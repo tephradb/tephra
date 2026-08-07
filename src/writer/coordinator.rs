@@ -190,7 +190,8 @@ impl Worker {
                     }));
                     continue;
                 }
-                match condition::evaluate(cond, &self.tips, batch.staged_tips(), &self.set, verify) {
+                match condition::evaluate(cond, &self.tips, batch.staged_tips(), &self.set, verify)
+                {
                     Ok(Some(at)) => {
                         let _ = req.reply.send(Err(AppendError::Conflict { at }));
                         continue;
@@ -339,12 +340,24 @@ mod tests {
         let (mut w, _tx) = worker(&dir, cfg());
 
         // Two decisions in one drain window, both guarding uniqueness of unique:x.
-        let (r1, rx1) = request(&[("Reserved", &["unique:x"])], Some(guard(&["unique:x"], Position::ZERO)));
-        let (r2, rx2) = request(&[("Reserved", &["unique:x"])], Some(guard(&["unique:x"], Position::ZERO)));
+        let (r1, rx1) = request(
+            &[("Reserved", &["unique:x"])],
+            Some(guard(&["unique:x"], Position::ZERO)),
+        );
+        let (r2, rx2) = request(
+            &[("Reserved", &["unique:x"])],
+            Some(guard(&["unique:x"], Position::ZERO)),
+        );
         w.process(&[r1, r2]);
 
         // Exactly one wins; the loser is a retryable same-batch conflict.
-        assert_eq!(assert_ok(&rx1), PositionRange { first: Position::new(1), last: Position::new(1) });
+        assert_eq!(
+            assert_ok(&rx1),
+            PositionRange {
+                first: Position::new(1),
+                last: Position::new(1)
+            }
+        );
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
@@ -359,8 +372,14 @@ mod tests {
     fn same_batch_distinct_tags_both_win() {
         let dir = TempDir::new().unwrap();
         let (mut w, _tx) = worker(&dir, cfg());
-        let (r1, rx1) = request(&[("Reserved", &["unique:a"])], Some(guard(&["unique:a"], Position::ZERO)));
-        let (r2, rx2) = request(&[("Reserved", &["unique:b"])], Some(guard(&["unique:b"], Position::ZERO)));
+        let (r1, rx1) = request(
+            &[("Reserved", &["unique:a"])],
+            Some(guard(&["unique:a"], Position::ZERO)),
+        );
+        let (r2, rx2) = request(
+            &[("Reserved", &["unique:b"])],
+            Some(guard(&["unique:b"], Position::ZERO)),
+        );
         w.process(&[r1, r2]);
         assert_ok(&rx1);
         assert_ok(&rx2);
@@ -380,7 +399,10 @@ mod tests {
         assert_ok(&rx1);
 
         // A later guarded append sees the durable event and loses.
-        let (r2, rx2) = request(&[("Reserved", &["unique:x"])], Some(guard(&["unique:x"], Position::ZERO)));
+        let (r2, rx2) = request(
+            &[("Reserved", &["unique:x"])],
+            Some(guard(&["unique:x"], Position::ZERO)),
+        );
         w.process(&[r2]);
         assert!(matches!(
             assert_err(&rx2),
@@ -399,7 +421,10 @@ mod tests {
         let first = assert_ok(&rx1).first; // position 1
 
         // Guard with after = 1 ignores the event at position 1, so no conflict.
-        let (r2, rx2) = request(&[("Reserved", &["unique:x"])], Some(guard(&["unique:x"], first)));
+        let (r2, rx2) = request(
+            &[("Reserved", &["unique:x"])],
+            Some(guard(&["unique:x"], first)),
+        );
         w.process(&[r2]);
         assert_ok(&rx2);
     }
@@ -423,7 +448,13 @@ mod tests {
         let (r2, rx2) = request(&[("Reserved", &["u"])], Some(guard(&["u"], tip)));
         w.process(&[r1, r2]);
 
-        assert_eq!(assert_ok(&rx1), PositionRange { first: Position::new(3), last: Position::new(3) });
+        assert_eq!(
+            assert_ok(&rx1),
+            PositionRange {
+                first: Position::new(3),
+                last: Position::new(3)
+            }
+        );
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
@@ -531,15 +562,18 @@ mod tests {
             let ty = types[rng.below(types.len() as u64) as usize];
             let start = rng.below(universe.len() as u64) as usize;
             let ntags = 1 + rng.below(2) as usize;
-            let picked: Vec<&str> = (0..ntags).map(|i| universe[(start + i) % universe.len()]).collect();
+            let picked: Vec<&str> = (0..ntags)
+                .map(|i| universe[(start + i) % universe.len()])
+                .collect();
             let ev = event(ty, &picked);
 
             let condition = if rng.below(2) == 0 {
                 // Guard on a random 1..=2 tag subset with a random valid `after`.
                 let gstart = rng.below(universe.len() as u64) as usize;
                 let gn = 1 + rng.below(2) as usize;
-                let gtags: Vec<&str> =
-                    (0..gn).map(|i| universe[(gstart + i) % universe.len()]).collect();
+                let gtags: Vec<&str> = (0..gn)
+                    .map(|i| universe[(gstart + i) % universe.len()])
+                    .collect();
                 let tip = expected_last;
                 let after = if tip == 0 { 0 } else { rng.below(tip + 1) };
                 Some(guard(&gtags, Position::new(after)))

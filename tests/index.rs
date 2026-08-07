@@ -33,7 +33,14 @@ impl Rng {
 }
 
 const TYPES: [&str; 3] = ["Registered", "Enrolled", "Renamed"];
-const TAGS: [&str; 6] = ["course:c1", "course:c2", "student:s1", "student:s2", "team:t1", "team:t2"];
+const TAGS: [&str; 6] = [
+    "course:c1",
+    "course:c2",
+    "student:s1",
+    "student:s2",
+    "team:t1",
+    "team:t2",
+];
 
 fn event_type(s: &str) -> EventType {
     EventType::new(s).unwrap()

@@ -608,7 +608,12 @@ mod tests {
 
     #[test]
     fn round_trip_full_event() {
-        let event = Event::new(&ty("Registered"), &tags(&["course:c1", "student:s1"]), b"payload").unwrap();
+        let event = Event::new(
+            &ty("Registered"),
+            &tags(&["course:c1", "student:s1"]),
+            b"payload",
+        )
+        .unwrap();
 
         let decoded = EventRef::from_bytes(event.as_bytes()).unwrap();
         assert_eq!(decoded.event_type(), "Registered");
@@ -668,7 +673,10 @@ mod tests {
     #[test]
     fn decode_rejects_short_header() {
         assert_eq!(EventRef::from_bytes(&[]), Err(DecodeError::Truncated));
-        assert_eq!(EventRef::from_bytes(&[1, 0, 0]), Err(DecodeError::Truncated));
+        assert_eq!(
+            EventRef::from_bytes(&[1, 0, 0]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     #[test]

@@ -100,7 +100,12 @@ impl<'a> Batch<'a> {
 
     /// Called after `append_batch` succeeded. Absorbs the staged tags into `main` (now
     /// durable) and replies each staged request its assigned range.
-    pub(super) fn commit_ok(self, committed: PositionRange, main: &mut TagTips, next_position: Position) {
+    pub(super) fn commit_ok(
+        self,
+        committed: PositionRange,
+        main: &mut TagTips,
+        next_position: Position,
+    ) {
         debug_assert_eq!(committed.first, self.first, "batch first position mismatch");
         debug_assert_eq!(
             committed.last,
@@ -154,8 +159,14 @@ mod tests {
         batch.stage(&e2, &tx2);
         batch.commit_err(AppendError::TooLarge { size: 99 });
 
-        assert!(matches!(rx1.try_recv(), Ok(Err(AppendError::TooLarge { size: 99 }))));
-        assert!(matches!(rx2.try_recv(), Ok(Err(AppendError::TooLarge { size: 99 }))));
+        assert!(matches!(
+            rx1.try_recv(),
+            Ok(Err(AppendError::TooLarge { size: 99 }))
+        ));
+        assert!(matches!(
+            rx2.try_recv(),
+            Ok(Err(AppendError::TooLarge { size: 99 }))
+        ));
     }
 
     #[test]

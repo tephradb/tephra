@@ -208,7 +208,9 @@ impl<const H: usize> Reader<H> {
             return Ok(RecordKind::End);
         }
 
-        let header = self.read_ahead_buf.read(&self.file, offset, RECORD_HEAD_SIZE)?;
+        let header = self
+            .read_ahead_buf
+            .read(&self.file, offset, RECORD_HEAD_SIZE)?;
         if is_truncation_marker(header) {
             return Ok(RecordKind::End);
         }

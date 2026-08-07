@@ -360,7 +360,11 @@ impl SegmentSet {
         }
 
         let flushed = writer.flushed_offset();
-        let offsets = scan_offsets(active_path, Some(flushed.clone()), config.header_size as u64)?;
+        let offsets = scan_offsets(
+            active_path,
+            Some(flushed.clone()),
+            config.header_size as u64,
+        )?;
         let count = offsets.len() as u64;
 
         // Cross-check the recovered commit marker against the event count. Position

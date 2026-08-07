@@ -278,8 +278,8 @@ mod tests {
         // Two items both matching position 3 must yield it once.
         let index = fixture();
         let q = Query::items(vec![
-            QueryItem::with_tags(tags(&["course:c1"])),   // 2, 3, 5
-            QueryItem::with_tags(tags(&["student:s1"])),  // 3, 4
+            QueryItem::with_tags(tags(&["course:c1"])),  // 2, 3, 5
+            QueryItem::with_tags(tags(&["student:s1"])), // 3, 4
         ]);
         assert_eq!(run(&index, &q, 0), vec![2, 3, 4, 5]);
     }

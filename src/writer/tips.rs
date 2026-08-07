@@ -93,10 +93,7 @@ impl TagTips {
     /// The highest position recorded for `tag`, or the window floor if absent (an upper
     /// bound: an unrecorded tag's true max is strictly below the floor).
     fn max_for(&self, tag: &str) -> Position {
-        self.max_pos
-            .get(tag)
-            .copied()
-            .unwrap_or(self.window_floor)
+        self.max_pos.get(tag).copied().unwrap_or(self.window_floor)
     }
 
     /// The current window floor.

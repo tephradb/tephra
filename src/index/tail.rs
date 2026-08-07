@@ -198,8 +198,12 @@ mod tests {
     #[should_panic(expected = "fed out of order")]
     fn out_of_order_push_panics() {
         let mut index = TailIndex::new(Position::new(1));
-        index.push(Position::new(1), event("E", &["a"]).as_ref()).unwrap();
+        index
+            .push(Position::new(1), event("E", &["a"]).as_ref())
+            .unwrap();
         // Skips position 2: must trip the feed-order assert.
-        index.push(Position::new(3), event("E", &["b"]).as_ref()).unwrap();
+        index
+            .push(Position::new(3), event("E", &["b"]).as_ref())
+            .unwrap();
     }
 }

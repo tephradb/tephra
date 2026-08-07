@@ -387,10 +387,7 @@ mod tests {
         let large_data = vec![0u8; small_size];
         let result = writer.append(&[], &large_data);
 
-        assert!(matches!(
-            result,
-            Err(WriteError::RecordTooLarge { .. })
-        ));
+        assert!(matches!(result, Err(WriteError::RecordTooLarge { .. })));
     }
 
     #[test]
@@ -891,7 +888,9 @@ mod tests {
 
         // A fresh batch after the rewind overwrites the discarded region and lands
         // contiguously right after "keep".
-        writer.append(&[], b"replacement").expect("failed to append");
+        writer
+            .append(&[], b"replacement")
+            .expect("failed to append");
         writer.commit(1).expect("failed to commit");
         let flushed = writer.flushed_offset();
         drop(writer);
@@ -927,7 +926,9 @@ mod tests {
         // Data record, then the commit marker, then end.
         assert_eq!(
             reader.peek(data_offset).unwrap(),
-            RecordKind::Data { total_len: data_len }
+            RecordKind::Data {
+                total_len: data_len
+            }
         );
         let marker_offset = data_offset + data_len as u64;
         let marker_len = match reader.peek(marker_offset).unwrap() {
@@ -2645,10 +2646,10 @@ mod tests {
         // recovery must roll back to the end of the first batch's commit marker.
         let record = RECORD_HEAD_SIZE + 2; // 8-byte head + 2-byte payload, no header
         let cuts = [
-            5,              // mid record (inside b1)
-            record,         // at a record boundary (end of b1)
-            3 * record,     // at the boundary right before the marker
-            3 * record + 4, // mid marker (inside its header)
+            5,                                 // mid record (inside b1)
+            record,                            // at a record boundary (end of b1)
+            3 * record,                        // at the boundary right before the marker
+            3 * record + 4,                    // mid marker (inside its header)
             3 * record + RECORD_HEAD_SIZE + 4, // mid marker (inside its payload)
         ];
 

@@ -105,7 +105,10 @@ fn overlapping_uniqueness_guard_lets_exactly_one_win() {
         let b = barrier.clone();
         joins.push(thread::spawn(move || {
             b.wait();
-            h.append(vec![event("Reserved", &["unique:x"])], Some(unique_guard("unique:x")))
+            h.append(
+                vec![event("Reserved", &["unique:x"])],
+                Some(unique_guard("unique:x")),
+            )
         }));
     }
 
@@ -132,7 +135,9 @@ fn explicit_shutdown_returns_a_consistent_set() {
     let (coord, handle) = WriteCoordinator::start(open(&dir), config());
 
     for i in 0..10 {
-        handle.append(vec![event("E", &[&format!("k:{i}")])], None).unwrap();
+        handle
+            .append(vec![event("E", &[&format!("k:{i}")])], None)
+            .unwrap();
     }
     drop(handle);
     let set = coord.shutdown();
@@ -150,7 +155,9 @@ fn drop_based_shutdown_persists_acknowledged_writes() {
     {
         let (coord, handle) = WriteCoordinator::start(open(&dir), config());
         for i in 0..5 {
-            handle.append(vec![event("E", &[&format!("k:{i}")])], None).unwrap();
+            handle
+                .append(vec![event("E", &[&format!("k:{i}")])], None)
+                .unwrap();
         }
         // Drop both: the coordinator's Drop signals shutdown and joins the thread.
         drop(handle);
@@ -176,8 +183,11 @@ fn tiny_queue_still_serves_all_writes() {
         let h = handle.clone();
         joins.push(thread::spawn(move || {
             for i in 0..100 {
-                h.append(vec![event("E", &[&format!("t:{t}"), &format!("i:{i}")])], None)
-                    .unwrap();
+                h.append(
+                    vec![event("E", &[&format!("t:{t}"), &format!("i:{i}")])],
+                    None,
+                )
+                .unwrap();
             }
         }));
     }
@@ -194,7 +204,10 @@ fn tiny_queue_still_serves_all_writes() {
 fn append_with_no_events_is_rejected() {
     let dir = TempDir::new().unwrap();
     let (coord, handle) = WriteCoordinator::start(open(&dir), config());
-    assert!(matches!(handle.append(vec![], None), Err(AppendError::Empty)));
+    assert!(matches!(
+        handle.append(vec![], None),
+        Err(AppendError::Empty)
+    ));
     drop(handle);
     coord.shutdown();
 }

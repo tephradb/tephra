@@ -69,11 +69,8 @@ impl QueryItem {
     /// Whether `event` satisfies this item: type in the list (or the list is empty)
     /// AND every one of the item's tags is present on the event.
     pub fn matches(&self, event: EventRef<'_>) -> bool {
-        let type_ok = self.types.is_empty()
-            || self
-                .types
-                .iter()
-                .any(|t| t.as_str() == event.event_type());
+        let type_ok =
+            self.types.is_empty() || self.types.iter().any(|t| t.as_str() == event.event_type());
         type_ok && tags_contained(&self.tags, event)
     }
 }
@@ -247,9 +244,7 @@ mod tests {
         let item = QueryItem::new(vec![ty("Enrolled")], tags(&["course:c1", "student:s1"]));
         // Superset matches.
         assert!(item.matches(event("Enrolled", &["course:c1", "student:s1"]).as_ref()));
-        assert!(item.matches(
-            event("Enrolled", &["course:c1", "extra:e", "student:s1"]).as_ref()
-        ));
+        assert!(item.matches(event("Enrolled", &["course:c1", "extra:e", "student:s1"]).as_ref()));
         // Missing one of the required tags fails.
         assert!(!item.matches(event("Enrolled", &["course:c1"]).as_ref()));
         assert!(!item.matches(event("Enrolled", &["student:s1"]).as_ref()));
