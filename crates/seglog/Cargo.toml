@@ -1,0 +1,24 @@
+[package]
+name = "seglog"
+authors = ["Ari Seyhun <dev@tqwewe.com>"]
+categories = ["database-implementations", "development-tools"]
+description = "High-performance segment log with CRC32C validation - optimized for event sourcing and append-only storage"
+edition = "2024"
+keywords = ["database", "event-sourcing", "event-store", "storage"]
+license = "Apache-2.0"
+version = "0.2.2"
+
+[dependencies]
+crc32fast = "1.5"
+nix = { version = "0.31", features = ["fs"] }
+thiserror = "2.0"
+tracing = "0.1"
+zstd = "0.13"
+
+[dev-dependencies]
+criterion = "0.8"
+tempfile = "3.27"
+
+[[bench]]
+name = "seglog_bench"
+harness = false
