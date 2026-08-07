@@ -79,27 +79,34 @@ Durable, position-addressed byte storage.
 
 Pure logic, no I/O. Blocks everything in phase 3.
 
-- [ ] `EventType(Box<str>)`, `Tag(Box<str>)`: `AsRef<str>`, `as_str()`, `Display`,
+- [x] `EventType(Box<str>)`, `Tag(Box<str>)`: `AsRef<str>`, `as_str()`, `Display`,
       `Ord`, no `Deref`
-- [ ] Construction validation: non-empty, max length (fixed-width length field, FST keys
+- [x] Construction validation: non-empty, max length (fixed-width length field, FST keys
       later)
-- [ ] `Tags(SmallVec<[Tag; 4]>)`: sorted, duplicates **rejected** not deduped
-- [ ] `Tags::from_sorted_unchecked` for the decode path, with a comment stating that the
-      decode path is its reason to exist
-- [ ] `Event { buf: Box<[u8]>, type_len, tag_lens, data_offset }`
-- [ ] `EventRef<'a>` borrowing from `RecordRef::data`
-- [ ] All accessors return borrows (`&str`, `&[Tag]`, `&[u8]`)
-- [ ] `Event::to_owned()` from `EventRef`; borrowed is the primitive, owned is the
+- [x] `Tags(SmallVec<[Tag; 4]>)`: sorted, duplicates **rejected** not deduped
+- [x] ~~`Tags::from_sorted_unchecked` for the decode path~~ **Removed.** The zero-copy
+      `EventRef` decode never rebuilds a `Tags` (it yields borrowed `&str`), so the
+      unsafe constructor had no caller. Reconciled in CLAUDE.md 5.3
+- [x] `Event { buf: Box<[u8]>, data_offset }` (dropped the cached `type_len` / `tag_lens`:
+      derivable from `buf`'s header, so `EventRef` is a `Copy` allocation-free view;
+      CLAUDE.md 5.1 updated)
+- [x] `EventRef<'a>` borrowing a `&[u8]` (joined to `RecordRef::data` at the call site)
+- [x] All accessors return borrows: `&str` (type), `&[u8]` (payload), and `TagsRef`, a
+      borrowed iterator of `&str`, for tags. **Deviation from CLAUDE.md 5.1**: tags
+      cannot be `&[Tag]` zero-copy (variable-length strings packed contiguously have no
+      fixed stride); CLAUDE.md 5.1 updated to match
+- [x] `Event::to_owned()` from `EventRef`; borrowed is the primitive, owned is the
       convenience
-- [ ] Codec: type, then sorted tags, then payload, contiguous, length-prefixed
-- [ ] `EventRef::from_bytes(&[u8]) -> Result<EventRef<'_>, _>`, checked decoding
-- [ ] Encoded form is canonical: identical tag sets produce identical bytes (test it)
-- [ ] Round-trip tests, plus malformed-input rejection (truncated, lying lengths,
+- [x] Codec: type, then sorted tags, then payload, contiguous, length-prefixed
+- [x] `EventRef::from_bytes(&[u8]) -> Result<EventRef<'_>, _>`, checked decoding
+- [x] Encoded form is canonical: identical tag sets produce identical bytes (test it)
+- [x] Round-trip tests, plus malformed-input rejection (truncated, lying lengths,
       overflowing prefix sums)
-- [ ] Codec lives in `event.rs`; the join to `RecordRef` happens at the call site above
-      both, not via a helper on the log side
-- [ ] Deferred: `from_bytes_unchecked` justified by the record CRC. Design the signature
-      now so it can be added without changing `EventRef`'s shape
+- [x] Codec lives in `event.rs`; the join to `RecordRef` happens at the call site above
+      both, not via a helper on the log side (`event.rs` has no `seglog` dependency)
+- [x] Deferred: `from_bytes_unchecked` justified by the record CRC. Signature is designed
+      for it: `from_bytes(&[u8]) -> Result<EventRef>` means a `from_bytes_unchecked(&[u8])
+      -> EventRef` can be added later without changing `EventRef`'s shape
 
 ## Phase 3: Query model
 

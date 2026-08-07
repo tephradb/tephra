@@ -316,15 +316,22 @@ everything", and a silent short read produces a wrong read model that reports su
 ```rust
 pub struct Event {
     buf: Box<[u8]>,
-    type_len: u16,
-    tag_lens: SmallVec<[u16; 4]>,
-    data_offset: u32,   // cached prefix sum; decode invariant
+    data_offset: u32,   // cached prefix sum locating the payload; decode invariant
 }
 ```
 
-Layout is type, then tags in sorted order, then payload, contiguous. Lengths rather than
+Layout is a small length header (`type_len`, `tag_count`, then one `u16` per tag), then
+the type, then tags in sorted order, then payload, all contiguous. Lengths rather than
 ranges, because offsets are prefix sums and the encoded form needs no separate offset
 table.
+
+Only `data_offset` is cached, not `type_len` or the per-tag lengths: those are single
+`u16` reads out of `buf`'s header, so caching them would just duplicate bytes already in
+the buffer (and, for events with more than four tags, heap-allocate a side array).
+`data_offset` alone is cached because it is the one value that costs an O(tags) prefix
+sum to recompute. This keeps `EventRef` a `Copy` two-word view (`&[u8]` plus `u32`) that
+allocates nothing, ever. `EventRef::from_bytes` and `Event::new` are the only places the
+header is parsed and validated; the accessors read it back unchecked.
 
 One allocation per event regardless of tag count, and **the in-memory layout is the
 on-disk layout**, so decoding is parsing integers rather than copying.
@@ -339,9 +346,16 @@ for non-matching events.
 highest-volume read path. `Event` is the owned counterpart, obtained via `to_owned()`.
 The borrowed form is the primitive; the owned form is the convenience, not the reverse.
 
-**All accessors return borrows** (`&str`, `&[Tag]`, `&[u8]`). This is the one truly
-irreversible API decision; the internal representation behind it is swappable, the
-accessor shape is not.
+**All accessors return borrows**: `&str` for the type, `&[u8]` for the payload, and an
+iterator of `&str` for the tags. This is the one truly irreversible API decision; the
+internal representation behind it is swappable, the accessor shape is not.
+
+Tags are *not* returned as `&[Tag]`. A slice needs fixed-stride elements, but tags are
+variable-length strings packed contiguously in the buffer, so a `&[Tag]` would require a
+separate fat-pointer array or an allocation, which defeats the zero-copy read path this
+whole section exists for. The borrowed iterator (`TagsRef`, yielding `&str` in sorted
+order) is the zero-copy shape, and it is what AND-matching consumes as a linear merge
+over two sorted sequences.
 
 ### 5.2 `EventType` and `Tag`
 
@@ -379,9 +393,17 @@ swallowing it means an event that round-trips to something different from what w
 submitted.
 
 Sortedness does real work: the encoded form becomes canonical (identical tag sets
-produce identical bytes), AND-item matching becomes a linear merge over two sorted
-slices, and decode can use `from_sorted_unchecked` to skip the re-sort on the read
-path. That constructor exists *for* the decode path; do not "clean it up".
+produce identical bytes), and AND-item matching becomes a linear merge over two sorted
+sequences.
+
+There is no `Tags` on the read path, and so no `from_sorted_unchecked`. The decode path
+never rebuilds a `Tags`: `EventRef::tags()` yields the tags as borrowed `&str` straight
+out of the buffer (already sorted, so iteration is sorted), which is strictly cheaper
+than reconstructing an owned, per-tag-allocating `Tags` would be. An earlier design had
+decode rebuild `Tags` and kept an unsafe `from_sorted_unchecked` to skip its re-sort;
+the zero-copy `EventRef` made both unnecessary, so the unsafe constructor was removed
+rather than left as unused, unverifiable code. Reintroduce it only alongside a real
+caller that needs an owned `Tags` from already-sorted input.
 
 ### 5.4 Codec and scan shape
 
