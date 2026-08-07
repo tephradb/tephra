@@ -110,19 +110,25 @@ pub fn parse_record<const H: usize>(
 
     // Decompress if needed
     let final_data = if is_compressed {
-        if compressed_data.len() < 4 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "compressed data too short to contain original size",
-            )
-            .into());
-        }
-        let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-        let _original_size = u32::from_le_bytes(original_size_bytes) as usize;
+        cfg_if::cfg_if! {
+            if #[cfg(not(feature = "zstd"))] {
+                return Err(ReadError::ZstdNotEnabled { offset: offset as u64 });
+            } else {
+                if compressed_data.len() < 4 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "compressed data too short to contain original size",
+                    )
+                    .into());
+                }
+                let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
+                let _original_size = u32::from_le_bytes(original_size_bytes) as usize;
 
-        let mut decompressed = Vec::new();
-        zstd::stream::copy_decode(&compressed_data[4..], &mut decompressed)?;
-        decompressed
+                let mut decompressed = Vec::new();
+                zstd::stream::copy_decode(&compressed_data[4..], &mut decompressed)?;
+                decompressed
+            }
+        }
     } else {
         compressed_data.to_vec()
     };

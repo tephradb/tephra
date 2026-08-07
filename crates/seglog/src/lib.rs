@@ -235,9 +235,11 @@ pub const COMMIT_MARKER_PAYLOAD: usize = 1 + 8;
 
 /// Minimum data size (in bytes) for compression to be applied.
 /// Records smaller than this threshold will not be compressed to avoid overhead.
+#[cfg(feature = "zstd")]
 pub const MIN_COMPRESSION_SIZE: usize = 128;
 
 /// Default zstd compression level (3 provides good balance of speed and ratio).
+#[cfg(feature = "zstd")]
 pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 /// Thread-safe atomic offset tracking for flushed data.
@@ -1588,6 +1590,7 @@ mod tests {
     // Compression Tests
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_disabled_by_default() {
         let temp = temp_path();
         let mut writer =
@@ -1612,6 +1615,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_enable_disable_compression() {
         let temp = temp_path();
         let mut writer =
@@ -1657,6 +1661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_large_data() {
         let temp = temp_path();
         let mut writer =
@@ -1683,6 +1688,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_no_compression_small_data() {
         let temp = temp_path();
         let mut writer =
@@ -1733,6 +1739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_read_compressed_record_random() {
         let temp = temp_path();
         let mut writer =
@@ -1759,6 +1766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_read_compressed_record_sequential() {
         let temp = temp_path();
         let mut writer =
@@ -1785,6 +1793,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compressed_record_has_compressed_data_field() {
         let temp = temp_path();
         let mut writer =
@@ -1818,6 +1827,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_iter_compressed_records() {
         let temp = temp_path();
         let mut writer =
@@ -1854,6 +1864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_mixed_compressed_uncompressed() {
         let temp = temp_path();
         let mut writer =
@@ -1901,6 +1912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_with_headers_h8() {
         let temp = temp_path();
         let mut writer =
@@ -1929,6 +1941,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_header_never_compressed() {
         let temp = temp_path();
         let mut writer =
@@ -1963,6 +1976,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_exactly_128_bytes() {
         let temp = temp_path();
         let mut writer =
@@ -1988,6 +2002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_127_bytes() {
         let temp = temp_path();
         let mut writer =
@@ -2013,6 +2028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_large_1mb_data() {
         let temp = temp_path();
         let mut writer =
@@ -2044,6 +2060,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_writer_open_compressed_segment() {
         let temp = temp_path();
         let mut writer =
@@ -2262,6 +2279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_replace_header_on_compressed_record() {
         let temp = temp_path();
         let mut writer =
@@ -2302,6 +2320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_replace_header_preserves_compression() {
         let temp = temp_path();
         let mut writer =
@@ -2513,6 +2532,7 @@ mod tests {
     // Integration Tests
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_headers_compression_replace_all_together() {
         let temp = temp_path();
         let mut writer =
@@ -2555,6 +2575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_concurrent_read_with_headers_and_compression() {
         let temp = temp_path();
         let mut writer =
@@ -2591,6 +2612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compression_ratio_verification() {
         let temp = temp_path();
         let mut writer =
@@ -2760,6 +2782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "zstd")]
     fn test_compressed_and_control_flags_decode_independently() {
         let temp = temp_path();
         let mut writer =

@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
-use tracing::{trace, warn};
 
 use seglog::read::{ReadError, ReadHint, Reader, RecordKind};
 use seglog::write::{WriteError, Writer};
@@ -64,11 +63,19 @@ pub struct SegmentConfig {
     pub max_record_len: usize,
     /// Bytes reserved at the start of every segment for its [`SegmentHeader`].
     pub header_size: usize,
+    /// Whether to zstd-compress each record's payload before writing it.
+    ///
+    /// Off by default and opt-in: DCB events are small, so per-record compression
+    /// saves little on the common case and puts a decompress on every random-access
+    /// payload fetch. It earns its keep on cold, archival-heavy segments. Requires
+    /// the `zstd` feature; [`validate`](Self::validate) rejects `true` without it.
+    pub compress: bool,
 }
 
 impl SegmentConfig {
     /// Config for the given segment size with the conventional defaults:
-    /// `max_record_len = segment_size / 4` and `header_size = SEGMENT_HEADER_SIZE`.
+    /// `max_record_len = segment_size / 4`, `header_size = SEGMENT_HEADER_SIZE`,
+    /// and compression off.
     ///
     /// The result is not guaranteed valid for very small `segment_size`; that is
     /// checked by [`SegmentSet::open`] via [`validate`](Self::validate).
@@ -77,7 +84,17 @@ impl SegmentConfig {
             segment_size,
             max_record_len: segment_size / 4,
             header_size: SEGMENT_HEADER_SIZE,
+            compress: false,
         }
+    }
+
+    /// Returns the config with per-record zstd compression enabled or disabled.
+    ///
+    /// Requires the `zstd` feature; [`validate`](Self::validate) rejects enabling it
+    /// without the feature rather than silently writing uncompressed records.
+    pub fn with_compression(mut self, compress: bool) -> Self {
+        self.compress = compress;
+        self
     }
 
     /// Rejects configs that cannot address, or cannot usefully store, records.
@@ -112,6 +129,13 @@ impl SegmentConfig {
                 "a max-size record plus its commit marker ({need} bytes) does not fit a \
                  segment's usable space ({usable} bytes)"
             ));
+        }
+        #[cfg(not(feature = "zstd"))]
+        if self.compress {
+            return invalid(
+                "compression requested (compress = true) but the `zstd` feature is not enabled"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -277,7 +301,8 @@ impl SegmentSet {
                 Err(HeaderError::Unwritten) if i == n - 1 => {
                     // A segment created but never header-written. Legal only as the
                     // trailing file; drop it and continue.
-                    warn!(
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
                         "deleting unwritten trailing segment {path:?} (crash between create and header write)"
                     );
                     fs::remove_file(path).map_err(|source| LogError::io(path, source))?;
@@ -299,7 +324,8 @@ impl SegmentSet {
         if valid.is_empty() {
             let (writer, active) =
                 Self::create_segment(&dir, &config, Position::new(FIRST_POSITION))?;
-            trace!("initialized empty segment set at {dir:?}");
+            #[cfg(feature = "tracing")]
+            tracing::trace!("initialized empty segment set at {dir:?}");
             return Ok(SegmentSet {
                 dir,
                 config,
@@ -348,15 +374,18 @@ impl SegmentSet {
         let mut writer =
             Writer::<0>::open(active_path, config.segment_size, config.header_size as u64)
                 .map_err(|source| LogError::write(active_path, source))?;
-        writer.set_max_record(config.max_record_len);
+        configure_writer(&mut writer, &config);
 
-        let committed = writer.write_offset();
-        if trailing_bytes_present(&writer, committed, config.segment_size) {
-            warn!(
-                "segment {active_path:?} recovered with rollback, discarding bytes from offset {committed}"
-            );
-        } else {
-            trace!("segment {active_path:?} opened cleanly at offset {committed}");
+        #[cfg(feature = "tracing")]
+        {
+            let committed = writer.write_offset();
+            if trailing_bytes_present(&writer, committed, config.segment_size) {
+                tracing::warn!(
+                    "segment {active_path:?} recovered with rollback, discarding bytes from offset {committed}"
+                );
+            } else {
+                tracing::trace!("segment {active_path:?} opened cleanly at offset {committed}");
+            }
         }
 
         let flushed = writer.flushed_offset();
@@ -508,7 +537,8 @@ impl SegmentSet {
         self.sealed.push(old_active);
         self.active_writer = writer;
 
-        trace!(
+        #[cfg(feature = "tracing")]
+        tracing::trace!(
             "rolled over to segment with base_position {}",
             self.next_position
         );
@@ -530,7 +560,7 @@ impl SegmentSet {
         // of the directory is needed.
         let mut writer = Writer::<0>::create(&path, config.segment_size, config.header_size as u64)
             .map_err(|source| LogError::write(&path, source))?;
-        writer.set_max_record(config.max_record_len);
+        configure_writer(&mut writer, config);
 
         let header = SegmentHeader::new(base);
         writer
@@ -1004,8 +1034,21 @@ fn scan_offsets(
     Ok(offsets)
 }
 
+/// Applies per-writer settings from the config to a freshly created or reopened
+/// writer: the max record length, and (with the `zstd` feature) compression when
+/// the config requests it. `SegmentConfig::validate` rejects `compress` without
+/// the feature, so the compression arm is only reachable when it can be honoured.
+fn configure_writer(writer: &mut Writer<0>, config: &SegmentConfig) {
+    writer.set_max_record(config.max_record_len);
+    #[cfg(feature = "zstd")]
+    if config.compress {
+        writer.enable_compression();
+    }
+}
+
 /// Whether a non-zero record header sits at `offset`, i.e. recovery discarded a
 /// torn trailing batch (as opposed to a clean end at the zero-filled tail).
+#[cfg(feature = "tracing")]
 fn trailing_bytes_present(writer: &Writer<0>, offset: u64, segment_size: usize) -> bool {
     if offset + RECORD_HEAD_SIZE as u64 > segment_size as u64 {
         return false;
@@ -1066,6 +1109,52 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Default max_record_len = 16, header 64, so nothing usable fits.
         let err = SegmentSet::open(dir.path(), SegmentConfig::new(64)).unwrap_err();
+        assert!(matches!(err, LogError::InvalidConfig { .. }), "got {err:?}");
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn compressed_records_round_trip_and_survive_reopen() {
+        // A payload well above MIN_COMPRESSION_SIZE and highly compressible, so the
+        // writer actually takes the compression path.
+        let payload = vec![b'x'; 4096];
+        let dir = TempDir::new().unwrap();
+
+        let (p1, p2) = {
+            let mut set = SegmentSet::open(
+                dir.path(),
+                SegmentConfig::new(1 << 20).with_compression(true),
+            )
+            .unwrap();
+            let p1 = append_one(&mut set, &payload);
+            let p2 = append_one(&mut set, &payload);
+
+            // Point read and scan both decode back to the original bytes.
+            assert_eq!(set.read_at(p1).unwrap().data, payload);
+            let scanned = drain(set.scan_from(Position(1)));
+            assert_eq!(scanned.len(), 2);
+            assert!(scanned.iter().all(|r| r.data == payload));
+            (p1, p2)
+        };
+
+        // Reopen (exercises the recovery path, which also re-applies compression to
+        // the active writer) and confirm the records read back intact.
+        let set = SegmentSet::open(
+            dir.path(),
+            SegmentConfig::new(1 << 20).with_compression(true),
+        )
+        .unwrap();
+        assert_eq!(set.read_at(p1).unwrap().data, payload);
+        assert_eq!(set.read_at(p2).unwrap().data, payload);
+        assert_eq!(set.next_position(), Position(3));
+    }
+
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn compression_without_zstd_feature_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let err = SegmentSet::open(dir.path(), SegmentConfig::new(4096).with_compression(true))
+            .unwrap_err();
         assert!(matches!(err, LogError::InvalidConfig { .. }), "got {err:?}");
     }
 

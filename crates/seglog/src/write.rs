@@ -6,14 +6,14 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use thiserror::Error;
-use tracing::trace;
 
 use crate::read::{ReadError, is_truncation_marker};
 use crate::{
     COMMIT_MARKER_PAYLOAD, COMPRESSION_FLAG, CONTROL_FLAG, FlushedOffset, LEN_SIZE, LENGTH_MASK,
-    MAX_RECORD_LEN, MIN_COMPRESSION_SIZE, RECORD_HEAD_SIZE, ZSTD_COMPRESSION_LEVEL,
-    calculate_crc32c, control, has_unknown_flags,
+    MAX_RECORD_LEN, RECORD_HEAD_SIZE, calculate_crc32c, control, has_unknown_flags,
 };
+#[cfg(feature = "zstd")]
+use crate::{MIN_COMPRESSION_SIZE, ZSTD_COMPRESSION_LEVEL};
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
@@ -211,8 +211,9 @@ impl<const H: usize> Writer<H> {
 
         let recovered = recover(&file, size, start_offset)?;
         let write_offset = recovered.committed_offset;
+        #[cfg(feature = "tracing")]
         if let Some(position) = recovered.last_position {
-            trace!("recovered committed position {position} at offset {write_offset}");
+            tracing::trace!("recovered committed position {position} at offset {write_offset}");
         }
 
         let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, file);
@@ -237,6 +238,7 @@ impl<const H: usize> Writer<H> {
     ///
     /// Once enabled, all data appended via `append()` will be compressed using zstd
     /// if the data size is >= [`MIN_COMPRESSION_SIZE`].
+    #[cfg(feature = "zstd")]
     pub fn enable_compression(&mut self) {
         self.compression_enabled = true;
     }
@@ -457,7 +459,8 @@ impl<const H: usize> Writer<H> {
     /// Flushes the file, ensuring all data is persisted to disk.
     pub fn sync(&mut self) -> Result<u64, WriteError> {
         if self.dirty {
-            trace!("flushing writer");
+            #[cfg(feature = "tracing")]
+            tracing::trace!("flushing writer");
             self.writer.flush()?;
             self.writer.get_ref().sync_data()?;
             self.flushed_offset.set(self.write_offset);
@@ -476,12 +479,8 @@ impl<const H: usize> Writer<H> {
     }
 
     fn prepare_data<'d>(&self, data: &'d [u8]) -> Result<(Cow<'d, [u8]>, u32), WriteError> {
-        // Decide whether to compress
-        let should_compress = self.compression_enabled && data.len() >= MIN_COMPRESSION_SIZE;
-
-        // Prepare data (with compression if needed)
-        if should_compress {
-            // Compress data and prepend original size
+        #[cfg(feature = "zstd")]
+        if self.compression_enabled && data.len() >= MIN_COMPRESSION_SIZE {
             let original_size = data.len() as u32;
             let compressed = zstd::bulk::compress(data, ZSTD_COMPRESSION_LEVEL)?;
 
@@ -492,12 +491,13 @@ impl<const H: usize> Writer<H> {
             let total_payload_len = H + final_data.len();
             let length_with_flag = (total_payload_len as u32) | COMPRESSION_FLAG;
 
-            Ok((Cow::Owned(final_data), length_with_flag))
-        } else {
-            let total_payload_len = H + data.len();
-            let length_with_flag = total_payload_len as u32;
-            Ok((Cow::Borrowed(data), length_with_flag))
+            return Ok((Cow::Owned(final_data), length_with_flag));
         }
+
+        let total_payload_len = H + data.len();
+        let length_with_flag = total_payload_len as u32;
+
+        Ok((Cow::Borrowed(data), length_with_flag))
     }
 }
 

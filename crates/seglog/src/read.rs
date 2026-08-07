@@ -6,7 +6,6 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use thiserror::Error;
-use tracing::warn;
 
 use crate::{
     COMPRESSION_FLAG, CONTROL_FLAG, CRC32C_SIZE, FlushedOffset, LEN_SIZE, LENGTH_MASK,
@@ -58,6 +57,8 @@ pub enum ReadError {
         existing_length: usize,
         new_length: usize,
     },
+    #[error("zstd compression is not enabled at offset {offset}")]
+    ZstdNotEnabled { offset: u64 },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -99,6 +100,7 @@ pub struct Reader<const H: usize> {
     read_ahead_buf: ReadAheadBuf,
     flushed_offset: FlushedOffset,
     // Decompression buffer (reused across reads to avoid allocations)
+    #[cfg(feature = "zstd")]
     decompress_buf: Vec<u8>,
 }
 
@@ -136,6 +138,7 @@ impl<const H: usize> Reader<H> {
             fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset,
+            #[cfg(feature = "zstd")]
             decompress_buf: Vec::new(),
         };
 
@@ -152,6 +155,7 @@ impl<const H: usize> Reader<H> {
             fallback_buf: self.fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset: self.flushed_offset.clone(),
+            #[cfg(feature = "zstd")]
             decompress_buf: Vec::new(),
         })
     }
@@ -172,15 +176,13 @@ impl<const H: usize> Reader<H> {
     pub fn prefetch(&self, offset: u64) {
         #[cfg(all(unix, target_os = "linux"))]
         {
-            use std::os::fd::AsRawFd;
-            unsafe {
-                nix::libc::posix_fadvise(
-                    self.file.as_raw_fd(),
-                    offset as i64,
-                    PAGE_SIZE as i64,
-                    nix::libc::POSIX_FADV_WILLNEED,
-                );
-            }
+            use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+            let _ = posix_fadvise(
+                &self.file,
+                offset as i64,
+                PAGE_SIZE as i64,
+                PosixFadviseAdvice::POSIX_FADV_WILLNEED,
+            );
         }
     }
 
@@ -363,26 +365,32 @@ impl<const H: usize> Reader<H> {
 
         // Decompress if needed
         let (final_data, compressed_data) = if is_compressed {
-            // First 4 bytes are the original size
-            if compressed_data.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "compressed data too short to contain original size",
-                )
-                .into());
+            cfg_if::cfg_if! {
+                if #[cfg(not(feature = "zstd"))] {
+                    return Err(ReadError::ZstdNotEnabled { offset });
+                } else {
+                    // First 4 bytes are the original size
+                    if compressed_data.len() < 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compressed data too short to contain original size",
+                        )
+                        .into());
+                    }
+                    let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
+                    let original_size = u32::from_le_bytes(original_size_bytes) as usize;
+
+                    // Decompress into reusable buffer
+                    self.decompress_buf.clear();
+                    self.decompress_buf.reserve(original_size);
+                    zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
+
+                    (
+                        Cow::Borrowed(self.decompress_buf.as_slice()),
+                        Some(compressed_data),
+                    )
+                }
             }
-            let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-            let original_size = u32::from_le_bytes(original_size_bytes) as usize;
-
-            // Decompress into reusable buffer
-            self.decompress_buf.clear();
-            self.decompress_buf.reserve(original_size);
-            zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
-
-            (
-                Cow::Borrowed(self.decompress_buf.as_slice()),
-                Some(compressed_data),
-            )
         } else {
             (compressed_data, None)
         };
@@ -465,24 +473,30 @@ impl<const H: usize> Reader<H> {
 
         // Decompress if needed
         let (final_data, compressed_data) = if is_compressed {
-            if compressed_data.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "compressed data too short to contain original size",
-                )
-                .into());
+            cfg_if::cfg_if! {
+                if #[cfg(not(feature = "zstd"))] {
+                    return Err(ReadError::ZstdNotEnabled { offset });
+                } else {
+                    if compressed_data.len() < 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compressed data too short to contain original size",
+                        )
+                        .into());
+                    }
+                    let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
+                    let original_size = u32::from_le_bytes(original_size_bytes) as usize;
+
+                    self.decompress_buf.clear();
+                    self.decompress_buf.reserve(original_size);
+                    zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
+
+                    (
+                        Cow::Borrowed(self.decompress_buf.as_slice()),
+                        Some(Cow::Borrowed(compressed_data)),
+                    )
+                }
             }
-            let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-            let original_size = u32::from_le_bytes(original_size_bytes) as usize;
-
-            self.decompress_buf.clear();
-            self.decompress_buf.reserve(original_size);
-            zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
-
-            (
-                Cow::Borrowed(self.decompress_buf.as_slice()),
-                Some(Cow::Borrowed(compressed_data)),
-            )
         } else {
             (Cow::Borrowed(compressed_data), None)
         };
@@ -711,7 +725,8 @@ impl<const H: usize> Iter<'_, H> {
             }
             Err(ReadError::OutOfBounds { .. } | ReadError::TruncationMarker { .. }) => Ok(None),
             Err(err) => {
-                warn!("unexpected read error at offset {}: {err}", self.offset);
+                #[cfg(feature = "tracing")]
+                tracing::warn!("unexpected read error at offset {}: {err}", self.offset);
                 Err(err)
             }
         }
