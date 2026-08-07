@@ -177,18 +177,47 @@ performance, and every bit of it can be differential-tested against this baselin
 
 ## Phase 5: Index segments (layer 3)
 
-- [ ] In-memory tail index: term -> growable position list, fed on append
-- [ ] Term interning, `TermId(u32)`
-- [ ] Index segment format: header with min/max position, FST term dictionary,
-      postings region
-- [ ] Tiered postings: singletons inlined in the term dict, small terms as varint
-      deltas, dense terms as Roaring
-- [ ] Dense type column: `u16` type_id indexed by `position - base_position`,
-      segment-local ids
-- [ ] Seal one index segment per sealed log segment
+Split into 5a (in-memory core plus the differential harness) and 5b (on-disk format and
+segment-lifecycle wiring). 5a lands the term/posting model and the acceptance test in
+isolation, before any serialization rigor or coordinator change.
+
+### Phase 5a: In-memory tail index and differential test
+
+- [x] Term interning, `TermId(u32)` (`TermInterner`) and type interning, `TypeId(u16)`
+      (`TypeInterner`, rejecting >`u16::MAX + 1` distinct types per segment with a named
+      error at push time). Two concrete interners, not one generic: their overflow
+      semantics genuinely differ
+- [x] In-memory tail index (`index::TailIndex`): per-tag postings (`TermId` -> ascending
+      local positions, dense by construction) plus a dense `u16` type column indexed by
+      `position - base_position`. Fed in position order via `push(position, event)` with a
+      **real** (not `debug_assert`) feed-order assert, since out-of-order feeding would
+      silently produce unsorted postings
+- [x] Index-driven evaluator (`index::search`): AND over an item's tag postings, type
+      filter via the column, OR/union across items, `after` exclusive. Returns an
+      ascending, deduped `impl Iterator<Item = Position>`: the ascending-per-segment
+      output is a 5b requirement (cross-segment union is a k-merge), distinct from the
+      phase-6 planner streaming
+- [x] Differential test (`tests/index.rs`): a random workload appended to a `SegmentSet`
+      and fed to a `TailIndex`; for random queries and `after` bounds, `search` returns
+      the exact positions the phase-4 scan oracle does. Anchored by a small fixed-dataset
+      unit test with hand-derived, spec-sourced answers for the tricky cases (empty types,
+      empty tags, empty `Items`, `All`, `after: 0`), so the two sides are pinned to the
+      spec, not just to each other
+- [x] No coordinator change and no on-disk format in 5a: the index is pure and
+      `#[cfg(test)]`-verifiable without touching files. Inline feeding lands in 5b, where
+      seal-on-rollover gives the fed data a destination
+
+### Phase 5b: On-disk index segments and wiring
+
+- [ ] Index segment format: header (CRC + golden byte lock) with min/max position, `fst`
+      term dictionary, postings region
+- [ ] Tiered postings: singletons inlined in the term value, small terms as varint deltas;
+      dense terms as Roaring deferred (correctness is identical, so add it after)
+- [ ] Persist the dense `u16` type column per segment
+- [ ] Inline feeding at the commit seam (the `TagTips::absorb` point); seal one index
+      segment per sealed log segment on rollover
 - [ ] Recovery: rebuild index state for any log tail that was durable but not indexed
-- [ ] Differential test: every query answered identically by the index and by the
-      phase-4 scan baseline
+- [ ] Extend the differential test across multiple sealed segments and their composition
 - [ ] Segment pruning by header comparison for `after: p`
 
 ## Phase 6: Query planner and read paths (layers 4 and 5)

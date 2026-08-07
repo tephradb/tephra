@@ -1,6 +1,7 @@
 use std::{fmt, ops};
 
 pub mod event;
+pub mod index;
 pub mod log;
 pub mod query;
 pub mod writer;

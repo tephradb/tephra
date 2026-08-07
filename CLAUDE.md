@@ -556,6 +556,40 @@ conflicting write.
 Immutable, position-disjoint, one index segment per sealed log segment (so disjointness
 is inherited and segment lifecycle is one concept, not two).
 
+### 7.0 Build split and the in-memory tail index
+
+The layer is built in two parts. **5a** is the in-memory core: a term interner
+(`TermInterner` -> `TermId(u32)`) and a type interner (`TypeInterner` -> `TypeId(u16)`,
+rejecting more than `u16::MAX + 1` distinct types per segment at push time, where the
+offending string is in hand), a per-segment `TailIndex` (per-tag postings plus the dense
+type column), and `index::search`, the index-driven evaluator. **5b** is the on-disk index
+segment format, feeding, sealing, recovery, and pruning (everything below this
+subsection).
+
+`index::search` is the counterpart to phase 4's scan oracle: it evaluates a `Query` from
+postings instead of a linear decode, and is **differential-tested to return the identical
+ascending positions the scan does**. That test is anchored by hand-derived, spec-sourced
+answers for the tricky cases (empty types match any type, empty tags constrain only on
+type, empty `Items` matches nothing, `after` is exclusive), so the evaluator and the
+predicate are both pinned to the spec rather than only to each other.
+
+`search` returns an **ascending, deduped `impl Iterator<Item = Position>`, not a `Vec`**.
+The per-segment ascending-output contract is load-bearing for 5b: a query spans several
+per-segment indexes and the cross-segment union is a k-merge of these streams, so a `Vec`
+would force a materialize-then-sort per segment that 5b would rewrite. This is distinct
+from the phase-4 (layer 4) planner's streaming, which is a later concern.
+
+The `TailIndex` is fed **in position order** via `push(position, event)`, guarded by a
+real (not `debug_assert`) contiguity assert: out-of-order feeding would silently produce
+unsorted posting lists that break every intersection. Feeding is inline at the commit seam
+(the `TagTips::absorb` point) in 5b; the append-condition hot path keeps the scan oracle
+until phase 6 wires the `Unknown` fallthrough onto the index.
+
+The tail index's per-tag postings **subsume** the layer-2 `TagTips`: a tag's max position
+is just the last element of its posting list. They are kept as separate structures for now
+and unified only when the condition fallthrough moves onto the index (phase 6), so phase
+4's correctness core is not destabilized early.
+
 **Tags (high cardinality) -> inverted index.** FST term dictionary (compresses `course:`
 style prefixes well), tiered postings by term frequency: singletons inlined in the term
 dictionary, small terms as varint deltas, dense terms as Roaring bitmaps. AND is
@@ -688,6 +722,12 @@ src/
     batch.rs        // accumulates records + assigns positions
     condition.rs    // evaluates AppendCondition (two arms: staged, then durable)
     tips.rs         // TagTips (durable, lossy) + StagedTips (batch, complete)
+
+  index/
+    mod.rs          // TermId, TypeId; re-exports
+    interner.rs     // TermInterner (tags -> u32), TypeInterner (types -> u16, bounded)
+    tail.rs         // TailIndex: per-tag postings + dense type column, fed in position order
+    search.rs       // index-driven Query evaluator, ascending iterator (differential oracle)
 ```
 
 Naming: `Log`, not `Store` or `EventLog` (it reads as `crate::log::Log`). `SegmentSet`,
