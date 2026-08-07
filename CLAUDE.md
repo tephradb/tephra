@@ -448,43 +448,106 @@ in-memory hash work, millions of ops/sec on one core. Not the bottleneck.
 
 Off-thread: payload encoding, group-commit fsync, index flush and merge, all reads.
 
-**Sync, not async.** `Coordinator` owns a `Receiver`; `WriteHandle` is a cloneable
-`SyncSender<Request>` where each request carries a reply `Sender`. The caller blocks on
-the reply, so the API is `handle.append(events, condition) -> Result<Vec<Position>>`.
-The bounded channel gives backpressure for free.
+**Sync, not async.** The writer thread (`Worker`) owns the `SegmentSet` and a `Receiver`;
+`WriteHandle` is a cloneable `SyncSender<Message>` where each request carries a reply
+`Sender` (a per-call oneshot). The caller blocks on the reply, so the API is
+`handle.append(events, condition) -> Result<PositionRange, AppendError>`. Events are
+pre-encoded `Event`s: encoding is on the caller thread, off the writer. The bounded
+channel gives backpressure for free (the caller blocks when it is full). `WriteCoordinator`
+owns the join handle; `shutdown()` signals and joins, returning the `SegmentSet`, and a
+drop of the owner does the same. A `Message::Shutdown` sentinel gives deterministic
+shutdown even while handles are still live; channel disconnect handles the drop path.
 
-The loop blocks on `recv()`, then drains with `try_recv()` up to a batch cap. Group
-commit falls out naturally without a timer, and batch size grows automatically as fsync
-latency rises, which is exactly the desired behaviour.
+The loop blocks on `recv()`, then drains with `try_recv()` up to a record/byte batch cap.
+Group commit falls out naturally without a timer, and batch size grows automatically as
+fsync latency rises, which is exactly the desired behaviour. A one-slot pushback buffer
+holds a request received but deferred (over budget, or oversize and needing its own solo
+batch): `try_recv` hands over a request before it can be measured, so the buffer is
+required. An oversize request within segment capacity gets a solo batch; one beyond
+capacity is answered `TooLarge` and never blocks anything.
 
-### Append-condition fast reject (`TagTips`)
+**The condition check under group commit is the correctness core.** Several independent
+decisions drain into one batch, and two can conflict with each other (the uniqueness
+guard). Each accepted request is staged (its positions assigned, its tags recorded) before
+the next request in the same drain is evaluated, so a later request sees the earlier one.
+The whole batch is one `append_batch` (one fsync); on failure every staged request is
+answered with an error and nothing commits (`append_batch` rewinds, `next_position` does
+not advance). Partial success is not representable. The `after <= tip` invariant is
+asserted per request: a client cannot have observed a position past the durable tip, so a
+staged record (position strictly above the tip) can never be skipped by the `after`
+filter. A request past the tip is a bug and is rejected `AfterBeyondTip`.
 
-`HashMap<TermId, u64>` of last position per tag, **bounded to a recent position window**,
-not all tags. For an AND-item, if any tag has `max_position <= after`, the item cannot
-match: reject with a hash lookup and zero I/O.
+### Append-condition check: two arms
 
-The bound is what makes it viable. `after` is recent by construction (the position the
-client read at, milliseconds ago), so the map only needs tags touched within a recent
+The condition evaluator (`condition::evaluate`) is the one definition of "does a matching
+event exist after `after`" that the index (layer 3) will be differential-tested against.
+It has two arms, and **neither may ever produce a false negative** (silently accepting a
+conflicting write). `may_match` returns an enum (`DefinitelyNoMatch` / `Unknown`), never a
+bool, so every call site handles the `Unknown` fallthrough explicitly.
+
+**Durable arm: `TagTips` fast-reject, then the scan oracle.** `HashMap<tag, max_position>`
+of the highest position per tag, **bounded to a recent position window**. For an AND-item,
+if any tag has `max_position <= after`, the item cannot match: `DefinitelyNoMatch` with a
+hash lookup and zero I/O. On `Unknown`, fall through to the scan (`scan_after`, decode
+each `EventRef`, run `Query::matches`), which is the permanent oracle, not scaffolding.
+The scan is bounded because `after` is recent, so it touches only the tail. This arm is an
+optimisation over always scanning; correctness lives in the oracle.
+
+The bound is what makes the map viable. `after` is recent by construction (the position
+the client read at, milliseconds ago), so the map only needs tags touched within a recent
 window, sized by write rate times window duration, not by total tag cardinality. At 50k
 events/sec with a 60-second window that is a few million entries whether you have 100M
 entities or 100 billion. An unbounded version at 100M entities would be 3 to 5 GB, which
 is the correct objection to it.
 
-Rule with a window: if the tag is absent and `window_floor <= after`, its max position is
-below the floor, which is at or below `after`, so it cannot match. Reject. If
-`after < window_floor` (stale client, batch job, long-running decision model), fall
-through to the index. Correct in both cases.
+Rule with a window: if the tag is absent and `window_floor <= after`, its max is below the
+floor, which is at or below `after`, so it cannot match. `DefinitelyNoMatch`. If
+`after < window_floor`, fall through to the scan. The floor is **monotonic
+non-decreasing** (it starts at `next_position`, so a cold map is all-`Unknown` and every
+early append scans: correct warm-up, not a bug) and eviction only ever raises it. A tag
+whose only event predates the current floor therefore stays below it forever and can never
+produce a false negative. Bounding is memory-only: correctness never depends on the map's
+contents, only memory does. That is what makes crude eviction (raise the floor, drop what
+falls below) acceptable.
 
-A fixed-size hashed array with collisions is an acceptable fallback: a collided slot
-stores the max over several tags, which is `>=` the true max, so `stored_max <= after`
-still implies the real max is too. You lose a fast-reject opportunity, never
-correctness. **Never a false negative.**
+**Staged arm: `StagedTips`, complete knowledge of one drain window.** Staging a record
+updates a batch-local `StagedTips` with its not-yet-durable position, and a later request
+in the same drain is rejected by the same kind of tag lookup. This is load-bearing for
+batch correctness, not an optimisation: staged records are not durable, so no scan can see
+them. `StagedTips` and `TagTips` are **two types, not one**, because they disagree on what
+an absent tag means, and one type carrying both meanings is exactly the subtlety that
+reads as correct and is not. Absent in `TagTips` means "maybe below the floor" (`Unknown`);
+absent in `StagedTips` means "definitely not staged" (no conflict). A single flagged type
+with `window_floor = tip` would return `Unknown` for every `after < tip` and reject the
+first conditional request in a drain against nothing.
 
-This is an optimisation, not load-bearing. Without it, seek the tag's postings for its
-max position; segment pruning means that touches the tail segment anyway.
+The staged check is **conservative and tag-only**: it ignores the query's type constraint
+(the staged map has no types), so two same-window requests sharing an item's full tag set
+conflict even if a precise type check would clear them. This is safe (never accepts a true
+conflict) and self-correcting: the loser is answered `ConflictSite::SameBatch`, which is
+**advisory and retryable**, and a retry re-reads the now-durable record for the precise
+verdict. A durable conflict is `ConflictSite::Durable(pos)`, terminal until the client
+rebuilds. A layer above the coordinator must honour that distinction and must not collapse
+the two into a bare position. This conservatism is only safe if callers retry; the retry
+contract is the future client layer's obligation.
 
-Test the window boundary and the `after < window_floor` fallthrough hard: a false
-negative there silently accepts a conflicting write.
+**Keys are the tag strings, not a hash.** A `HashMap<Box<str>, _>` looks up by `&str` for
+free, so recording and querying allocate nothing on the read side. A hash was rejected: it
+throws away diagnosability in the one component whose failure mode is invisible by design
+(a `u64` cannot answer "which tag" when a spurious rejection or a property-test
+disagreement is investigated), and it is *not* a step toward layer 3, which interns tags to
+an exact `TermId(u32)` and discards a hash rather than building on it. A window-bounded map
+of string keys costs a few MB; revisit only if profiling says so. A fixed-size hashed array
+with collisions remains an acceptable *memory-bounded* fallback if it ever matters: a
+collided slot stores the max over several tags (`>=` the true max), so `stored <= after`
+still implies the real max is, losing a fast-reject but never correctness. Its constraint
+is that a collision may only lose a fast-reject, never invert one.
+
+A paranoid `verify_tips` mode (a runtime flag, so a property test can flip it per case, not
+a cargo feature) runs the scan even on `DefinitelyNoMatch` and asserts they agree. Test the
+window boundary and the `after < window_floor` fallthrough hard, and the `after == tip`
+case with a staged record at `tip + 1`: a false negative there silently accepts a
+conflicting write.
 
 ---
 
@@ -623,8 +686,8 @@ src/
     coordinator.rs  // owns the writer thread loop
     handle.rs       // WriteHandle: cloneable, Send, blocking append()
     batch.rs        // accumulates records + assigns positions
-    condition.rs    // evaluates AppendCondition
-    tips.rs         // TagTips: bounded recent tag -> max position window
+    condition.rs    // evaluates AppendCondition (two arms: staged, then durable)
+    tips.rs         // TagTips (durable, lossy) + StagedTips (batch, complete)
 ```
 
 Naming: `Log`, not `Store` or `EventLog` (it reads as `crate::log::Log`). `SegmentSet`,

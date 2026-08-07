@@ -47,6 +47,14 @@ const NAME_DIGITS: usize = 20;
 /// "empty", so events (and the first segment's base) start at 1.
 const FIRST_POSITION: u64 = 1;
 
+/// Per-record framing overhead (length + CRC), on top of the record's own bytes.
+/// Exposed so the write coordinator can budget batch sizes without importing seglog.
+pub const RECORD_OVERHEAD: usize = RECORD_HEAD_SIZE;
+
+/// Fixed overhead a batch pays once for its trailing commit marker (the marker's own
+/// record frame plus its payload).
+pub const BATCH_OVERHEAD: usize = RECORD_HEAD_SIZE + COMMIT_MARKER_PAYLOAD;
+
 /// Configuration for the segments in a set. All segments in a set share it.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentConfig {
@@ -638,6 +646,17 @@ impl SegmentSet {
     /// The next position that will be assigned.
     pub fn next_position(&self) -> Position {
         self.next_position
+    }
+
+    /// Largest batch (records plus commit marker) that can fit an empty segment. The
+    /// write coordinator budgets against this so a multi-request batch always fits.
+    pub fn segment_capacity(&self) -> usize {
+        self.config.segment_size - self.config.header_size
+    }
+
+    /// Largest a single record may be. A batch containing a larger record is rejected.
+    pub fn max_record_len(&self) -> usize {
+        self.config.max_record_len
     }
 
     /// Number of sealed (immutable) segments.

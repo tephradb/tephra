@@ -217,7 +217,7 @@ pub enum EncodeError {
 }
 
 /// Error decoding an [`EventRef`] from bytes.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("buffer is shorter than the encoded event claims")]
     Truncated,

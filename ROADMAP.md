@@ -136,24 +136,38 @@ Pure logic, no I/O.
 
 ## Phase 4: Write coordinator (layer 2)
 
-- [ ] `writer/tips.rs`: `TagTips`, bounded window map, `record()` and `may_match()`
-- [ ] Test the window boundary and the `after < window_floor` fallthrough hard. A false
-      negative silently accepts a conflicting write
-- [ ] Optional: fixed-size hashed array fallback, with a test that collisions only ever
-      lose a fast-reject, never correctness
-- [ ] `writer/condition.rs`: tips fast-reject, then fall through to a scan from `after`
-      to the end
-- [ ] Slow path is a full scan in v1. Correct and slow, and it becomes the
-      known-correct baseline the index is tested against later
-- [ ] `writer/batch.rs`: accumulate records, assign positions
-- [ ] `writer/handle.rs`: `WriteHandle`, bounded `SyncSender<Request>`, per-request reply
-      `Sender`, blocking `append()`
-- [ ] `writer/coordinator.rs`: thread loop, `recv()` then `try_recv()` drain to a batch
-      cap, group commit without a timer
-- [ ] Shutdown signal (`crossbeam-channel` select, or a sentinel request)
-- [ ] Backpressure behaviour under a full queue: decide block vs reject, document it
-- [ ] Concurrency tests: N threads appending, positions dense and unique, no gaps
-- [ ] Conflict tests: two decisions on overlapping tags, exactly one wins
+- [x] `writer/tips.rs`: `TagTips` (durable, lossy) with a bounded window map and
+      `may_match() -> Verdict{DefinitelyNoMatch, Unknown}`, plus `StagedTips` (batch,
+      complete). **Two types, not one**: they disagree on what an absent tag means
+      (`Unknown` vs "definitely not staged"), which is load-bearing. Keys are tag strings
+      (`Box<str>`), not a hash, for diagnosability (CLAUDE.md 6). Floor is monotonic
+      non-decreasing so an event predating the floor never yields a false negative
+- [x] Tested the window boundary, the `after < window_floor` fallthrough, the
+      `after == tip` with staged-at-`tip + 1` boundary, and floor monotonicity. A
+      randomized `verify_tips` property test (600 iters) asserts tips agree with the scan
+- [x] ~~Fixed-size hashed array fallback~~ **Not built.** String keys do not collide;
+      the collision-safety property is documented as a constraint on any future hashed
+      variant rather than tested here (CLAUDE.md 6)
+- [x] `writer/condition.rs`: two arms. Staged arm (`StagedTips`) settles intra-batch
+      conflicts (conservative, tag-only, `ConflictSite::SameBatch`, advisory/retryable);
+      durable arm is tips fast-reject then a scan from `after` (`ConflictSite::Durable`)
+- [x] Scan oracle is permanent, not v1 scaffolding: it is the baseline the index is
+      differential-tested against, and the `verify_tips` cross-check keeps tips honest
+- [x] `writer/batch.rs`: accumulate borrowed record bytes, assign dense positions,
+      `commit_ok` (absorb staged tags into the main tips + reply ranges) / `commit_err`
+      (reply the one error to every staged request; all-or-nothing)
+- [x] `writer/handle.rs`: `WriteHandle`, bounded `SyncSender<Message>`, per-request reply
+      oneshot, blocking `append(events, condition) -> Result<PositionRange, AppendError>`
+- [x] `writer/coordinator.rs`: thread loop, `recv()` then `try_recv()` drain to a
+      record/byte cap, group commit without a timer, one-slot pushback buffer for
+      deferred/oversize requests, `after <= tip` invariant asserted per request
+- [x] Shutdown: drop-based (channel disconnect) plus an explicit `Message::Shutdown`
+      sentinel; `WriteCoordinator::shutdown()` joins and returns the `SegmentSet`
+- [x] Backpressure: **block the caller** (bounded `SyncSender`), documented. Tested that
+      a tiny queue still serves every write with dense positions
+- [x] Concurrency tests: N threads appending, positions dense, unique, no gaps
+- [x] Conflict tests: overlapping uniqueness guard, exactly one wins (same-batch and
+      durable paths), plus oversize routing/isolation and no-events rejection
 
 **Milestone: after phase 4, this is a correct, durable, DCB-compliant store.** It just
 restarts slowly and answers selective queries by scanning. Everything below is
