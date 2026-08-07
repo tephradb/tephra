@@ -493,6 +493,11 @@ fn decode_data(buf: &[u8], data_offset: u32) -> &[u8] {
 /// `lens` is the raw little-endian `u16` length header (2 bytes per tag), read
 /// straight out of the event buffer rather than a decoded side array, so the view
 /// stays allocation-free.
+///
+/// `Copy` because it is three trivially-copyable fields (two shared slices and a
+/// cursor): copying yields an independent cursor over the same tags, which is what
+/// the match predicate needs to re-walk the tags without re-decoding the event.
+#[derive(Clone, Copy)]
 pub struct TagsRef<'a> {
     data: &'a [u8],
     lens: &'a [u8],

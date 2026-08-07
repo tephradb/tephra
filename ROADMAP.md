@@ -112,15 +112,25 @@ Pure logic, no I/O. Blocks everything in phase 3.
 
 Pure logic, no I/O.
 
-- [ ] `QueryItem { types: Vec<EventType>, tags: Tags }`
-- [ ] `Query` as a set of items, plus the `Query::all()` variant
-- [ ] `AppendCondition { fail_if_events_match: Query, after: Position }`
-- [ ] The match predicate: type in list AND all tags present, as a linear merge over
-      sorted slices
-- [ ] One definition of the predicate, shared by the condition evaluator and (later) the
-      index. This is the thing they must agree on
-- [ ] Test the OR-across-items / AND-within-item semantics explicitly, including the
-      empty-types case (matches any type) and `after: 0`
+- [x] `QueryItem { types: Vec<EventType>, tags: Tags }` (with `new` / `of_types` /
+      `with_tags` / `default` constructors; `types` unsorted since it is low
+      cardinality and membership is a linear `any`)
+- [x] `Query` as a set of items, plus the `Query::all()` variant. Modelled as an enum
+      (`All` vs `Items(Vec<QueryItem>)`) so the read/condition paths can recognise a
+      full scan and bypass the index; empty `Items` matches nothing (OR over zero)
+- [x] `AppendCondition { fail_if_events_match: Query, after: Position }` (`new` defaults
+      `after` to `Position::ZERO`, the 1-based "whole log" bound; `.after(pos)` builder)
+- [x] The match predicate: type in list (empty list matches any type) AND all tags
+      present, as a linear merge over sorted sequences (`tags_contained`). The item's
+      `Tags` is sorted by construction and `EventRef::tags()` decodes in sorted order,
+      so neither side sorts at match time
+- [x] One definition of the predicate: `Query::matches` / `QueryItem::matches`, to be
+      shared by the condition evaluator (layer 2) and differential-tested against the
+      index (layer 3)
+- [x] Tests: OR-across-items, AND-within-item, empty-types (matches any type), empty
+      item (matches everything), empty `Items` (matches nothing), tag-merge boundary
+      cases (overshoot, exhaust, no tags), and `AppendCondition` default `after: 0` plus
+      the `.after` bound
 
 ---
 

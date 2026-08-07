@@ -2,6 +2,7 @@ use std::{fmt, ops};
 
 pub mod event;
 pub mod log;
+pub mod query;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position(u64);
