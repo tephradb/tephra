@@ -1,0 +1,12 @@
+[package]
+name = "dcbdb-proto"
+description = "Wire protocol (protobuf messages + length-prefixed framing) shared by the dcbdb TCP server and client"
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[dependencies]
+protobuf = "=4.35.1-release"
+
+[build-dependencies]
+protobuf-codegen = "=4.35.1-release"

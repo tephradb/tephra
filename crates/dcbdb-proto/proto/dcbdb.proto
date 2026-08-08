@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package dcbdb.v1;
+
+// A single event: an opaque type string, a set of tag strings, and an opaque payload.
+// The server validates these against dcbdb's own constructors.
+message Event {
+  string type = 1;
+  repeated string tags = 2;
+  bytes payload = 3;
+}
+
+// One alternative in a query: types OR'd within the item, tags AND'd within the item.
+message QueryItem {
+  repeated string types = 1;
+  repeated string tags = 2;
+}
+
+// A query: the catch-all (all = true) or a set of items OR'd together.
+message Query {
+  bool all = 1;
+  repeated QueryItem items = 2;
+}
+
+// The guard on an append: reject if any event after `after` matches the query.
+// `after` = 0 means "consider the whole log" (positions are 1-based).
+message AppendCondition {
+  Query fail_if_events_match = 1;
+  uint64 after = 2;
+}
+
+message AppendRequest {
+  repeated Event events = 1;
+  optional AppendCondition condition = 2;
+}
+
+message ReadRequest {
+  Query query = 1;
+  uint64 after = 2;
+}
+
+message AppendResponse {
+  uint64 first = 1;
+  uint64 last = 2;
+}
+
+message SequencedEvent {
+  uint64 position = 1;
+  Event event = 2;
+}
+
+// A streamed batch of events for a read. Zero or more of these precede a ReadEnd.
+message ReadEvents {
+  repeated SequencedEvent events = 1;
+}
+
+// Terminates a successful read, carrying the watermark the read was pinned to.
+message ReadEnd {
+  uint64 watermark = 1;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_CONFLICT = 1;
+  ERROR_CODE_AFTER_BEYOND_TIP = 2;
+  ERROR_CODE_EMPTY = 3;
+  ERROR_CODE_TOO_LARGE = 4;
+  ERROR_CODE_BAD_REQUEST = 5;
+  ERROR_CODE_INTERNAL = 6;
+  ERROR_CODE_SHUTDOWN = 7;
+}
+
+message ErrorResponse {
+  ErrorCode code = 1;
+  string message = 2;
+  // Set for a durable append conflict: the position of the conflicting event.
+  optional uint64 conflict_position = 3;
+  // A same-batch conflict is advisory and retryable; a durable one is terminal.
+  bool retryable = 4;
+}
+
+message Request {
+  uint64 request_id = 1;
+  oneof kind {
+    AppendRequest append = 2;
+    ReadRequest read = 3;
+  }
+}
+
+message Response {
+  uint64 request_id = 1;
+  oneof kind {
+    AppendResponse append = 2;
+    ReadEvents read_events = 3;
+    ReadEnd read_end = 4;
+    ErrorResponse error = 5;
+  }
+}

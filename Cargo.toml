@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/seglog"]
+members = [
+    ".",
+    "crates/seglog",
+    "crates/dcbdb-proto",
+    "crates/dcbdb-server",
+    "crates/dcbdb-client",
+]
 resolver = "2"
 
 [package]

@@ -1,0 +1,28 @@
+[package]
+name = "dcbdb-server"
+description = "Synchronous, thread-per-connection TCP server exposing a dcbdb event store over the length-prefixed protobuf protocol"
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[dependencies]
+dcbdb = { path = "../.." }
+dcbdb-proto = { path = "../dcbdb-proto" }
+
+ctrlc = "3"
+protobuf = "=4.35.1-release"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+dcbdb-client = { path = "../dcbdb-client" }
+
+tempfile = "3"
+
+[[bin]]
+name = "dcbdb-server"
+path = "src/main.rs"
+
+[lib]
+name = "dcbdb_server"
+path = "src/lib.rs"
