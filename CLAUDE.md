@@ -485,13 +485,19 @@ It has two arms, and **neither may ever produce a false negative** (silently acc
 conflicting write). `may_match` returns an enum (`DefinitelyNoMatch` / `Unknown`), never a
 bool, so every call site handles the `Unknown` fallthrough explicitly.
 
-**Durable arm: `TagTips` fast-reject, then the scan oracle.** `HashMap<tag, max_position>`
-of the highest position per tag, **bounded to a recent position window**. For an AND-item,
-if any tag has `max_position <= after`, the item cannot match: `DefinitelyNoMatch` with a
-hash lookup and zero I/O. On `Unknown`, fall through to the scan (`scan_after`, decode
-each `EventRef`, run `Query::matches`), which is the permanent oracle, not scaffolding.
-The scan is bounded because `after` is recent, so it touches only the tail. This arm is an
-optimisation over always scanning; correctness lives in the oracle.
+**Durable arm: `TagTips` fast-reject, then the index existence check.** `HashMap<tag,
+max_position>` of the highest position per tag, **bounded to a recent position window**. For
+an AND-item, if any tag has `max_position <= after`, the item cannot match:
+`DefinitelyNoMatch` with a hash lookup and zero I/O. On `Unknown`, resolve with an
+**early-terminating index existence check** (`IndexSet::find_match`, phase 6d): it probes the
+touched segments in ascending order and returns the first (lowest) matching position, reusing
+the one spec-pinned `index::search` evaluator, so it returns exactly the position the scan
+would. The scan (`scan_after`, decode each `EventRef`, run `Query::matches`) stays as the
+**oracle**: the `verify` cross-check, and the fallback when a touched segment is unindexable
+(or the `condition_force_scan` escape hatch). The `after`-omitted uniqueness guard always
+falls through (the floor starts above `0`), so the index is what makes it O(touched segments)
+of FST probes instead of an O(total events) log decode. Correctness lives in the oracle;
+`find_match` is differential-tested against it and can only change the speed.
 
 The bound is what makes the map viable. `after` is recent by construction (the position
 the client read at, milliseconds ago), so the map only needs tags touched within a recent
@@ -502,7 +508,7 @@ is the correct objection to it.
 
 Rule with a window: if the tag is absent and `window_floor <= after`, its max is below the
 floor, which is at or below `after`, so it cannot match. `DefinitelyNoMatch`. If
-`after < window_floor`, fall through to the scan. The floor is **monotonic
+`after < window_floor`, fall through to the index existence check. The floor is **monotonic
 non-decreasing** (it starts at `next_position`, so a cold map is all-`Unknown` and every
 early append scans: correct warm-up, not a bug) and eviction only ever raises it. A tag
 whose only event predates the current floor therefore stays below it forever and can never
@@ -544,10 +550,14 @@ still implies the real max is, losing a fast-reject but never correctness. Its c
 is that a collision may only lose a fast-reject, never invert one.
 
 A paranoid `verify_tips` mode (a runtime flag, so a property test can flip it per case, not
-a cargo feature) runs the scan even on `DefinitelyNoMatch` and asserts they agree. Test the
-window boundary and the `after < window_floor` fallthrough hard, and the `after == tip`
-case with a staged record at `tip + 1`: a false negative there silently accepts a
-conflicting write.
+a cargo feature) cross-checks the fast path against the scan oracle: it runs the scan on both
+the `DefinitelyNoMatch` tips verdict and the `Unknown` index verdict and requires agreement.
+A disagreement is a bug, but the scan is authoritative, so it is logged and the writer
+**degrades to the scan answer** rather than panicking the writer thread and poisoning every
+future append (it panics only in debug builds, so tests fail loudly): the same "a degraded
+component errors, never answers short" discipline as the unindexable path. Test the window
+boundary and the `after < window_floor` fallthrough hard, and the `after == tip` case with a
+staged record at `tip + 1`: a false negative there silently accepts a conflicting write.
 
 ---
 
@@ -586,8 +596,9 @@ planner's streaming, which is a later concern.
 The `ActiveTail` is fed **in position order** via `push(position, event)`, guarded by a
 real (not `debug_assert`) contiguity assert: out-of-order feeding would silently produce
 unsorted posting lists that break every intersection. Feeding is inline at the commit seam
-(the `TagTips::absorb` point) in 5b; the append-condition hot path keeps the scan oracle
-until phase 6d wires the `Unknown` fallthrough onto the index.
+(the `TagTips::absorb` point) in 5b; the append-condition durable arm resolves its `Unknown`
+fallthrough through this same tail plus the sealed segments (`IndexSet::find_match`, phase
+6d), keeping the scan only as the oracle and the unindexable fallback.
 
 The tail index's per-tag postings **subsume** the layer-2 `TagTips`: a tag's max position
 is just the last element of its posting list. They are kept as separate structures for now

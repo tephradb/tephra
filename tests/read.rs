@@ -131,6 +131,7 @@ fn coordinator_with_scan_bias(scan_bias: u32) -> (WriteCoordinator, WriteHandle,
         tips_window: 1_000_000,
         verify_tips: false,
         read: ReadConfig { scan_bias },
+        ..WriterConfig::default()
     };
     let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
     (coord, handle, dir)

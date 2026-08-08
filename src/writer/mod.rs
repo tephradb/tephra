@@ -48,6 +48,12 @@ pub struct WriterConfig {
     /// Paranoid cross-check: scan even on `DefinitelyNoMatch` and assert agreement. A
     /// runtime flag (not a cargo feature) so the property test can flip it per case.
     pub verify_tips: bool,
+    /// Force the append-condition durable arm to resolve `Verdict::Unknown` with the scan
+    /// oracle instead of the index existence check ([`condition`], phase 6d). An operational
+    /// escape hatch (the log is the source of truth, so the scan is always safe) and the A/B
+    /// control the `condition_path` benchmark uses to measure index-vs-scan. `false` in
+    /// production.
+    pub condition_force_scan: bool,
     /// Read-path tuning for the handles this coordinator hands out (the index-vs-scan cost
     /// model, CLAUDE.md 8). Reads run off the writer thread, so this only configures the
     /// planner, never the append path.
@@ -62,6 +68,7 @@ impl Default for WriterConfig {
             max_batch_bytes: 8 * 1024 * 1024,
             tips_window: 1_000_000,
             verify_tips: false,
+            condition_force_scan: false,
             read: ReadConfig::default(),
         }
     }

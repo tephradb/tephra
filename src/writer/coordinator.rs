@@ -225,8 +225,15 @@ impl Worker {
                     }));
                     continue;
                 }
-                match condition::evaluate(cond, &self.tips, batch.staged_tips(), &self.set, verify)
-                {
+                match condition::evaluate(
+                    cond,
+                    &self.tips,
+                    batch.staged_tips(),
+                    &self.index,
+                    &self.set,
+                    verify,
+                    self.cfg.condition_force_scan,
+                ) {
                     Ok(Some(at)) => {
                         let _ = req.reply.send(Err(AppendError::Conflict { at }));
                         continue;
@@ -325,6 +332,7 @@ mod tests {
             max_batch_bytes: SEG_SIZE / 2,
             tips_window: 1_000_000,
             verify_tips: true,
+            condition_force_scan: false,
             read: ReadConfig::default(),
         }
     }
@@ -667,6 +675,110 @@ mod tests {
             }
             assert_eq!(w.set.last_position(), Position::new(expected_last));
         }
+    }
+
+    // --- phase 6d: the index-backed durable arm and its scan fallback ---
+
+    /// Builds a worker over a tiny-segment log so a modest workload seals several segments,
+    /// exercising both the sealed-segment and active-tail halves of the condition check.
+    fn small_worker(dir: &TempDir, cfg: WriterConfig) -> Worker {
+        let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+        let index = IndexSet::open(&set).unwrap();
+        let read_core = ReadCore::new(&set, &index);
+        let (_tx, rx) = channel::bounded(cfg.queue_capacity);
+        let tips = TagTips::new(set.next_position(), cfg.tips_window);
+        Worker {
+            set,
+            index,
+            tips,
+            cfg,
+            rx,
+            pushback: None,
+            shutdown: false,
+            read_core,
+        }
+    }
+
+    #[test]
+    fn unindexable_fallback_matches_the_indexed_verdict() {
+        // The Unknown -> Unindexable -> scan fallback must yield the identical verdict the
+        // index path would. This path only fires once a segment has already degraded, so it
+        // is tested directly rather than left cold. Two workers take the identical workload
+        // across several sealed segments; one then has its whole index forced unindexable,
+        // and both must answer the same conditional appends the same way.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let mut a = small_worker(&dir_a, cfg());
+        let mut b = small_worker(&dir_b, cfg());
+        for i in 0..60u64 {
+            let (ra, _rxa) = request(&[("E", &[&format!("k:{}", i % 7)])], None);
+            let (rb, _rxb) = request(&[("E", &[&format!("k:{}", i % 7)])], None);
+            a.process(&[ra]);
+            b.process(&[rb]);
+        }
+        assert!(a.set.sealed_len() >= 1, "tiny segments should have sealed");
+        assert_eq!(a.set.last_position(), b.set.last_position());
+
+        // Degrade B's index: its condition check must now fall back to the scan oracle.
+        b.index.force_unindexable_for_test();
+
+        // A guard on an existing tag conflicts (Durable) at the same position in both.
+        let (ga, rga) = request(&[("G", &["k:3"])], Some(guard(&["k:3"], Position::ZERO)));
+        let (gb, rgb) = request(&[("G", &["k:3"])], Some(guard(&["k:3"], Position::ZERO)));
+        a.process(&[ga]);
+        b.process(&[gb]);
+        match (assert_err(&rga), assert_err(&rgb)) {
+            (
+                AppendError::Conflict {
+                    at: ConflictSite::Durable(pa),
+                },
+                AppendError::Conflict {
+                    at: ConflictSite::Durable(pb),
+                },
+            ) => assert_eq!(pa, pb, "index and scan-fallback name the same conflict"),
+            other => panic!("expected matching durable conflicts, got {other:?}"),
+        }
+
+        // A guard on a fresh tag succeeds in both (no match anywhere).
+        let (fa, rfa) = request(
+            &[("G", &["fresh:z"])],
+            Some(guard(&["fresh:z"], Position::ZERO)),
+        );
+        let (fb, rfb) = request(
+            &[("G", &["fresh:z"])],
+            Some(guard(&["fresh:z"], Position::ZERO)),
+        );
+        a.process(&[fa]);
+        b.process(&[fb]);
+        assert_eq!(assert_ok(&rfa), assert_ok(&rfb));
+    }
+
+    #[test]
+    fn condition_force_scan_still_detects_durable_conflict() {
+        // The escape hatch resolves the durable arm with the scan oracle instead of the
+        // index; a durable conflict must still be caught.
+        let dir = TempDir::new().unwrap();
+        let cfg = WriterConfig {
+            condition_force_scan: true,
+            ..cfg()
+        };
+        let (mut w, _tx) = worker(&dir, cfg);
+
+        let (r1, rx1) = request(&[("Reserved", &["unique:x"])], None);
+        w.process(&[r1]);
+        assert_ok(&rx1);
+
+        let (r2, rx2) = request(
+            &[("Reserved", &["unique:x"])],
+            Some(guard(&["unique:x"], Position::ZERO)),
+        );
+        w.process(&[r2]);
+        assert!(matches!(
+            assert_err(&rx2),
+            AppendError::Conflict {
+                at: ConflictSite::Durable(p)
+            } if p == Position::new(1)
+        ));
     }
 
     #[test]

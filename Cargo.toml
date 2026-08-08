@@ -42,5 +42,9 @@ name = "read_path"
 harness = false
 
 [[bench]]
+name = "condition_path"
+harness = false
+
+[[bench]]
 name = "compare"
 harness = false

@@ -303,10 +303,23 @@ index). See the phase-6 plan for the confirmed decisions behind each.
 
 ### Phase 6d: Condition fallthrough onto the index
 
-- [ ] Wire the `TagTips` `Unknown` fallthrough to an early-terminating index existence check
-      (over the active `ActiveTail` plus the sealed segments) instead of a full scan, with a
-      scan fallback on an unindexable segment; keep `verify_tips`; the index existence verdict
-      differential-tested to never disagree with the scan oracle
+- [x] Wired the `TagTips` `Unknown` fallthrough to an early-terminating index existence check
+      (`IndexSet::find_match`, over the active `ActiveTail` plus the sealed segments, probing
+      touched segments in ascending order and returning the first match, reusing the one
+      spec-pinned `index::search` evaluator) instead of a full scan. Scan fallback on an
+      unindexable touched segment (logged at warn), plus a `WriterConfig::condition_force_scan`
+      escape hatch. `find_match` differential-tested against the scan oracle (a `set.rs` unit
+      test equals the scan's first match for every query/`after`; the `verify_tips` property
+      test now cross-checks the `Unknown` index arm too)
+- [x] Made `verify_tips` non-fatal: a fast-path/scan disagreement is logged and the writer
+      degrades to the authoritative scan answer (panicking only in debug builds), never
+      poisoning the writer thread; the pre-existing `DefinitelyNoMatch` `assert!` was folded
+      into the same graceful path
+- [x] Benchmark (`benches/condition_path.rs`): the `after: 0` uniqueness guard, index vs
+      forced-scan, over growing history. Confirms the crossover (index near-flat at a few µs;
+      scan linear in history, ~1000x slower at 32k events on tmpfs). The unindexable
+      scan-fallback verdict is differential-tested to equal the indexed verdict
+      (`coordinator.rs`)
 
 ## Phase 7: Subscriptions
 

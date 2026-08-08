@@ -208,21 +208,15 @@ impl IndexSet {
         self.active_unindexable = false;
     }
 
-    /// Positions matching `query`, ascending, deduped, strictly after `after`, across
-    /// every segment.
+    /// The segments a query restricted to positions after `after` actually touches, in
+    /// ascending base order (sealed first, then the active tail).
     ///
-    /// Prunes segments whose whole range is at or before `after` by header comparison,
-    /// then, over only the segments the query actually touches, errors if any is
-    /// unindexable (never a short answer), then concatenates their ascending per-segment
-    /// outputs. The materialized order is already globally ascending because the segments
-    /// are disjoint and ordered.
-    pub fn search_all(
-        &self,
-        query: &Query,
-        after: Position,
-    ) -> Result<std::vec::IntoIter<Position>, IndexError> {
-        // Prune, then check: collect the segments this query touches, erroring up front if
-        // any touched segment is unindexable, before any positions are produced.
+    /// Prunes segments whose whole range is at or before `after` by header comparison, and
+    /// errors up front (before any positions are produced) if any surviving segment is
+    /// unindexable, so a covering query never gets a short answer (CLAUDE.md 7). Shared by
+    /// [`search_all`](Self::search_all) and [`find_match`](Self::find_match) so the pruning
+    /// and unindexable checks have exactly one definition.
+    fn plan_touched(&self, after: Position) -> Result<Vec<Touched<'_>>, IndexError> {
         let mut plan: Vec<Touched<'_>> = Vec::new();
         for entry in &self.sealed {
             let Some(max) = entry.max_position() else {
@@ -257,9 +251,22 @@ impl IndexSet {
                 plan.push(Touched::Active(self.active.as_ref()));
             }
         }
+        Ok(plan)
+    }
 
+    /// Positions matching `query`, ascending, deduped, strictly after `after`, across
+    /// every segment.
+    ///
+    /// Prunes and unindexable-checks via [`plan_touched`](Self::plan_touched), then
+    /// concatenates the touched segments' ascending per-segment outputs. The materialized
+    /// order is already globally ascending because the segments are disjoint and ordered.
+    pub fn search_all(
+        &self,
+        query: &Query,
+        after: Position,
+    ) -> Result<std::vec::IntoIter<Position>, IndexError> {
         let mut out = Vec::new();
-        for touched in plan {
+        for touched in self.plan_touched(after)? {
             match touched {
                 Touched::Seg(seg) => out.extend(search(seg, query, after)),
                 // The active tail is queried through a full (unbounded) view: `search_all`
@@ -268,6 +275,51 @@ impl IndexSet {
             }
         }
         Ok(out.into_iter())
+    }
+
+    /// The first (lowest) position matching `query` strictly after `after`, or `None` if no
+    /// indexed event matches. The early-terminating existence check the append-condition
+    /// durable arm uses in place of a linear log scan (CLAUDE.md 6, phase 6d).
+    ///
+    /// Probes the touched segments in ascending base order and returns as soon as one yields
+    /// a match: because the segments are position-disjoint and ordered, the first match in
+    /// the earliest touched segment is the global minimum, identical to what the scan oracle
+    /// returns (so a reported [`ConflictSite::Durable`](crate::writer::ConflictSite) names
+    /// the true earliest conflict). Early termination is at segment granularity, reusing the
+    /// one spec-pinned [`search`] evaluator rather than a second, divergent one.
+    ///
+    /// Errors [`IndexError::Unindexable`] if a touched segment is degraded, exactly like
+    /// [`search_all`](Self::search_all); the caller falls back to the scan oracle for that
+    /// range. Does no I/O (segments are resident in memory), so in practice that is the only
+    /// error it can produce.
+    pub fn find_match(
+        &self,
+        query: &Query,
+        after: Position,
+    ) -> Result<Option<Position>, IndexError> {
+        for touched in self.plan_touched(after)? {
+            let first = match touched {
+                Touched::Seg(seg) => search(seg, query, after).next(),
+                Touched::Active(tail) => search(&tail.view_full(), query, after).next(),
+            };
+            if first.is_some() {
+                return Ok(first);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Forces every segment unindexable, so a covering query errors and the caller falls
+    /// back to a log scan. White-box test support for the `Unindexable` -> scan fallback
+    /// path, which a real >`u16::MAX`-distinct-types segment (not a practical fixture)
+    /// would otherwise be needed to reach.
+    #[cfg(test)]
+    pub(crate) fn force_unindexable_for_test(&mut self) {
+        for entry in &mut self.sealed {
+            entry.seg = None;
+        }
+        self.active_unindexable = true;
+        self.active.mark_unindexable();
     }
 }
 
@@ -653,5 +705,73 @@ mod tests {
             let from_scan = scan_baseline(&set, &q, Position::new(after));
             assert_eq!(from_index, from_scan, "after {after}");
         }
+    }
+
+    #[test]
+    fn find_match_is_the_first_position_the_scan_would_return() {
+        // The existence check must equal the scan oracle's first match for every
+        // (query, after): the durable arm reports that position as the conflict site.
+        let dir = TempDir::new().unwrap();
+        let set = build_log(dir.path());
+        let index = IndexSet::open(&set).unwrap();
+
+        let queries = [
+            Query::all(),
+            Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+            Query::item(QueryItem::with_tags(tags(&["student:s2"]))),
+            Query::item(QueryItem::of_types(vec![
+                EventType::new("Enrolled").unwrap(),
+            ])),
+            Query::items(vec![
+                QueryItem::with_tags(tags(&["course:c1"])),
+                QueryItem::with_tags(tags(&["student:s2"])),
+            ]),
+            // A tag no event carries: never a match.
+            Query::item(QueryItem::with_tags(tags(&["ghost:x"]))),
+        ];
+        let last = set.last_position().get();
+        for query in &queries {
+            for after in 0..=last {
+                let found = index.find_match(query, Position::new(after)).unwrap();
+                let expected = scan_baseline(&set, query, Position::new(after))
+                    .into_iter()
+                    .next();
+                assert_eq!(found, expected, "query {query:?} after {after}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_match_prunes_and_errors_like_search_all() {
+        // Mirrors `unindexable_segment_errors_when_touched_but_not_when_pruned` for the
+        // existence check: a touched unindexable segment errors, a pruned one does not.
+        let dir = TempDir::new().unwrap();
+        let index = IndexSet {
+            dir: dir.path().to_path_buf(),
+            sealed: vec![SealedIndex {
+                base: Position::new(1),
+                count: 3,
+                seg: None,
+            }],
+            active: Arc::new(super::super::ActiveTail::new(Position::new(4))),
+            active_base: Position::new(4),
+            active_span: 0,
+            active_unindexable: false,
+        };
+
+        // `after = 0` touches the unindexable segment: error naming its exact range.
+        match index.find_match(&Query::all(), Position::ZERO) {
+            Err(IndexError::Unindexable { range }) => {
+                assert_eq!(range.first, Position::new(1));
+                assert_eq!(range.last, Position::new(3));
+            }
+            other => panic!("expected Unindexable error, got {other:?}"),
+        }
+
+        // `after = 3` prunes the whole segment away: no match, no error.
+        assert_eq!(
+            index.find_match(&Query::all(), Position::new(3)).unwrap(),
+            None
+        );
     }
 }

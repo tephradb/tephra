@@ -12,7 +12,7 @@ use dcbdb::Position;
 use dcbdb::event::{Event, EventType, Tag, Tags};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::query::{AppendCondition, Query, QueryItem};
-use dcbdb::writer::{AppendError, WriteCoordinator, WriteHandle, WriterConfig};
+use dcbdb::writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};
 
 const SEG_SIZE: usize = 1 << 20;
 
@@ -259,6 +259,67 @@ fn index_search_sees_own_writes_across_rollovers() {
 
     drop(handle);
     coord.shutdown();
+}
+
+#[test]
+fn durable_conflict_detected_through_the_index_across_sealed_segments() {
+    // With verify off, the durable arm runs the index existence check alone (no scan
+    // cross-check), so this exercises the real production path (phase 6d). Tiny segments
+    // force seals, so the guarded tag lives in an early *sealed* segment: the check must
+    // find it there, proving the index path works across sealed segments, not just the
+    // active tail. This is the `after`-omitted uniqueness guard, the shape 6d most improves.
+    let dir = TempDir::new().unwrap();
+    let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+    let cfg = WriterConfig {
+        queue_capacity: 64,
+        max_batch_records: 64,
+        max_batch_bytes: 256,
+        verify_tips: false,
+        ..WriterConfig::default()
+    };
+    let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
+
+    // The guarded tag lands first, then enough filler to seal several later segments.
+    handle
+        .append(vec![event("Reserved", &["unique:early"])], None)
+        .unwrap();
+    for i in 0..80u64 {
+        handle
+            .append(vec![event("Filler", &[&format!("f:{i}")])], None)
+            .unwrap();
+    }
+
+    // A uniqueness guard (after: 0) on the early tag must see the durable event and conflict.
+    let err = handle
+        .append(
+            vec![event("Reserved", &["unique:early"])],
+            Some(unique_guard("unique:early")),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppendError::Conflict {
+                at: ConflictSite::Durable(_)
+            }
+        ),
+        "expected a durable conflict from a sealed segment, got {err:?}"
+    );
+
+    // A guard on a tag no event carries succeeds.
+    handle
+        .append(
+            vec![event("Reserved", &["unique:fresh"])],
+            Some(unique_guard("unique:fresh")),
+        )
+        .unwrap();
+
+    drop(handle);
+    let set = coord.shutdown();
+    assert!(
+        set.sealed_len() >= 1,
+        "tiny segments should have sealed, so unique:early was in a sealed segment"
+    );
 }
 
 #[test]
