@@ -1,29 +1,28 @@
 //! Layer 3: the derived index.
 //!
 //! The log is the source of truth; this is derived from it and rebuildable by replay.
-//! Phase 5a is the in-memory, pure core:
+//! The in-memory core:
 //!
-//! - [`TermInterner`] / [`TypeInterner`]: tag and event-type strings to dense ids.
-//! - [`TailIndex`]: a per-segment index, per-tag postings plus a dense type column, fed
-//!   in position order.
+//! - [`ActiveTail`]: a per-segment index, per-tag postings plus a dense type column, fed
+//!   in position order and shared lock-free for reading via a watermark-bounded
+//!   [`ActiveView`] (phase 6b). Tag and type interning use concurrent maps.
 //! - [`search`]: the index-driven query evaluator, the counterpart to phase 4's scan
 //!   oracle (`writer::condition`). It answers a [`Query`](crate::query::Query)
 //!   identically to a scan, which the differential test pins down.
 //!
-//! Phase 5b adds the on-disk half: an `IndexSegment` format (CRC-locked header, FST
-//! term dictionary, tiered postings, dense type column), an `IndexSet` that owns the
-//! sealed segments plus the active tail and answers a [`Query`](crate::query::Query)
-//! across all of them, inline feeding at the commit seam, seal-on-rollover, and
-//! rebuild-from-log recovery. [`search`] is made generic over [`SegmentIndex`] so the
-//! one spec-pinned evaluator serves both the in-memory [`TailIndex`] and the on-disk
-//! `IndexSegment` unchanged.
+//! The on-disk half: an `IndexSegment` format (CRC-locked header, FST term dictionary,
+//! tiered postings, dense type column), an `IndexSet` that owns the sealed segments plus
+//! the active tail and answers a [`Query`](crate::query::Query) across all of them, inline
+//! feeding at the commit seam, seal-on-rollover, and rebuild-from-log recovery. [`search`]
+//! is generic over [`SegmentIndex`] so the one spec-pinned evaluator serves both the
+//! in-memory tail (through [`ActiveView`]) and the on-disk `IndexSegment` unchanged.
 
 use std::borrow::Cow;
 
 use crate::Position;
 
+mod append;
 mod header;
-mod interner;
 mod postings;
 mod search;
 mod segment;
@@ -33,15 +32,14 @@ mod tail;
 pub mod recovery;
 
 pub use header::{INDEX_HEADER_SIZE, IndexHeaderError, IndexSegmentHeader};
-pub use interner::{TermInterner, TooManyTypes, TypeInterner};
 pub use search::search;
 pub use segment::{IndexSegment, IndexSegmentError};
 pub use set::{IndexError, IndexSet};
-pub use tail::TailIndex;
+pub use tail::{ActiveTail, ActiveView, TooManyTypes};
 
 /// A segment-local identifier for a tag, dense from 0.
 ///
-/// Interned per [`TailIndex`] (Lucene-style), so ids never need to be stable across
+/// Interned per [`ActiveTail`] (Lucene-style), so ids never need to be stable across
 /// segments and there is no global registry to persist.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TermId(u32);
@@ -69,12 +67,13 @@ impl TypeId {
 }
 
 /// One segment's worth of index that [`search`] can evaluate a query against, whether
-/// it lives in memory ([`TailIndex`]) or on disk ([`IndexSegment`]).
+/// it lives in memory (an [`ActiveView`] over the [`ActiveTail`]) or on disk
+/// ([`IndexSegment`]).
 ///
-/// The two share exactly one evaluator (CLAUDE.md 6, 7.0). The only shape difference is
-/// [`term_postings`](SegmentIndex::term_postings): the in-memory tail borrows its posting
-/// slice ([`Cow::Borrowed`], zero-copy), while the on-disk segment decodes varint deltas
-/// into an owned vec ([`Cow::Owned`]). Positions are segment-local (`global - base`).
+/// The two share exactly one evaluator (CLAUDE.md 6, 7.0). Both return
+/// [`term_postings`](SegmentIndex::term_postings) as an owned [`Cow::Owned`]: the on-disk
+/// segment decodes varint deltas, the active view materializes its chunked, watermark-
+/// truncated postings. Positions are segment-local (`global - base`).
 pub trait SegmentIndex {
     /// First global position this segment covers; `global = base + local`.
     fn base(&self) -> Position;

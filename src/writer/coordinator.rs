@@ -112,10 +112,10 @@ impl Drop for WriteCoordinator {
 /// The state owned by the writer thread.
 struct Worker {
     set: SegmentSet,
-    /// The derived index, fed inline at the commit seam and queried on this thread for the
-    /// condition check. Still writer-private in 6a (the `!Sync` active tail cannot escape);
-    /// off-thread reads see the sealed segments through the published [`Snapshot`], and the
-    /// active range through a bounded log scan, until 6b shares the active tail.
+    /// The derived index, fed inline at the commit seam. The writer feeds it here; off-thread
+    /// reads query the same segments through the published [`Snapshot`], including the active
+    /// segment's shared [`ActiveTail`](crate::index::ActiveTail), which they read lock-free
+    /// through a watermark-bounded view (phase 6b).
     index: IndexSet,
     tips: TagTips,
     cfg: WriterConfig,

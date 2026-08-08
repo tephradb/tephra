@@ -558,13 +558,14 @@ is inherited and segment lifecycle is one concept, not two).
 
 ### 7.0 Build split and the in-memory tail index
 
-The layer is built in two parts. **5a** is the in-memory core: a term interner
-(`TermInterner` -> `TermId(u32)`) and a type interner (`TypeInterner` -> `TypeId(u16)`,
-rejecting more than `u16::MAX + 1` distinct types per segment at push time, where the
-offending string is in hand), a per-segment `TailIndex` (per-tag postings plus the dense
-type column), and `index::search`, the index-driven evaluator. **5b** is the on-disk index
-segment format, feeding, sealing, recovery, and pruning (everything below this
-subsection).
+The layer is built in two parts. **5a** is the in-memory core: a per-segment `ActiveTail`
+(per-tag postings plus the dense type column) with tag -> `TermId(u32)` and type ->
+`TypeId(u16)` interning (the type interner rejects more than `u16::MAX + 1` distinct types
+per segment at push time, where the offending string is in hand), and `index::search`, the
+index-driven evaluator. Both interners are concurrent `DashMap`s as of 6b, when the tail
+became reader-shared (section 9); the reverse id -> string maps stay writer-only for the
+sealer. **5b** is the on-disk index segment format, feeding, sealing, recovery, and pruning
+(everything below this subsection).
 
 `index::search` is the counterpart to phase 4's scan oracle: it evaluates a `Query` from
 postings instead of a linear decode, and is **differential-tested to return the identical
@@ -582,11 +583,11 @@ already sorted, with no comparisons). This is the same "merging is concatenation
 as section 2, applied to the read path. It is distinct from the phase-4 (layer 4)
 planner's streaming, which is a later concern.
 
-The `TailIndex` is fed **in position order** via `push(position, event)`, guarded by a
+The `ActiveTail` is fed **in position order** via `push(position, event)`, guarded by a
 real (not `debug_assert`) contiguity assert: out-of-order feeding would silently produce
 unsorted posting lists that break every intersection. Feeding is inline at the commit seam
 (the `TagTips::absorb` point) in 5b; the append-condition hot path keeps the scan oracle
-until phase 6 wires the `Unknown` fallthrough onto the index.
+until phase 6d wires the `Unknown` fallthrough onto the index.
 
 The tail index's per-tag postings **subsume** the layer-2 `TagTips`: a tag's max position
 is just the last element of its posting list. They are kept as separate structures for now
@@ -647,15 +648,16 @@ anything missing, corrupt, or mismatched. The active segment's tail index is alw
 by scan and never persisted (like the offset sidecar), which also covers a durable-but-
 unindexed tail after a crash.
 
-**Feeding, sealing, read-your-writes.** The active `TailIndex` is fed at the commit seam
+**Feeding, sealing, read-your-writes.** The active `ActiveTail` is fed at the commit seam
 (`commit_ok`) **before the append reply is sent**, so a client that reads immediately after
 its append sees its own write through the index. On a log rollover the completed tail is
 sealed: its in-memory segment is published to readers before the file is fsynced (reader
 visibility does not wait on durability), and a failed `.idx` write is logged and ignored
 (the in-memory segment is authoritative; the next open rebuilds the file). Never an
-unpublish, never a write failure. In 5b the `IndexSet` is owned and read on the writer
-thread only; it is `!Sync` (a `PhantomData<Cell<()>>` marker) so it cannot escape to a
-reader thread until phase 6 gives the active tail a published watermark.
+unpublish, never a write failure. As of 6b the active tail is an `Arc<ActiveTail>` shared
+into the read snapshot: the writer feeds it while reader threads query it lock-free, so the
+`IndexSet` is `Send + Sync` (the 5b `!Sync` `PhantomData<Cell<()>>` marker is gone). See
+section 9 for the append-only structures and the watermark bound that make that sound.
 
 **A degraded segment errors, never answers short.** If a single segment holds more distinct
 event types than the `u16` type column can address (not a real workload, but possible), it
@@ -715,16 +717,36 @@ and atomics, never a lock guard), not with a timing test. This is why the active
 append-only structure published by an atomic watermark (chunked vectors that never move
 existing elements), not an `RwLock` evaluated under the read guard.
 
+**The active tail's realization (6b).** `ActiveTail` is that append-only structure. Its type
+column and per-`TermId` posting slots are `AppendColumn`s (`src/index/append.rs`): chunked
+vectors of atomic slots whose chunks never move, so a reader's reference to element `i` stays
+valid. Two orderings, kept apart: **slot contents** are `Relaxed`, made visible by a higher
+release/acquire edge (the published watermark for the type column, a `PostingSlot`'s own
+`len` for its postings); the **backbone** (the vec of chunk handles) is published under a
+brief `RwLock<Arc<..>>` swap on growth (chunk count grows by doubling, so total growth is
+`O(n)`, not `O(n^2)`). A reader clones every backbone **after** loading the watermark and
+clamps its visible length to what the clones cover, and `AppendColumn::get` is bounds-checked,
+so a not-yet-grown backbone can never panic a reader. Posting slots keep the common 1-to-4-tag
+case inline (heap-free) and spill only when hot. The one genuine concurrent map, tag ->
+`TermId`, is a `DashMap` (a single-shard probe, within the rule); the id -> string reverse
+maps the sealer needs are writer-only, reconstructed from the maps at seal. Readers evaluate
+the active range through a watermark-bounded `ActiveView`, the tail's `SegmentIndex` impl, so
+one evaluator serves the sealed and active halves alike. If the active segment latches
+unindexable (section 7.1), feeding stops while positions keep arriving, so the columns go
+short of the watermark; the tail carries that latch as a live `AtomicBool` (it fires
+mid-segment, with no snapshot republish), and a reader that observes it scans the log for the
+active range rather than trust the short columns, never a short answer (CLAUDE.md 7, 4.7).
+
 **Snapshot / watermark ordering.** The writer publishes the segment set (on rollover)
 before the watermark (every commit); a reader loads the watermark before the segment set.
 With acquire/release ordering the loaded snapshot always covers the loaded watermark: if a
 reader observes watermark `W`, the segment set it then loads was published no earlier than
 the one current when `W` was stored, and segment sets only grow.
 
-Phase 6a lands the caller-thread reader, the published snapshot, and the streaming `read`.
-The active *index* stays writer-private in 6a (the active *range* is answered by a bounded
-log scan); 6b converts the active tail to the append-only, watermark-published form above
-and lets readers evaluate it lock-free.
+Phase 6a landed the caller-thread reader, the published snapshot, and the streaming `read`,
+with the active *range* answered by a bounded log scan. Phase 6b converts the active tail to
+the append-only, watermark-published form above and lets readers evaluate it lock-free, so
+the active range is now index-driven like the sealed ranges.
 
 ---
 
@@ -801,10 +823,13 @@ src/
     tips.rs         // TagTips (durable, lossy) + StagedTips (batch, complete)
 
   index/
-    mod.rs          // TermId, TypeId; re-exports
-    interner.rs     // TermInterner (tags -> u32), TypeInterner (types -> u16, bounded)
-    tail.rs         // TailIndex: per-tag postings + dense type column, fed in position order
+    mod.rs          // TermId, TypeId, SegmentIndex trait; re-exports
+    append.rs       // AppendColumn (chunked atomic append-only vec) + PostingSlot (inline/spill)
+    tail.rs         // ActiveTail: shared per-tag postings + dense type column, fed in position order; ActiveView reader
     search.rs       // index-driven Query evaluator, ascending iterator (differential oracle)
+    segment.rs      // IndexSegment: on-disk index format, encode/decode
+    set.rs          // IndexSet: sealed IndexSegments + active ActiveTail, search_all, seal/rebuild
+    recovery.rs     // Rebuilder: reconstruct the tail from a log scan
 ```
 
 Naming: `Log`, not `Store` or `EventLog` (it reads as `crate::log::Log`). `SegmentSet`,

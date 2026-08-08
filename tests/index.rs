@@ -3,13 +3,13 @@
 //!
 //! The scan baseline (`scan_after` + `Query::matches`) is the permanent oracle the whole
 //! index is defined against. Here a random workload is appended to a real `SegmentSet`
-//! and fed, in the same order, to a `TailIndex`; for a spread of random queries and
+//! and fed, in the same order, to an `ActiveTail`; for a spread of random queries and
 //! `after` bounds, `index::search` must return the exact same ascending positions the
 //! scan does. A disagreement is a bug in the index, since the oracle is authoritative.
 
 use dcbdb::Position;
 use dcbdb::event::{Event, EventRef, EventType, Tag, Tags};
-use dcbdb::index::{IndexSet, TailIndex, search};
+use dcbdb::index::{ActiveTail, IndexSet, search};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::query::{Query, QueryItem};
 use smallvec::SmallVec;
@@ -108,7 +108,7 @@ fn index_search_agrees_with_scan_over_random_workload() {
     // One roomy segment: the differential contract for the in-memory half is a single
     // logical index; multi-segment composition and pruning are phase 5b.
     let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(1 << 20)).unwrap();
-    let mut index = TailIndex::new(set.next_position());
+    let index = ActiveTail::new(set.next_position());
 
     let mut rng = Rng(0x1234_5678_9ABC_DEF0);
 
@@ -125,7 +125,7 @@ fn index_search_agrees_with_scan_over_random_workload() {
         for _ in 0..4 {
             let query = random_query(&mut rng);
             let after = Position::new(rng.below(last + 1));
-            let from_index: Vec<Position> = search(&index, &query, after).collect();
+            let from_index: Vec<Position> = search(&index.view_full(), &query, after).collect();
             let from_scan = scan_baseline(&set, &query, after);
             assert_eq!(
                 from_index, from_scan,

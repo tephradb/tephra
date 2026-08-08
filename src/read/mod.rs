@@ -25,14 +25,15 @@
 //! reader observes watermark `W`, the segment set it then loads was published no earlier
 //! than the one current when `W` was stored, and segment sets only grow.
 //!
-//! ## Phase 6a scope
+//! ## Index-driven reads
 //!
-//! Sealed segments are answered through their on-disk index ([`search`]); the **active**
-//! segment's range is answered by a bounded log scan (the active tail index stays
-//! writer-private until 6b gives it a shared, watermark-published form). An unindexable
-//! sealed segment falls back to scanning its own range, so a read never returns a short
-//! answer. The index-vs-scan cost model is 6c; here selective queries use the index for
-//! sealed ranges and scan the (bounded) active range.
+//! Both sealed and active ranges are answered through the index: sealed segments via their
+//! on-disk index ([`search`]), and the **active** segment via a watermark-bounded
+//! [`ActiveView`](crate::index::ActiveView) over the shared `Arc<ActiveTail>` the writer
+//! publishes (phase 6b). A degraded segment never answers short: an unindexable sealed
+//! segment, or an active segment that latched unindexable, falls back to scanning its own
+//! range. The index-vs-scan cost model (choosing scan over the index for broad queries) is
+//! phase 6c; today selective queries use the index and `Query::all` streams a log scan.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ use seglog::read::Reader;
 
 use crate::Position;
 use crate::event::{DecodeError, EventRef};
-use crate::index::{IndexSegment, search};
+use crate::index::{ActiveTail, IndexSegment, search};
 use crate::log::set::{LogError, Record, Scan, Segment, SegmentSet, SegmentSource};
 use crate::query::Query;
 
@@ -70,6 +71,10 @@ pub struct Snapshot {
     /// that segment is unindexable (a query touching it scans the log for its range).
     sealed_index: Vec<Option<Arc<IndexSegment>>>,
     active_log: Arc<Segment>,
+    /// The active segment's shared in-memory index. A reader queries it lock-free through a
+    /// watermark-bounded [`ActiveView`](crate::index::ActiveView), so the active range is
+    /// index-driven like the sealed ranges rather than scanned (phase 6b).
+    active_index: Arc<ActiveTail>,
 }
 
 impl Snapshot {
@@ -89,9 +94,20 @@ impl Snapshot {
             sealed_log,
             sealed_index,
             active_log: set.active_arc(),
+            active_index: index.active_tail_arc(),
         }
     }
 }
+
+// The snapshot crosses to reader threads as an immutable `Arc`, so it must be `Send + Sync`.
+// Its active index (`Arc<ActiveTail>`) is the only interior-mutable member; locking this in
+// keeps a future non-`Sync` addition from silently regressing the read path (CLAUDE.md 9).
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
+    is_send::<Snapshot>();
+    is_sync::<Snapshot>();
+};
 
 impl SegmentSource for Snapshot {
     fn header_size(&self) -> u64 {
@@ -422,17 +438,31 @@ fn plan_positions(
         }
     }
 
-    // Active segment's range: no shared active index in 6a, so scan it (bounded by one
-    // segment and the watermark). 6b replaces this with the watermark-published active tail.
+    // Active segment's range: query the shared active tail through a watermark-bounded view
+    // (phase 6b), index-driven like the sealed segments rather than scanned. The view exposes
+    // only locals at or before the pinned watermark, so it never yields a position past `wm`,
+    // and its positions are all above every sealed segment's (disjoint, active range last), so
+    // the concatenation stays globally ascending.
+    //
+    // Unless the active segment latched unindexable: then its columns are truncated relative to
+    // the watermark (feeding stopped but positions kept arriving), so the view would answer
+    // short or wrong. Fall back to a log scan of the range, mirroring the sealed `None` arm and
+    // 6a. The flag is read live off the shared tail because the latch fires mid-segment with no
+    // snapshot republish.
     let active_base = snapshot.active_log.base_position();
     if watermark >= active_base {
-        scan_positions_into(
-            snapshot,
-            query,
-            first_after(after, active_base),
-            watermark,
-            &mut out,
-        )?;
+        if snapshot.active_index.is_unindexable() {
+            scan_positions_into(
+                snapshot,
+                query,
+                first_after(after, active_base),
+                watermark,
+                &mut out,
+            )?;
+        } else {
+            let view = snapshot.active_index.view(watermark);
+            out.extend(search(&view, query, after));
+        }
     }
 
     Ok(out)
@@ -519,5 +549,55 @@ mod tests {
             let expected: Vec<u64> = (1..=wm).collect();
             assert_eq!(got, expected, "watermark {wm}");
         }
+    }
+
+    /// Regression: when the active segment latches unindexable, feeding stops but positions
+    /// keep arriving, so the tail's columns are truncated relative to the watermark. A reader
+    /// must not trust the short tail; it scans the log for the active range instead (mirroring
+    /// the sealed unindexable arm and 6a). Reproduced white-box with a tail deliberately fed
+    /// only a prefix of a fully-durable single segment, then latched.
+    #[test]
+    fn active_unindexable_reader_scans_the_log_for_complete_results() {
+        let dir = TempDir::new().unwrap();
+        // One roomy segment: all six events land in the active segment, no rollover.
+        let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(1 << 16)).unwrap();
+        for _ in 0..6 {
+            set.append_batch(&[event("Enrolled", &["course:c1"]).as_bytes()])
+                .unwrap();
+        }
+        let last = set.last_position(); // 6
+
+        // A tail fed only the first four of the six durable events, then latched unindexable:
+        // exactly the state `IndexSet` reaches when the fifth event trips the u16 type limit.
+        let active_base = set.active_base();
+        let tail = ActiveTail::new(active_base);
+        let mut scan = set.scan_from(active_base);
+        for _ in 0..4 {
+            let record = scan.next().unwrap().unwrap();
+            let ev = EventRef::from_bytes(record.data).unwrap();
+            tail.push(record.position, ev).unwrap();
+        }
+        drop(scan);
+        tail.mark_unindexable();
+        assert_eq!(
+            tail.len(),
+            4,
+            "tail is truncated below the durable tip of 6"
+        );
+
+        let snapshot = Arc::new(Snapshot {
+            header_size: set.header_size(),
+            sealed_log: Vec::new(),
+            sealed_index: Vec::new(),
+            active_log: set.active_arc(),
+            active_index: Arc::new(tail),
+        });
+
+        // Every event matches, so the complete answer is the dense 1..=6. The truncated tail
+        // alone would return only 1..=4 (short); the scan fallback restores completeness.
+        let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
+        let planned = plan_positions(&snapshot, &query, Position::ZERO, last).unwrap();
+        let got: Vec<u64> = planned.iter().map(|p| p.get()).collect();
+        assert_eq!(got, (1..=6).collect::<Vec<_>>());
     }
 }

@@ -1,5 +1,5 @@
 //! The on-disk index segment: one immutable file per sealed log segment, holding the
-//! same index a [`TailIndex`] holds in memory, in a compact form a reader can query
+//! same index an [`ActiveTail`] holds in memory, in a compact form a reader can query
 //! without decoding the whole thing.
 //!
 //! Layout (all little-endian), described by [`IndexSegmentHeader`]:
@@ -39,7 +39,7 @@ use crate::Position;
 use super::SegmentIndex;
 use super::header::{INDEX_HEADER_SIZE, IndexHeaderError, IndexSegmentHeader};
 use super::postings::{decode_postings, encode_postings};
-use super::tail::TailIndex;
+use super::tail::ActiveTail;
 
 /// A shared subslice of an `Arc<[u8]>`: shares ownership of the whole segment buffer but
 /// exposes only one region. Lets `fst::Map` own its bytes (it needs `AsRef<[u8]>` over
@@ -71,7 +71,7 @@ pub struct IndexSegment {
 impl IndexSegment {
     /// Encodes `index` into the on-disk byte layout. Pure: no I/O, so it is testable and
     /// reused by both the file writer and [`from_bytes`](Self::from_bytes).
-    pub fn encode(index: &TailIndex) -> Vec<u8> {
+    pub fn encode(index: &ActiveTail) -> Vec<u8> {
         let created_at_nanos = u64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -83,10 +83,10 @@ impl IndexSegment {
     }
 
     /// [`encode`](Self::encode) with an explicit timestamp, for deterministic tests.
-    pub fn encode_at(index: &TailIndex, created_at_nanos: u64) -> Vec<u8> {
+    pub fn encode_at(index: &ActiveTail, created_at_nanos: u64) -> Vec<u8> {
         // Type column: one u16 per event, in local-position order.
-        let mut type_column = Vec::with_capacity(index.len() * 2);
-        for &type_id in index.type_column() {
+        let mut type_column = Vec::with_capacity(index.len() as usize * 2);
+        for type_id in index.type_column() {
             type_column.extend_from_slice(&type_id.to_le_bytes());
         }
 
@@ -105,7 +105,7 @@ impl IndexSegment {
         let mut postings_region = Vec::new();
         let mut builder = fst::MapBuilder::memory();
         for (tag, postings) in index.terms_sorted_with_postings() {
-            let value = encode_postings(postings, &mut postings_region);
+            let value = encode_postings(&postings, &mut postings_region);
             builder
                 .insert(tag.as_bytes(), value)
                 .expect("terms are fed to the FST in sorted key order");
@@ -345,7 +345,7 @@ mod tests {
     }
 
     /// Builds a tail index over the five-event fixture (base 1), matching search.rs.
-    fn fixture() -> TailIndex {
+    fn fixture() -> ActiveTail {
         let events = [
             event("Registered", &[]),
             event("Enrolled", &["course:c1"]),
@@ -353,7 +353,7 @@ mod tests {
             event("Renamed", &["student:s1"]),
             event("Registered", &["course:c1"]),
         ];
-        let mut index = TailIndex::new(Position::new(1));
+        let index = ActiveTail::new(Position::new(1));
         for (i, ev) in events.iter().enumerate() {
             index
                 .push(Position::new(1 + i as u64), ev.as_ref())
@@ -362,7 +362,7 @@ mod tests {
         index
     }
 
-    fn sealed(index: &TailIndex) -> IndexSegment {
+    fn sealed(index: &ActiveTail) -> IndexSegment {
         let bytes = IndexSegment::encode(index);
         IndexSegment::from_bytes(Arc::from(bytes)).unwrap()
     }
@@ -401,7 +401,8 @@ mod tests {
         ];
         for query in &queries {
             for after in 0..=5 {
-                let from_tail: Vec<Position> = search(&tail, query, Position::new(after)).collect();
+                let from_tail: Vec<Position> =
+                    search(&tail.view_full(), query, Position::new(after)).collect();
                 let from_seg: Vec<Position> = search(&seg, query, Position::new(after)).collect();
                 assert_eq!(from_tail, from_seg, "query {query:?} after {after}");
             }
@@ -411,7 +412,7 @@ mod tests {
     #[test]
     fn singleton_and_multi_postings_both_survive() {
         // student:s1 appears twice (tier1 deltas); a lone tag appears once (tier0 inline).
-        let mut index = TailIndex::new(Position::new(1));
+        let index = ActiveTail::new(Position::new(1));
         index
             .push(Position::new(1), event("E", &["only:once"]).as_ref())
             .unwrap();
@@ -457,7 +458,7 @@ mod tests {
 
     #[test]
     fn empty_tail_index_round_trips() {
-        let index = TailIndex::new(Position::new(1));
+        let index = ActiveTail::new(Position::new(1));
         let seg = sealed(&index);
         assert_eq!(seg.len(), 0);
         assert_eq!(seg.header().max_position(), None);
@@ -471,7 +472,7 @@ mod tests {
         // them. The type dictionary must encode and reload every one: a u16 count field
         // would have overflowed at precisely this boundary and panicked the writer thread.
         let n = u16::MAX as u64 + 1; // 65536
-        let mut index = TailIndex::new(Position::new(1));
+        let index = ActiveTail::new(Position::new(1));
         for i in 0..n {
             let ev = event(&format!("T{i}"), &[]);
             index.push(Position::new(1 + i), ev.as_ref()).unwrap();

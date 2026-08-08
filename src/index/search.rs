@@ -1,6 +1,6 @@
 //! The index-driven query evaluator: the counterpart to phase 4's scan oracle.
 //!
-//! [`search`] answers a [`Query`] against a [`TailIndex`] with the same semantics the
+//! [`search`] answers a [`Query`] against a [`SegmentIndex`] with the same semantics the
 //! scan uses (`Query::matches` over `scan_after`), driven by postings instead of a linear
 //! decode. The differential test pins the two together: they must return the identical
 //! ascending position set for every query. This evaluator is deliberately simple (no cost
@@ -21,10 +21,10 @@ use super::SegmentIndex;
 
 /// Positions of events matching `query`, ascending, deduped, strictly after `after`.
 ///
-/// Generic over [`SegmentIndex`] so the identical evaluator serves the in-memory
-/// [`TailIndex`](super::TailIndex) and the on-disk [`IndexSegment`](super::IndexSegment):
-/// there is one definition of the query semantics, pinned to the spec by the tests below
-/// and differential-tested against the scan oracle.
+/// Generic over [`SegmentIndex`] so the identical evaluator serves the in-memory active tail
+/// (through an [`ActiveView`](super::ActiveView)) and the on-disk
+/// [`IndexSegment`](super::IndexSegment): there is one definition of the query semantics,
+/// pinned to the spec by the tests below and differential-tested against the scan oracle.
 ///
 /// Empty `Query::Items` matches nothing (OR over zero items); `Query::All` matches every
 /// event. Within an item it is AND over tags and "one of" over types, an empty tag list
@@ -122,7 +122,7 @@ fn intersect(mut lists: Vec<Cow<'_, [u32]>>) -> Vec<u32> {
 mod tests {
     use super::*;
     use crate::event::{Event, EventType, Tag, Tags};
-    use crate::index::TailIndex;
+    use crate::index::ActiveTail;
     use crate::query::QueryItem;
     use smallvec::SmallVec;
 
@@ -154,7 +154,7 @@ mod tests {
     /// |  3  | Enrolled   | course:c1, student:s1      |
     /// |  4  | Renamed    | student:s1                 |
     /// |  5  | Registered | course:c1                  |
-    fn fixture() -> TailIndex {
+    fn fixture() -> ActiveTail {
         let events = [
             event("Registered", &[]),
             event("Enrolled", &["course:c1"]),
@@ -162,7 +162,7 @@ mod tests {
             event("Renamed", &["student:s1"]),
             event("Registered", &["course:c1"]),
         ];
-        let mut index = TailIndex::new(Position::new(1));
+        let index = ActiveTail::new(Position::new(1));
         for (i, ev) in events.iter().enumerate() {
             index
                 .push(Position::new(1 + i as u64), ev.as_ref())
@@ -171,8 +171,8 @@ mod tests {
         index
     }
 
-    fn run(index: &TailIndex, query: &Query, after: u64) -> Vec<u64> {
-        search(index, query, Position::new(after))
+    fn run(index: &ActiveTail, query: &Query, after: u64) -> Vec<u64> {
+        search(&index.view_full(), query, Position::new(after))
             .map(|p| p.get())
             .collect()
     }

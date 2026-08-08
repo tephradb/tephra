@@ -14,7 +14,7 @@
 use crate::Position;
 use crate::event::EventRef;
 
-use super::TailIndex;
+use super::ActiveTail;
 
 /// The result of a rebuild: the reconstructed index, how many events it covers, and
 /// whether the segment could be indexed at all.
@@ -27,20 +27,20 @@ use super::TailIndex;
 /// the range, even when `unindexable`, so the range can still be named and pruned.
 #[derive(Debug)]
 pub struct Rebuilt {
-    pub index: TailIndex,
+    pub index: ActiveTail,
     pub count: u64,
     pub unindexable: bool,
 }
 
-/// Accumulates a [`TailIndex`] from events fed in position order.
+/// Accumulates an [`ActiveTail`] from events fed in position order.
 ///
-/// The one wrinkle over a bare loop of [`TailIndex::push`] is the `unindexable` latch:
+/// The one wrinkle over a bare loop of [`ActiveTail::push`] is the `unindexable` latch:
 /// once a push is rejected for too many types, feeding must stop pushing (the tail's
 /// length would otherwise disagree with the positions still arriving and trip the
 /// feed-order assert), but the caller keeps feeding so `count` stays exact.
 #[derive(Debug)]
 pub struct Rebuilder {
-    index: TailIndex,
+    index: ActiveTail,
     count: u64,
     unindexable: bool,
 }
@@ -49,7 +49,7 @@ impl Rebuilder {
     /// A fresh rebuilder whose first event sits at global position `base`.
     pub fn new(base: Position) -> Self {
         Rebuilder {
-            index: TailIndex::new(base),
+            index: ActiveTail::new(base),
             count: 0,
             unindexable: false,
         }
@@ -133,7 +133,7 @@ mod tests {
 
         // The rebuilt index answers a query exactly as a freshly fed one would.
         let q = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
-        let got: Vec<Position> = search(&rebuilt.index, &q, Position::ZERO).collect();
+        let got: Vec<Position> = search(&rebuilt.index.view_full(), &q, Position::ZERO).collect();
         assert_eq!(got, vec![Position::new(2), Position::new(3)]);
     }
 

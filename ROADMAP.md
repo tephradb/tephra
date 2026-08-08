@@ -266,10 +266,22 @@ index). See the phase-6 plan for the confirmed decisions behind each.
 
 ### Phase 6b: Append-only active tail plus published watermark
 
-- [ ] Convert the `TailIndex` postings and type column to chunked append-only vectors (an
-      append never moves existing elements), and the term dictionary to a concurrent map, so
-      readers evaluate the active tail lock-free bounded by the watermark, replacing 6a's
-      active-range scan. No lock held across query evaluation (enforced structurally)
+- [x] Convert `TailIndex` to a shared `ActiveTail`: postings and type column become chunked
+      append-only vectors of atomic slots (`AppendColumn`, an append never moves existing
+      elements; backbone growth doubles and publishes under a brief `RwLock<Arc>` swap),
+      posting slots inline the 1-to-4-tag case and spill when hot, and the tag/type interners
+      become concurrent `DashMap`s (reverse maps stay writer-only for the sealer)
+- [x] Readers evaluate the active tail lock-free through a watermark-bounded `ActiveView`
+      (the tail's `SegmentIndex` impl), replacing 6a's active-range scan on the indexed path;
+      the `IndexSet` `!Sync` marker is dropped and `Send + Sync` is asserted. No lock held
+      across query evaluation, enforced structurally (the evaluator sees only atomics,
+      published `Arc` backbones, and single-shard `DashMap` probes)
+- [x] Two orderings kept apart: slot contents `Relaxed` behind a higher release/acquire edge
+      (watermark for the type column, per-slot `len` for postings); backbones cloned after the
+      watermark load with `AppendColumn::get` bounds-checked, so a reader can never panic or
+      read past its pinned prefix. `AppendColumn`/`PostingSlot` unit tests plus a concurrent
+      active-index consistency test (`tests/read.rs`); the 6a differential and read-your-writes
+      tests stay green with the active range now index-driven
 
 ### Phase 6c: Cost model (benchmark-first)
 
@@ -285,9 +297,9 @@ index). See the phase-6 plan for the confirmed decisions behind each.
 ### Phase 6d: Condition fallthrough onto the index
 
 - [ ] Wire the `TagTips` `Unknown` fallthrough to an early-terminating index existence check
-      (over the writer-private active `TailIndex` plus the sealed segments) instead of a full
-      scan, with a scan fallback on an unindexable segment; keep `verify_tips`; the index
-      existence verdict differential-tested to never disagree with the scan oracle
+      (over the active `ActiveTail` plus the sealed segments) instead of a full scan, with a
+      scan fallback on an unindexable segment; keep `verify_tips`; the index existence verdict
+      differential-tested to never disagree with the scan oracle
 
 ## Phase 7: Subscriptions
 

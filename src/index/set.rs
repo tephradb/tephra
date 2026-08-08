@@ -1,14 +1,13 @@
 //! [`IndexSet`]: the index counterpart of the log's [`SegmentSet`], owning one on-disk
-//! [`IndexSegment`] per sealed log segment plus the in-memory [`TailIndex`] for the
+//! [`IndexSegment`] per sealed log segment plus the in-memory [`ActiveTail`] for the
 //! active one, and answering a [`Query`] across all of them.
 //!
 //! Ownership mirrors the log: sealed segments are immutable `Arc<IndexSegment>` (reading
-//! them is lock-free), and the active tail is mutable and fed in position order at the
-//! commit seam. In phase 5b the whole set is owned and read on the writer thread only, so
-//! the active tail needs no synchronization yet; the set is made `!Sync` (via a
-//! `PhantomData<Cell<()>>`) so any attempt to share `&IndexSet` across threads fails to
-//! compile until phase 6 gives the active tail a published watermark and a snapshot
-//! handoff (CLAUDE.md 9). The sealed half is already thread-safe.
+//! them is lock-free), and the active tail is fed in position order at the commit seam. As
+//! of phase 6b the active tail is an `Arc<ActiveTail>`, append-only and shared: the writer
+//! feeds it while reader threads query it lock-free through a watermark-bounded
+//! [`ActiveView`](super::ActiveView), so the set is `Sync` and its active `Arc` is published
+//! into the read snapshot (CLAUDE.md 9).
 //!
 //! Cross-segment combination is **ordered concatenation, not a k-merge**: segments are
 //! position-disjoint and ordered, so each one's per-query output is a globally-ascending,
@@ -19,10 +18,8 @@
 //! errors with the unanswerable range so the caller falls back to a log scan, rather than
 //! returning a short answer (CLAUDE.md 7).
 
-use std::cell::Cell;
 use std::fs::File;
 use std::io;
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +30,7 @@ use crate::event::{DecodeError, EventRef};
 use crate::log::set::{LogError, PositionRange, SegmentSet};
 use crate::query::Query;
 
+use super::ActiveTail;
 use super::recovery::Rebuilder;
 use super::search;
 use super::segment::{IndexSegment, write_segment_file};
@@ -62,8 +60,10 @@ pub struct IndexSet {
     dir: PathBuf,
     /// Sealed, immutable index segments in `base` order, disjoint and contiguous.
     sealed: Vec<SealedIndex>,
-    /// The index over the active log segment, fed in position order.
-    active: super::TailIndex,
+    /// The index over the active log segment, fed in position order. Shared: reader threads
+    /// hold clones of this `Arc` (via the read snapshot) and query it lock-free through a
+    /// watermark-bounded [`ActiveView`](super::ActiveView).
+    active: Arc<ActiveTail>,
     /// Base position of the active segment.
     active_base: Position,
     /// Number of events assigned to the active segment. Equals `active.len()` while the
@@ -73,10 +73,6 @@ pub struct IndexSet {
     /// Set if the active segment exceeded the per-segment type limit; a covering query
     /// then errors rather than reading a partial index.
     active_unindexable: bool,
-    /// Marks the set `!Sync`: the active tail is writer-thread-owned in phase 5b. Removed
-    /// in phase 6 when readers get a published watermark. `Cell<()>` keeps the set `Send`
-    /// (so it still moves into the writer thread) while forbidding `&self` sharing.
-    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl IndexSet {
@@ -119,12 +115,17 @@ impl IndexSet {
         Ok(IndexSet {
             dir,
             sealed,
-            active: rebuilt.index,
+            active: Arc::new(rebuilt.index),
             active_base,
             active_span: rebuilt.count,
             active_unindexable: rebuilt.unindexable,
-            _not_sync: PhantomData,
         })
+    }
+
+    /// The active tail's shared handle, for publishing into a read snapshot. Readers query it
+    /// lock-free through a watermark-bounded [`ActiveView`](super::ActiveView).
+    pub(crate) fn active_tail_arc(&self) -> Arc<ActiveTail> {
+        Arc::clone(&self.active)
     }
 
     /// The per-sealed-segment index handles, aligned with the log's sealed segments, for
@@ -138,8 +139,8 @@ impl IndexSet {
     ///
     /// Best-effort: the write is already durable when this runs, so a too-many-types
     /// rejection never fails the write. It latches the active segment unindexable (a
-    /// covering query will error), and feeding stops mutating the tail while positions
-    /// keep arriving.
+    /// covering query will error, and off-thread reads scan the log for its range), and
+    /// feeding stops mutating the tail while positions keep arriving.
     pub fn push(&mut self, position: Position, event: EventRef<'_>) {
         self.active_span += 1;
         if self.active_unindexable {
@@ -147,6 +148,10 @@ impl IndexSet {
         }
         if self.active.push(position, event).is_err() {
             self.active_unindexable = true;
+            // Publish the latch on the shared tail too: the latch fires mid-segment (no
+            // rollover, so no snapshot republish), and an off-thread reader must see it live
+            // to fall back to a log scan instead of trusting the now-truncated columns.
+            self.active.mark_unindexable();
             #[cfg(feature = "tracing")]
             tracing::error!(
                 "segment at base {} exceeds the per-segment type limit; queries over it will error until it seals and is rebuilt",
@@ -197,7 +202,7 @@ impl IndexSet {
             }
         }
 
-        self.active = super::TailIndex::new(new_base);
+        self.active = Arc::new(ActiveTail::new(new_base));
         self.active_base = new_base;
         self.active_span = 0;
         self.active_unindexable = false;
@@ -249,7 +254,7 @@ impl IndexSet {
                         },
                     });
                 }
-                plan.push(Touched::Active(&self.active));
+                plan.push(Touched::Active(self.active.as_ref()));
             }
         }
 
@@ -257,7 +262,9 @@ impl IndexSet {
         for touched in plan {
             match touched {
                 Touched::Seg(seg) => out.extend(search(seg, query, after)),
-                Touched::Active(tail) => out.extend(search(tail, query, after)),
+                // The active tail is queried through a full (unbounded) view: `search_all`
+                // runs on the writer thread, so there is no watermark to clamp to.
+                Touched::Active(tail) => out.extend(search(&tail.view_full(), query, after)),
             }
         }
         Ok(out.into_iter())
@@ -268,7 +275,7 @@ impl IndexSet {
 /// a plan so the unindexable check runs before any positions are produced.
 enum Touched<'a> {
     Seg(&'a IndexSegment),
-    Active(&'a super::TailIndex),
+    Active(&'a ActiveTail),
 }
 
 impl std::fmt::Debug for IndexSet {
@@ -406,12 +413,15 @@ impl IndexError {
     }
 }
 
-// Lock in that the set is `Send` (it moves into the writer thread). It is deliberately
-// not `Sync`: the active tail is writer-owned until phase 6, enforced by the
-// `PhantomData<Cell<()>>` field rather than by prose.
+// Lock in that the set is `Send` (it moves into the writer thread) and `Sync`: as of
+// phase 6b the active tail is a shared `Arc<ActiveTail>` that reader threads query
+// lock-free, so `&IndexSet` may cross threads. A future change reintroducing a
+// non-`Sync` field would fail this build.
 const _: fn() = || {
     fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
     is_send::<IndexSet>();
+    is_sync::<IndexSet>();
 };
 
 #[cfg(test)]
@@ -589,11 +599,10 @@ mod tests {
                 count: 3,
                 seg: None,
             }],
-            active: super::super::TailIndex::new(Position::new(4)),
+            active: Arc::new(super::super::ActiveTail::new(Position::new(4))),
             active_base: Position::new(4),
             active_span: 0,
             active_unindexable: false,
-            _not_sync: PhantomData,
         };
 
         // `after = 0` touches the unindexable segment: error naming its exact range.

@@ -126,6 +126,20 @@ fn read_owned(
     handle.read(query, after).collect_owned()
 }
 
+fn tags(items: &[&str]) -> Tags {
+    Tags::new(
+        items
+            .iter()
+            .map(|s| Tag::new(s).unwrap())
+            .collect::<SmallVec<[Tag; 4]>>(),
+    )
+    .unwrap()
+}
+
+fn tagged_event(ty: &str, tag_strs: &[&str]) -> Event {
+    Event::new(&EventType::new(ty).unwrap(), &tags(tag_strs), b"payload").unwrap()
+}
+
 // ------------------------------- tests -------------------------------
 
 #[test]
@@ -210,6 +224,60 @@ fn concurrent_reads_see_a_consistent_prefix_under_heavy_appends() {
     let mut rng = Rng(0xABCD_1234_5678_9F01);
     for _ in 0..600 {
         handle.append(vec![random_event(&mut rng)], None).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let mut max_seen = 0u64;
+    for r in readers {
+        max_seen = max_seen.max(r.join().unwrap());
+    }
+    assert!(max_seen > 0, "readers should have observed some appends");
+    coord.shutdown();
+}
+
+#[test]
+fn concurrent_reads_of_the_active_index_see_a_consistent_prefix() {
+    // Every event carries course:c1, so a *tag* query pinned at watermark W must return
+    // exactly 1..=W. Unlike `Query::all` (which streams a bypass log scan), a tag query
+    // routes through the index: sealed segments via their on-disk index, and the active range
+    // via the shared, watermark-bounded `ActiveView` (phase 6b). Readers hammer the active
+    // tail while the writer feeds it, so a torn view of the chunked postings/type column, a
+    // posting past the watermark, or a backbone not yet covering a visible local would each
+    // break the dense-prefix assert. Small segments force constant rollover, so there is
+    // always a live active tail being read mid-growth.
+    let (coord, handle, _dir) = coordinator();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let reader = handle.reader();
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut max_seen = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
+                    let mut reads = reader.read(query, Position::ZERO);
+                    let watermark = reads.watermark().get();
+                    let mut positions = Vec::new();
+                    while let Some(item) = reads.next() {
+                        positions.push(item.expect("read failed").position.get());
+                    }
+                    let expected: Vec<u64> = (1..=watermark).collect();
+                    assert_eq!(
+                        positions, expected,
+                        "active-index read did not return the dense prefix 1..={watermark}"
+                    );
+                    max_seen = max_seen.max(watermark);
+                }
+                max_seen
+            })
+        })
+        .collect();
+
+    for _ in 0..600 {
+        handle
+            .append(vec![tagged_event("Enrolled", &["course:c1"])], None)
+            .unwrap();
     }
     stop.store(true, Ordering::Relaxed);
 
