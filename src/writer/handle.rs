@@ -1,6 +1,6 @@
 //! The caller-facing handle.
 
-use crossbeam::channel::{self, Sender};
+use flume::{self as channel, Sender};
 
 use crate::Position;
 use crate::event::Event;
@@ -73,6 +73,63 @@ impl WriteHandle {
             .map_err(|_| SearchError::Shutdown)?;
         response
             .recv()
+            .map_err(|_| SearchError::Shutdown)?
+            .map_err(SearchError::Index)
+    }
+
+    /// The `async` counterpart of [`append`](Self::append): identical semantics, but it
+    /// yields to the executor instead of blocking the thread while the request queue is
+    /// full (backpressure) and while awaiting the durable reply.
+    #[cfg(feature = "async")]
+    pub async fn append_async(
+        &self,
+        events: Vec<Event>,
+        condition: Option<AppendCondition>,
+    ) -> Result<PositionRange, AppendError> {
+        if events.is_empty() {
+            return Err(AppendError::Empty);
+        }
+        let (reply, response) = channel::unbounded();
+        let request = Request {
+            events,
+            condition,
+            reply,
+        };
+        // A full request queue awaits rather than blocks; an error means the coordinator
+        // is gone (channel disconnected).
+        self.tx
+            .send_async(Message::Append(request))
+            .await
+            .map_err(|_| AppendError::Shutdown)?;
+        // A dropped reply sender (coordinator died mid-flight) surfaces as shutdown.
+        response
+            .recv_async()
+            .await
+            .map_err(|_| AppendError::Shutdown)?
+    }
+
+    /// The `async` counterpart of [`search`](Self::search): identical semantics, but it
+    /// yields to the executor instead of blocking the thread while the request queue is
+    /// full and while awaiting the reply. Read-your-writes still holds against an
+    /// `append_async` awaited earlier on the same handle.
+    #[cfg(feature = "async")]
+    pub async fn search_async(
+        &self,
+        query: Query,
+        after: Position,
+    ) -> Result<Vec<Position>, SearchError> {
+        let (reply, response) = channel::unbounded();
+        self.tx
+            .send_async(Message::Search {
+                query,
+                after,
+                reply,
+            })
+            .await
+            .map_err(|_| SearchError::Shutdown)?;
+        response
+            .recv_async()
+            .await
             .map_err(|_| SearchError::Shutdown)?
             .map_err(SearchError::Index)
     }

@@ -141,7 +141,7 @@ impl<'a> Batch<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam::channel::{self, Receiver};
+    use flume::{self as channel, Receiver};
 
     use crate::event::{Event, EventType, Tags};
     use crate::writer::WriterConfig;

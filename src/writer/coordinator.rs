@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam::channel::{self, Receiver, Sender, TryRecvError};
+use flume::{self as channel, Receiver, Sender, TryRecvError};
 
 use crate::Position;
 use crate::event::EventRef;

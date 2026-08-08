@@ -262,3 +262,106 @@ fn append_with_no_events_is_rejected() {
     drop(handle);
     coord.shutdown();
 }
+
+/// Drives a future to completion on the calling thread with a park/unpark waker. The
+/// worker replies from its own thread, so its `wake` unparks us. Keeps the async tests
+/// free of an executor dependency.
+#[cfg(feature = "async")]
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread::{self, Thread};
+
+    struct ThreadWaker(Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn append_async_assigns_dense_positions_and_search_async_reads_own_writes() {
+    let dir = TempDir::new().unwrap();
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
+
+    block_on(async {
+        // Every event carries course:c1, so after the i-th append the query must return
+        // exactly positions 1..=i: read-your-writes through the async pair.
+        let mut expected = Vec::new();
+        for i in 0..20u64 {
+            let range = handle
+                .append_async(vec![event("Enrolled", &["course:c1"])], None)
+                .await
+                .unwrap();
+            assert_eq!(range.first, range.last, "one event, one position");
+            assert_eq!(range.first, Position::new(i + 1), "dense positions");
+            expected.push(range.first);
+
+            let got = handle
+                .search_async(
+                    Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+                    Position::ZERO,
+                )
+                .await
+                .unwrap();
+            assert_eq!(got, expected, "read-your-writes after async append {i}");
+        }
+    });
+
+    drop(handle);
+    let set = coord.shutdown();
+    assert_eq!(set.last_position(), Position::new(20));
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn append_async_honors_the_uniqueness_guard() {
+    let dir = TempDir::new().unwrap();
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
+
+    block_on(async {
+        // Empty events are rejected before ever touching the channel.
+        assert!(matches!(
+            handle.append_async(vec![], None).await,
+            Err(AppendError::Empty)
+        ));
+
+        // First guarded write wins; the second, guarded on the same tag, sees the durable
+        // conflict.
+        handle
+            .append_async(
+                vec![event("Reserved", &["unique:x"])],
+                Some(unique_guard("unique:x")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            handle
+                .append_async(
+                    vec![event("Reserved", &["unique:x"])],
+                    Some(unique_guard("unique:x")),
+                )
+                .await,
+            Err(AppendError::Conflict { .. })
+        ));
+    });
+
+    drop(handle);
+    let set = coord.shutdown();
+    assert_eq!(set.last_position(), Position::new(1));
+}

@@ -9,7 +9,7 @@ edition = "2024"
 
 [dependencies]
 crc32fast = "1.5"
-crossbeam = "0.8"
+flume = { version = "0.12", default-features = false }
 fst = { version = "0.4.7", default-features = false }
 seglog = { path = "crates/seglog" }
 smallvec = "1"
@@ -26,6 +26,7 @@ criterion = "0.8"
 tempfile = "3"
 
 [features]
+async = ["flume/async"]
 tracing = ["dep:tracing", "seglog/tracing"]
 zstd = ["seglog/zstd"]
 # Enables the dcbdb-vs-umadb comparison bench (`--bench compare`).

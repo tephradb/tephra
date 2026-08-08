@@ -20,7 +20,7 @@ mod tips;
 
 use std::sync::Arc;
 
-use crossbeam::channel::Sender;
+use flume::Sender;
 use thiserror::Error;
 
 use crate::Position;
