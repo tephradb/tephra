@@ -1,6 +1,6 @@
 //! The caller-facing handle.
 
-use std::sync::mpsc::{self, SyncSender};
+use crossbeam::channel::{self, Sender};
 
 use crate::Position;
 use crate::event::Event;
@@ -15,7 +15,7 @@ use super::{AppendError, Message, Request};
 /// coordinator down.
 #[derive(Clone)]
 pub struct WriteHandle {
-    pub(super) tx: SyncSender<Message>,
+    pub(super) tx: Sender<Message>,
 }
 
 impl WriteHandle {
@@ -38,7 +38,7 @@ impl WriteHandle {
         if events.is_empty() {
             return Err(AppendError::Empty);
         }
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = channel::unbounded();
         let request = Request {
             events,
             condition,
@@ -63,7 +63,7 @@ impl WriteHandle {
     /// surfaces as an [`IndexError::Io`]-free channel drop, mapped to
     /// [`SearchError::Shutdown`].
     pub fn search(&self, query: Query, after: Position) -> Result<Vec<Position>, SearchError> {
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = channel::unbounded();
         self.tx
             .send(Message::Search {
                 query,

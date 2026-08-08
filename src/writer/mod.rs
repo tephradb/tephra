@@ -19,8 +19,8 @@ mod handle;
 mod tips;
 
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
+use crossbeam::channel::Sender;
 use thiserror::Error;
 
 use crate::Position;

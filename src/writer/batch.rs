@@ -141,7 +141,7 @@ impl<'a> Batch<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{self, Receiver};
+    use crossbeam::channel::{self, Receiver};
 
     use crate::event::{Event, EventType, Tags};
     use crate::writer::WriterConfig;
@@ -154,7 +154,7 @@ mod tests {
     }
 
     fn reply() -> (Reply, Receiver<Result<PositionRange, AppendError>>) {
-        mpsc::channel()
+        channel::unbounded()
     }
 
     #[test]

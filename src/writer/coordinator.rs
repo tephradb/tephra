@@ -1,8 +1,9 @@
 //! The writer thread: draining, condition evaluation, staging, and group commit.
 
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
+
+use crossbeam::channel::{self, Receiver, Sender, TryRecvError};
 
 use crate::Position;
 use crate::event::EventRef;
@@ -18,7 +19,7 @@ use super::{AppendError, Message, Request, SearchReply, WriterConfig, condition}
 /// Owns the writer thread. Holds the join handle so shutdown is deterministic and the
 /// `SegmentSet` can be recovered for inspection or reopen.
 pub struct WriteCoordinator {
-    shutdown: SyncSender<Message>,
+    shutdown: Sender<Message>,
     join: Option<JoinHandle<SegmentSet>>,
 }
 
@@ -47,7 +48,7 @@ impl WriteCoordinator {
         );
 
         let index = IndexSet::open(&set)?;
-        let (tx, rx) = mpsc::sync_channel::<Message>(cfg.queue_capacity);
+        let (tx, rx) = channel::bounded::<Message>(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         let worker = Worker {
             set,
@@ -297,8 +298,6 @@ fn classify(err: LogError) -> AppendError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::Receiver;
-
     use smallvec::SmallVec;
     use tempfile::TempDir;
 
@@ -328,10 +327,10 @@ mod tests {
         }
     }
 
-    fn worker(dir: &TempDir, cfg: WriterConfig) -> (Worker, SyncSender<Message>) {
+    fn worker(dir: &TempDir, cfg: WriterConfig) -> (Worker, Sender<Message>) {
         let set = new_set(dir);
         let index = IndexSet::open(&set).unwrap();
-        let (tx, rx) = mpsc::sync_channel(cfg.queue_capacity);
+        let (tx, rx) = channel::bounded(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         (
             Worker {
@@ -367,7 +366,7 @@ mod tests {
         condition: Option<AppendCondition>,
     ) -> (Request, ReplyRx) {
         let events = specs.iter().map(|(ty, t)| event(ty, t)).collect();
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = channel::unbounded();
         (
             Request {
                 events,
@@ -576,7 +575,7 @@ mod tests {
             &vec![0u8; SEG_SIZE],
         )
         .unwrap();
-        let (reply, rx_big) = mpsc::channel();
+        let (reply, rx_big) = channel::unbounded();
         let big = Request {
             events: vec![huge],
             condition: None,
@@ -646,7 +645,7 @@ mod tests {
                 None
             };
 
-            let (reply, rx) = mpsc::channel();
+            let (reply, rx) = channel::unbounded();
             let req = Request {
                 events: vec![ev],
                 condition,
@@ -683,7 +682,7 @@ mod tests {
             &vec![0u8; 8192],
         )
         .unwrap();
-        let (reply, _rx_big) = mpsc::channel();
+        let (reply, _rx_big) = channel::unbounded();
         let r_big = Request {
             events: vec![big_event],
             condition: None,
