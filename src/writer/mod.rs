@@ -27,6 +27,7 @@ use crate::Position;
 use crate::event::{DecodeError, Event};
 use crate::log::set::{LogError, PositionRange};
 use crate::query::AppendCondition;
+use crate::read::ReadConfig;
 
 pub use coordinator::WriteCoordinator;
 pub use handle::WriteHandle;
@@ -47,6 +48,10 @@ pub struct WriterConfig {
     /// Paranoid cross-check: scan even on `DefinitelyNoMatch` and assert agreement. A
     /// runtime flag (not a cargo feature) so the property test can flip it per case.
     pub verify_tips: bool,
+    /// Read-path tuning for the handles this coordinator hands out (the index-vs-scan cost
+    /// model, CLAUDE.md 8). Reads run off the writer thread, so this only configures the
+    /// planner, never the append path.
+    pub read: ReadConfig,
 }
 
 impl Default for WriterConfig {
@@ -57,6 +62,7 @@ impl Default for WriterConfig {
             max_batch_bytes: 8 * 1024 * 1024,
             tips_window: 1_000_000,
             verify_tips: false,
+            read: ReadConfig::default(),
         }
     }
 }

@@ -14,7 +14,7 @@ use dcbdb::Position;
 use dcbdb::event::{Event, EventRef, EventType, Tag, Tags};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::query::{Query, QueryItem};
-use dcbdb::read::ReadError;
+use dcbdb::read::{ReadConfig, ReadError};
 use dcbdb::writer::{WriteCoordinator, WriteHandle, WriterConfig};
 use smallvec::SmallVec;
 use tempfile::TempDir;
@@ -113,6 +113,24 @@ fn coordinator() -> (WriteCoordinator, WriteHandle, TempDir) {
         max_batch_bytes: 256,
         tips_window: 1_000_000,
         verify_tips: false,
+        ..WriterConfig::default()
+    };
+    let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
+    (coord, handle, dir)
+}
+
+/// Like [`coordinator`], but pins the planner's `scan_bias` so a test can force the index
+/// arm (`1`), the scan arm (`u32::MAX`), or anything between.
+fn coordinator_with_scan_bias(scan_bias: u32) -> (WriteCoordinator, WriteHandle, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+    let cfg = WriterConfig {
+        queue_capacity: 64,
+        max_batch_records: 64,
+        max_batch_bytes: 256,
+        tips_window: 1_000_000,
+        verify_tips: false,
+        read: ReadConfig { scan_bias },
     };
     let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
     (coord, handle, dir)
@@ -184,6 +202,69 @@ fn read_matches_scan_over_random_workload_across_segments() {
             let want_tags: Vec<&str> = expected.tags().collect();
             assert_eq!(got_tags, want_tags);
         }
+    }
+}
+
+#[test]
+fn the_planner_never_changes_the_answer() {
+    // The cost model (6c) picks index-vs-scan purely for speed, so for any `scan_bias` the
+    // read must return the identical result. Replay one workload into three coordinators:
+    // bias 1 forces the index arm (even broad queries plan positions), bias u32::MAX forces
+    // the filtered-scan arm (even selective queries stream + filter), and 4 is the default.
+    // All three must agree with each other and with the scan oracle.
+    let mut wrng = Rng(0x5EED_1234_ABCD_0001);
+    let events: Vec<Event> = (0..400).map(|_| random_event(&mut wrng)).collect();
+
+    // A fixed spread of reads, generated once so every bias runs the identical queries
+    // (covering `all`, empty-items, and 1..=3-item type/tag mixes at random `after` bounds).
+    let mut qrng = Rng(0xABCD_0001_5EED_1234);
+    let last = events.len() as u64;
+    let cases: Vec<(Query, Position)> = (0..500)
+        .map(|_| {
+            let query = random_query(&mut qrng);
+            let after = Position::new(qrng.below(last + 1));
+            (query, after)
+        })
+        .collect();
+
+    let mut per_bias: Vec<Vec<Vec<Position>>> = Vec::new();
+    for &scan_bias in &[1u32, 4, u32::MAX] {
+        let (coord, handle, _dir) = coordinator_with_scan_bias(scan_bias);
+        for ev in &events {
+            handle.append(vec![ev.clone()], None).unwrap();
+        }
+        let results: Vec<Vec<Position>> = cases
+            .iter()
+            .map(|(query, after)| {
+                read_owned(&handle, query.clone(), *after)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect()
+            })
+            .collect();
+        let set = coord.shutdown();
+        // Pin the first run (forced index) against the scan oracle; the workload is identical
+        // across biases, so the same baseline governs all of them.
+        if per_bias.is_empty() {
+            let baseline: Vec<Vec<Position>> = cases
+                .iter()
+                .map(|(query, after)| scan_baseline(&set, query, *after))
+                .collect();
+            assert_eq!(
+                results, baseline,
+                "scan_bias {scan_bias} disagreed with the scan oracle"
+            );
+        }
+        per_bias.push(results);
+    }
+
+    // Every bias produced byte-identical answers: the planner changed the path, not the data.
+    for (bias, results) in [4u32, u32::MAX].iter().zip(&per_bias[1..]) {
+        assert_eq!(
+            *results, per_bias[0],
+            "scan_bias {bias} changed the answer versus the forced-index run"
+        );
     }
 }
 

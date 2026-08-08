@@ -300,6 +300,15 @@ impl SegmentIndex for ActiveView {
         Some(Cow::Owned(out))
     }
 
+    fn term_len(&self, tag: &str) -> Option<u32> {
+        let term = self.tags.get(tag).map(|r| *r)?;
+        let slot = self.postings.get(term.get())?;
+        // Upper bound: the slot's full count clamped to the visible window. The true visible
+        // count can be lower (postings straddling `upto_len`), but an overcount only biases
+        // the planner toward scanning, never toward a wrong answer (see the trait doc).
+        Some(slot.len().min(self.upto_len))
+    }
+
     fn type_id(&self, name: &str) -> Option<u16> {
         self.types.get(name).map(|r| r.get())
     }
@@ -430,6 +439,18 @@ mod tests {
         let q = Query::item(QueryItem::with_tags(tags(&["a"])));
         let got: Vec<u64> = search(&view, &q, Position::ZERO).map(|p| p.get()).collect();
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn term_len_is_a_watermark_bounded_upper_bound() {
+        // Tag "a" on all five events. The full view counts all five; a view pinned at
+        // watermark 3 clamps to its visible window (three), never reporting past the
+        // watermark. An absent tag is None.
+        let events: Vec<Event> = (0..5).map(|_| event("E", &["a"])).collect();
+        let index = build(1, &events);
+        assert_eq!(index.view_full().term_len("a"), Some(5));
+        assert_eq!(index.view(Position::new(3)).term_len("a"), Some(3));
+        assert_eq!(index.view_full().term_len("absent"), None);
     }
 
     #[test]

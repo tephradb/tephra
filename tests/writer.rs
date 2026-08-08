@@ -23,6 +23,7 @@ fn config() -> WriterConfig {
         max_batch_bytes: 256 * 1024,
         tips_window: 1_000_000,
         verify_tips: true,
+        ..WriterConfig::default()
     }
 }
 
@@ -223,6 +224,7 @@ fn index_search_sees_own_writes_across_rollovers() {
         max_batch_bytes: 256,
         tips_window: 1_000_000,
         verify_tips: true,
+        ..WriterConfig::default()
     };
     let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
 

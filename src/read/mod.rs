@@ -27,13 +27,16 @@
 //!
 //! ## Index-driven reads
 //!
-//! Both sealed and active ranges are answered through the index: sealed segments via their
-//! on-disk index ([`search`]), and the **active** segment via a watermark-bounded
-//! [`ActiveView`](crate::index::ActiveView) over the shared `Arc<ActiveTail>` the writer
-//! publishes (phase 6b). A degraded segment never answers short: an unindexable sealed
-//! segment, or an active segment that latched unindexable, falls back to scanning its own
-//! range. The index-vs-scan cost model (choosing scan over the index for broad queries) is
-//! phase 6c; today selective queries use the index and `Query::all` streams a log scan.
+//! The planner ([`estimate_matches`](crate::index::estimate_matches) + [`choose`], phase 6c)
+//! picks between two modes per read by estimating the result size from exact posting lengths
+//! (CLAUDE.md 8): a **selective** query
+//! is answered through the index (sealed segments via their on-disk index [`search`], the
+//! **active** segment via a watermark-bounded [`ActiveView`](crate::index::ActiveView) over
+//! the shared `Arc<ActiveTail>` the writer publishes in phase 6b), then each matching event
+//! is fetched by position; a **broad** query streams a sequential log scan instead, avoiding
+//! one random fetch per event. The choice only ever changes which correct path runs. A
+//! degraded segment never answers short: an unindexable sealed segment, or an active segment
+//! that latched unindexable, falls back to scanning its own range regardless of the verdict.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -45,17 +48,34 @@ use thiserror::Error;
 use seglog::read::Reader;
 
 use crate::Position;
-use crate::event::{DecodeError, EventRef};
-use crate::index::{ActiveTail, IndexSegment, search};
+use crate::event::{DecodeError, Event, EventRef};
+use crate::index::{
+    Access, ActiveTail, IndexSegment, SegmentIndex, choose, estimate_matches, search,
+};
 use crate::log::set::{LogError, Record, Scan, Segment, SegmentSet, SegmentSource};
 use crate::query::Query;
 
 use crate::index::IndexSet;
 
-/// Configuration for the read paths. A placeholder in 6a; the index-vs-scan cost model
-/// (6c) adds its knobs here.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReadConfig {}
+/// Configuration for the read paths: the index-vs-scan cost model's tuning (CLAUDE.md 8).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadConfig {
+    /// The planner's `K`: the index is chosen only when the post-pruning range is at least
+    /// `scan_bias` times the estimated result count, so larger values bias toward scanning
+    /// at the margin and `1` disables the bias (index whenever the estimate does not exceed
+    /// the range). Provisional default pending the read-path benchmark; it changes only
+    /// which correct path runs, never the answer.
+    pub scan_bias: u32,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        // Index when the estimated result is at most ~1/4 of the range. A placeholder until
+        // `benches/read_path.rs` locates the real crossover (CLAUDE.md 8; the deliverable is
+        // the benchmark, not a tuned `K`).
+        ReadConfig { scan_bias: 4 }
+    }
+}
 
 /// An immutable snapshot of what is readable: the sealed log segments and their on-disk
 /// indexes (aligned one-for-one), plus the active log segment. Shared behind an `Arc`;
@@ -212,12 +232,13 @@ pub enum ReadError {
 
 /// A lending iterator over the events matching a read, in ascending position order.
 ///
-/// Two internal shapes (chosen by [`Reads::plan`]): the bypass path streams a filtered log
-/// scan and never buffers the result; the indexed path plans the ascending *positions* (a
-/// `Vec<Position>`, cheap `u64`s, small for a selective query) and fetches each event on
-/// demand into a single-record buffer it lends from. Neither buffers a growing *event*
-/// result; the position list is materialized only on the indexed path, and 6c routes broad
-/// results to the streaming bypass path.
+/// Three internal shapes (chosen by [`Reads::plan`] via the cost model): the bypass path
+/// streams a log scan, either unfiltered (`Query::all`, zero-copy) or filtered (a broad
+/// query, copying one matched record at a time); the indexed path plans the ascending
+/// *positions* (a `Vec<Position>`, cheap `u64`s, small for a selective query) and fetches
+/// each event on demand into a single-record buffer it lends from. None buffers a growing
+/// *event* result; only the indexed path materializes a position list, and the planner routes
+/// broad results to the streaming bypass path instead.
 pub struct Reads {
     watermark: Position,
     pending_err: Option<ReadError>,
@@ -242,13 +263,27 @@ struct IndexedState {
     buf: Option<Record>,
 }
 
+/// The filtered-scan path's state: the streaming scan, the query to filter by, and a
+/// single-event buffer each matched record is copied into (as an owned [`Event`], which
+/// carries the decode offset computed for the filter, so yielding it needs no second parse)
+/// so the yielded event borrows the buffer rather than the scan.
+struct ScanFilteredState {
+    scan: Scan<Arc<Snapshot>>,
+    query: Query,
+    buf: Option<(Position, Event)>,
+}
+
 enum Mode {
-    /// Bypass: a sequential scan of the whole `(after, watermark]` range. Streaming, so a
-    /// huge projection never materializes. In 6a this path is only `Query::all`, so every
-    /// record matches and there is no per-item filter; 6c adds broad-projection filtering.
-    /// Both non-trivial variants are boxed: a `Scan` and the indexed state each own large
-    /// buffers, so keeping the enum small avoids a bloated `Reads` for the `Done` case.
+    /// Bypass, unfiltered: a zero-copy streaming scan of the whole `(after, watermark]`
+    /// range, yielding every record. This is the `Query::all` projection-catch-up path, the
+    /// highest-volume read (CLAUDE.md 9), kept at disk bandwidth with no per-event copy.
     Scan { scan: Box<Scan<Arc<Snapshot>>> },
+    /// Bypass, filtered: the same streaming scan, but keeping only records matching `query`.
+    /// The planner routes a broad (but not full-log) query here so a large result set never
+    /// materializes a position list or refetches. Each matched record is copied out because a
+    /// lending iterator cannot conditionally return its borrow from a loop on stable Rust; the
+    /// copy is paid only per *matched* event, the same as the indexed path's per-event buffer.
+    ScanFiltered(Box<ScanFilteredState>),
     /// Indexed: a pre-planned ascending position list (already clamped to the watermark),
     /// each event fetched on demand and lent from `buf`, reusing one reader per segment.
     Indexed(Box<IndexedState>),
@@ -263,15 +298,17 @@ impl Reads {
         self.watermark
     }
 
-    /// Plans the read: `Query::all` (and, in 6c, broad projections) streams a filtered log
-    /// scan; a selective query gathers positions from the sealed indexes and the bounded
-    /// active-range scan, then fetches events on demand.
+    /// Plans the read (CLAUDE.md 8). Estimates the result size from exact posting lengths and
+    /// picks the cheaper mode: a broad query streams a filtered log scan
+    /// ([`Access::Scan`]), a selective one gathers positions from the index and fetches
+    /// events on demand ([`Access::Index`]). The choice only ever changes which correct path
+    /// runs: both return the identical positions.
     fn plan(
         snapshot: Arc<Snapshot>,
         query: Query,
         after: Position,
         watermark: Position,
-        _config: &ReadConfig,
+        config: &ReadConfig,
     ) -> Reads {
         if after >= watermark {
             return Reads {
@@ -281,32 +318,59 @@ impl Reads {
             };
         }
 
-        // Bypass: a full-log query streams a scan rather than planning positions. Every
-        // record matches `Query::all`, so no per-item filter is needed here.
-        if matches!(query, Query::All) {
-            let scan = Box::new(Scan::start(Arc::clone(&snapshot), after.next(), watermark));
-            return Reads {
-                watermark,
-                pending_err: None,
-                mode: Mode::Scan { scan },
-            };
-        }
+        let (estimate, width) = estimate_read(&snapshot, &query, after, watermark);
+        let access = choose(estimate, width, config.scan_bias);
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            ?access,
+            estimate,
+            width,
+            scan_bias = config.scan_bias,
+            "read planner verdict"
+        );
 
-        match plan_positions(&snapshot, &query, after, watermark) {
-            Ok(positions) => Reads {
-                watermark,
-                pending_err: None,
-                mode: Mode::Indexed(Box::new(IndexedState {
-                    snapshot,
-                    positions: positions.into_iter(),
-                    reader: None,
-                    buf: None,
-                })),
-            },
-            Err(err) => Reads {
-                watermark,
-                pending_err: Some(err),
-                mode: Mode::Done,
+        match access {
+            // Broad: stream a scan of the whole range, never materializing positions. A
+            // full-log query needs no filter and stays zero-copy; any other broad query
+            // filters (and copies) per matched event. The `Query::all` check picks the
+            // cheaper scan *implementation*; it does not bypass the cost model, which already
+            // routed the query here.
+            Access::Scan => {
+                let scan = Scan::start(Arc::clone(&snapshot), after.next(), watermark);
+                let mode = if matches!(query, Query::All) {
+                    Mode::Scan {
+                        scan: Box::new(scan),
+                    }
+                } else {
+                    Mode::ScanFiltered(Box::new(ScanFilteredState {
+                        scan,
+                        query,
+                        buf: None,
+                    }))
+                };
+                Reads {
+                    watermark,
+                    pending_err: None,
+                    mode,
+                }
+            }
+            // Selective: plan the ascending positions from the index, fetch on demand.
+            Access::Index => match plan_positions(&snapshot, &query, after, watermark) {
+                Ok(positions) => Reads {
+                    watermark,
+                    pending_err: None,
+                    mode: Mode::Indexed(Box::new(IndexedState {
+                        snapshot,
+                        positions: positions.into_iter(),
+                        reader: None,
+                        buf: None,
+                    })),
+                },
+                Err(err) => Reads {
+                    watermark,
+                    pending_err: Some(err),
+                    mode: Mode::Done,
+                },
             },
         }
     }
@@ -321,6 +385,7 @@ impl Reads {
         }
         match &mut self.mode {
             Mode::Done => None,
+            // Unfiltered: yield every record, zero-copy (the event borrows the scan buffer).
             Mode::Scan { scan } => match scan.next()? {
                 Ok(record) => {
                     let position = record.position;
@@ -331,6 +396,35 @@ impl Reads {
                 }
                 Err(err) => Some(Err(ReadError::Log(Arc::new(err)))),
             },
+            // Filtered: advance to the next record matching `query`, copying the match into an
+            // owned `Event` so the yielded event borrows `buf` (a lending iterator cannot
+            // conditionally return its borrow of the scan from a loop). Decoding happens once:
+            // the filter decode's offset is preserved by `to_owned`, so `as_ref` on the way out
+            // reparses nothing. The filter is the same `Query::matches` the scan oracle uses, so
+            // this yields exactly the indexed path's positions.
+            Mode::ScanFiltered(state) => {
+                let ScanFilteredState { scan, query, buf } = state.as_mut();
+                loop {
+                    match scan.next()? {
+                        Ok(record) => {
+                            let event = match EventRef::from_bytes(record.data) {
+                                Ok(event) => event,
+                                Err(err) => return Some(Err(ReadError::Corrupt(err))),
+                            };
+                            if query.matches(event) {
+                                *buf = Some((record.position, event.to_owned()));
+                                break;
+                            }
+                        }
+                        Err(err) => return Some(Err(ReadError::Log(Arc::new(err)))),
+                    }
+                }
+                let (position, event) = buf.as_ref().unwrap();
+                Some(Ok(Sequenced {
+                    position: *position,
+                    event: event.as_ref(),
+                }))
+            }
             Mode::Indexed(state) => {
                 let IndexedState {
                     snapshot,
@@ -392,6 +486,82 @@ impl Reads {
         }
         Ok(out)
     }
+}
+
+/// Estimates the read's result size and its post-pruning range width for the planner
+/// ([`choose`]). Mirrors [`plan_positions`]'s pruning so the estimate covers exactly the
+/// segments the read will touch: sealed segments through their index, plus the active tail.
+/// An unindexable segment (sealed, or the active tail latched unindexable) is treated as
+/// fully broad, since the indexed path would scan its whole range anyway. The estimate is an
+/// upper bound, capped at the width, so the verdict only ever errs toward scanning.
+fn estimate_read(
+    snapshot: &Snapshot,
+    query: &Query,
+    after: Position,
+    watermark: Position,
+) -> (u64, u64) {
+    let wm = watermark.get();
+    let mut estimate: u64 = 0;
+    let mut width: u64 = 0;
+
+    for (seg, index) in snapshot.sealed_log.iter().zip(snapshot.sealed_index.iter()) {
+        let base = seg.base_position();
+        let count = seg.event_count();
+        if count == 0 {
+            continue;
+        }
+        let effective_max = (base.get() + count - 1).min(wm);
+        if effective_max <= after.get() {
+            continue;
+        }
+        let seg_width = segment_width(after, base, effective_max);
+        width += seg_width;
+        estimate += match index {
+            Some(index_seg) => estimate_segment(index_seg.as_ref(), query, seg_width),
+            // Unindexable: scanned wholesale by the indexed path, so as broad as it gets.
+            None => seg_width,
+        };
+    }
+
+    let active_base = snapshot.active_log.base_position();
+    if watermark >= active_base {
+        let seg_width = segment_width(after, active_base, wm);
+        width += seg_width;
+        estimate += if snapshot.active_index.is_unindexable() {
+            seg_width
+        } else {
+            estimate_segment(&snapshot.active_index.view(watermark), query, seg_width)
+        };
+    }
+
+    (estimate.min(width), width)
+}
+
+/// The number of positions in `(after, effective_max]` that fall within a segment based at
+/// `base`: `[max(after + 1, base), effective_max]`, or `0` if that range is empty.
+fn segment_width(after: Position, base: Position, effective_max: u64) -> u64 {
+    let first = first_after(after, base).get();
+    (effective_max + 1).saturating_sub(first)
+}
+
+/// The per-segment result estimate ([`estimate_matches`]), also emitting one per-item trace
+/// line so a mis-chosen plan can be attributed to the item whose estimate was off (and so
+/// the per-item data that would justify per-item mode mixing is captured; CLAUDE.md 8).
+fn estimate_segment<I: SegmentIndex>(index: &I, query: &Query, seg_width: u64) -> u64 {
+    let estimate = estimate_matches(index, query, seg_width);
+    #[cfg(feature = "tracing")]
+    if let Query::Items(items) = query {
+        for (item, spec) in items.iter().enumerate() {
+            tracing::trace!(
+                segment_base = index.base().get(),
+                item,
+                estimate = crate::index::estimate_item(index, spec, seg_width),
+                seg_width,
+                "planner per-item estimate"
+            );
+        }
+    }
+    estimate
 }
 
 /// Gathers the ascending positions matching `query` in `(after, watermark]`: sealed

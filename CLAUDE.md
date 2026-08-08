@@ -671,15 +671,45 @@ fix: it would reintroduce a global type id space, which segment-local ids delibe
 
 ## 8. Layer 4: Query planner
 
-Per query item, choose posting intersection vs column/log scan by comparing posting
-length against the post-pruning position range width.
+Choose posting intersection vs a sequential scan by comparing an estimated result size
+against the post-pruning position range width. The estimate comes from posting lengths:
+per item the shortest posting list bounds an AND (`min` over its tags, absent tag being
+0), and the item estimates sum for an OR, capped at the width. A type-only or empty item
+is treated as broad (the width) since there is no stored per-type count.
 
-Exact posting lengths come free from the term dictionary, per segment. No statistics, no
-`ANALYZE`, no estimation error: the planner is strictly easier here than in a
-general-purpose database.
+Exact posting lengths come free from the term dictionary, per segment (`SegmentIndex::
+term_len`: a singleton is 1, a small term reads only its leading count varint). No
+statistics, no `ANALYZE`, no estimation error: the planner is strictly easier here than in
+a general-purpose database. On the in-memory active tail the length is a watermark-bounded
+**upper bound**, not exact, which is fine: the estimate is only ever an upper bound anyway.
+
+**The planner can only change the speed, never the answer.** Both execution modes (indexed
+fetch, streaming filtered scan) return the identical positions the scan oracle does, so a
+crude estimate at worst picks a slower correct path. That is what lets the estimate be an
+upper bound and the whole thing carry no correctness risk. It is enforced by a test that
+runs every read under `scan_bias = 1` (force index), `u32::MAX` (force scan), and the
+default, and asserts identical results.
+
+The verdict (`index::plan::choose`): index iff `estimate * K <= width`, where `K` is
+`ReadConfig::scan_bias` (biased toward scanning at the margin; larger scans more). `K` is
+**not** a tuned constant: `benches/read_path.rs` is the deliverable, measuring the
+index-vs-scan crossover shape (selectivity, range width, payload size, cold vs hot) so the
+default is set from what the curve shows, not guessed. Every read's verdict is trace-logged
+(the aggregate at `debug`, per-item estimates at `trace`).
 
 `Query.all()` and broad projection catch-up bypass the index entirely and scan the log
-sequentially. Keep the index out of the projection rebuild path.
+sequentially (the `all` bypass stays zero-copy; a broad *filtered* query copies one matched
+record at a time, since a lending iterator cannot conditionally return its borrow from a
+loop). Keep the index out of the projection rebuild path.
+
+**Granularity: the decision is whole-query, not per-item (yet).** A query mixing a narrow
+item and a broad one takes one verdict for both, so the broad item drags the narrow one
+into a scan. The genuinely right granularity is per-item (index the narrow, scan the broad,
+in one read), but that needs an iterator merging an index-derived position set with a
+scan-derived one in ascending order, and it should not be built before the benchmark and
+the per-item trace logs show it pays. Per-*segment* mixing is rejected: most of that
+complexity, at a granularity that does not match selectivity (a rare tag is rare in every
+segment).
 
 ---
 
@@ -827,6 +857,7 @@ src/
     append.rs       // AppendColumn (chunked atomic append-only vec) + PostingSlot (inline/spill)
     tail.rs         // ActiveTail: shared per-tag postings + dense type column, fed in position order; ActiveView reader
     search.rs       // index-driven Query evaluator, ascending iterator (differential oracle)
+    plan.rs         // layer-4 cost model: estimate_matches (posting-length bound) + choose
     segment.rs      // IndexSegment: on-disk index format, encode/decode
     set.rs          // IndexSet: sealed IndexSegments + active ActiveTail, search_all, seal/rebuild
     recovery.rs     // Rebuilder: reconstruct the tail from a log scan

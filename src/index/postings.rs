@@ -141,6 +141,34 @@ pub fn decode_postings(value: u64, region: &[u8]) -> Result<Cow<'static, [u32]>,
     }
 }
 
+/// The number of postings a `value` from the FST term dictionary points at, without
+/// materializing the list.
+///
+/// A singleton is length `1` from the value alone; a small term reads only the leading
+/// `varint(count)` at its offset (not the deltas), which is what makes exact posting
+/// lengths "free from the term dictionary" (CLAUDE.md 8) for the query planner. The
+/// reserved dense tier is a named error, exactly as [`decode_postings`].
+pub fn posting_len(value: u64, region: &[u8]) -> Result<u32, PostingsError> {
+    let tier = value >> TIER_SHIFT;
+    let payload = value & PAYLOAD_MASK;
+    match tier {
+        TIER_SINGLETON => Ok(1),
+        TIER_SMALL => {
+            let offset = payload as usize;
+            let cursor = region
+                .get(offset..)
+                .ok_or(PostingsError::OffsetOutOfBounds {
+                    offset,
+                    len: region.len(),
+                })?;
+            let (count, _) = decode_varint(cursor)?;
+            u32::try_from(count).map_err(|_| PostingsError::PositionOverflow)
+        }
+        TIER_DENSE => Err(PostingsError::ReservedDenseTier),
+        _ => unreachable!("tier is two bits, values 0..=3, and 3 is unused"),
+    }
+}
+
 /// Reads a `varint(count)` + `count` delta block at `offset` into ascending positions.
 fn decode_delta_block(offset: usize, region: &[u8]) -> Result<Vec<u32>, PostingsError> {
     let mut cursor = region
@@ -271,6 +299,27 @@ mod tests {
             vec![1, 3]
         );
         assert_eq!(decode_postings(c, &region).unwrap().into_owned(), vec![9]);
+    }
+
+    #[test]
+    fn posting_len_matches_the_decoded_length_without_walking_it() {
+        let mut region = Vec::new();
+        // Singleton: length 1 from the value alone, region untouched.
+        let one = encode_postings(&[42], &mut region);
+        assert_eq!(posting_len(one, &region).unwrap(), 1);
+        // Small term: length is the leading count varint, equal to the decoded list length.
+        let postings = [0u32, 1, 5, 6, 1000, 1_000_000];
+        let small = encode_postings(&postings, &mut region);
+        assert_eq!(posting_len(small, &region).unwrap(), postings.len() as u32);
+        assert_eq!(
+            posting_len(small, &region).unwrap() as usize,
+            decode_postings(small, &region).unwrap().len()
+        );
+        // Reserved dense tier is a named error, like decode.
+        assert_eq!(
+            posting_len(TIER_DENSE << TIER_SHIFT, &region),
+            Err(PostingsError::ReservedDenseTier)
+        );
     }
 
     #[test]

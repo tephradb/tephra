@@ -23,6 +23,7 @@ use crate::Position;
 
 mod append;
 mod header;
+mod plan;
 mod postings;
 mod search;
 mod segment;
@@ -32,6 +33,7 @@ mod tail;
 pub mod recovery;
 
 pub use header::{INDEX_HEADER_SIZE, IndexHeaderError, IndexSegmentHeader};
+pub use plan::{Access, choose, estimate_item, estimate_matches};
 pub use search::search;
 pub use segment::{IndexSegment, IndexSegmentError};
 pub use set::{IndexError, IndexSet};
@@ -89,6 +91,18 @@ pub trait SegmentIndex {
     /// Ascending local positions of every event carrying `tag`, or `None` if no indexed
     /// event carries it.
     fn term_postings(&self, tag: &str) -> Option<Cow<'_, [u32]>>;
+
+    /// How many events carry `tag`, or `None` if no indexed event does, **without
+    /// materializing the postings**. The query planner ([`estimate_matches`]) uses this as a
+    /// cheap result-size estimate (CLAUDE.md 8, "exact posting lengths come free from the
+    /// term dictionary").
+    ///
+    /// **Exact on the on-disk [`IndexSegment`]** (the FST value carries the count); an
+    /// **upper bound on an [`ActiveView`]**, whose count is clamped to the watermark but
+    /// may still overcount (a watermark below the tail tip, or a tag's locals straddling
+    /// the bound). An overcount only ever biases the planner toward scanning, never toward
+    /// a wrong answer, so the asymmetry is safe.
+    fn term_len(&self, tag: &str) -> Option<u32>;
 
     /// The dense type id for `name`, or `None` if no indexed event has that type.
     fn type_id(&self, name: &str) -> Option<u16>;

@@ -21,6 +21,7 @@ pub struct WriteCoordinator {
     shutdown: Sender<Message>,
     join: Option<JoinHandle<SegmentSet>>,
     read_core: Arc<ReadCore>,
+    read_config: ReadConfig,
 }
 
 impl WriteCoordinator {
@@ -51,7 +52,7 @@ impl WriteCoordinator {
         // The shared read state: readers hold a clone and query it on their own thread,
         // while the writer publishes to it at each commit seam.
         let read_core = ReadCore::new(&set, &index);
-        let reader = ReadHandle::new(Arc::clone(&read_core), ReadConfig::default());
+        let reader = ReadHandle::new(Arc::clone(&read_core), cfg.read);
         let (tx, rx) = channel::bounded::<Message>(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         let worker = Worker {
@@ -74,6 +75,7 @@ impl WriteCoordinator {
                 shutdown,
                 join: Some(join),
                 read_core,
+                read_config: cfg.read,
             },
             WriteHandle { tx, reader },
         ))
@@ -82,7 +84,7 @@ impl WriteCoordinator {
     /// A [`ReadHandle`] for reads that do not append, sharing the coordinator's published
     /// read state. Reads run on the caller's thread and never touch the writer.
     pub fn read_handle(&self) -> ReadHandle {
-        ReadHandle::new(Arc::clone(&self.read_core), ReadConfig::default())
+        ReadHandle::new(Arc::clone(&self.read_core), self.read_config)
     }
 
     /// Signals shutdown, joins the writer thread, and returns the `SegmentSet`. Requests
@@ -323,6 +325,7 @@ mod tests {
             max_batch_bytes: SEG_SIZE / 2,
             tips_window: 1_000_000,
             verify_tips: true,
+            read: ReadConfig::default(),
         }
     }
 

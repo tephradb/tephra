@@ -38,7 +38,7 @@ use crate::Position;
 
 use super::SegmentIndex;
 use super::header::{INDEX_HEADER_SIZE, IndexHeaderError, IndexSegmentHeader};
-use super::postings::{decode_postings, encode_postings};
+use super::postings::{decode_postings, encode_postings, posting_len};
 use super::tail::ActiveTail;
 
 /// A shared subslice of an `Arc<[u8]>`: shares ownership of the whole segment buffer but
@@ -231,6 +231,16 @@ impl SegmentIndex for IndexSegment {
         let postings = decode_postings(value, self.postings_region())
             .expect("postings decode on a CRC-validated index segment");
         Some(postings)
+    }
+
+    fn term_len(&self, tag: &str) -> Option<u32> {
+        let value = self.map.get(tag.as_bytes())?;
+        // Exact and cheap: the tier gives a singleton's 1 directly and reads only a small
+        // term's leading count varint. Like `term_postings`, a decode failure on an
+        // already-CRC-validated segment is an integrity bug, not a normal outcome.
+        let len = posting_len(value, self.postings_region())
+            .expect("posting length on a CRC-validated index segment");
+        Some(len)
     }
 
     fn type_id(&self, name: &str) -> Option<u16> {
@@ -432,6 +442,31 @@ mod tests {
             vec![1, 2]
         );
         assert!(seg.term_postings("absent").is_none());
+    }
+
+    #[test]
+    fn term_len_is_exact_and_matches_the_postings() {
+        // only:once is a tier0 singleton (length 1 from the FST value); twice:here is a
+        // tier1 small term whose length is its leading count varint. Both must equal the
+        // decoded posting-list length, without materializing it, and an absent tag is None.
+        let index = ActiveTail::new(Position::new(1));
+        index
+            .push(Position::new(1), event("E", &["only:once"]).as_ref())
+            .unwrap();
+        index
+            .push(Position::new(2), event("E", &["twice:here"]).as_ref())
+            .unwrap();
+        index
+            .push(Position::new(3), event("E", &["twice:here"]).as_ref())
+            .unwrap();
+        let seg = sealed(&index);
+        assert_eq!(seg.term_len("only:once"), Some(1));
+        assert_eq!(seg.term_len("twice:here"), Some(2));
+        assert_eq!(seg.term_len("absent"), None);
+        assert_eq!(
+            seg.term_len("twice:here").unwrap() as usize,
+            seg.term_postings("twice:here").unwrap().len()
+        );
     }
 
     #[test]

@@ -180,6 +180,13 @@ impl PostingSlot {
         self.len.store((n + 1) as u32, Ordering::Release);
     }
 
+    /// The posting count (Acquire), the reader-side length bound. An upper bound on how many
+    /// postings are visible below any given `upto`: the planner uses it for a cheap size
+    /// estimate without walking the list ([`collect_below`](Self::collect_below) truncates).
+    pub fn len(&self) -> u32 {
+        self.len.load(Ordering::Acquire)
+    }
+
     /// Appends this slot's ascending locals with `local < upto` to `out`. Reader-side.
     ///
     /// Reads `len` first (Acquire), then chooses inline-vs-spill from it: never the reverse,

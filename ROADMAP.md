@@ -285,14 +285,21 @@ index). See the phase-6 plan for the confirmed decisions behind each.
 
 ### Phase 6c: Cost model (benchmark-first)
 
-- [ ] A read-path benchmark measuring the index-vs-scan crossover *shape* (selectivity,
-      range width, payload size, cold vs hot); the benchmark is the deliverable, not a tuned
-      `K`
-- [ ] Per-item planner: posting length (exact, from the term dictionary) vs post-pruning
-      position range width, biased toward scanning at the margin, `K` a `ReadConfig` knob,
-      every decision trace-logged
-- [ ] Broad-projection bypass: a query whose result is a large fraction of the range scans
-      the log rather than the index
+- [x] A read-path benchmark (`benches/read_path.rs`) measuring the index-vs-scan crossover
+      *shape* (selectivity, range width, payload size), forcing each arm via `scan_bias` so
+      the two curves are measured over one workload; the benchmark is the deliverable, not a
+      tuned `K` (cold vs hot is a documented cache caveat, like write_path's fsync caveat)
+- [x] Planner cost model (`index::plan`): estimate the result size from exact posting
+      lengths (`SegmentIndex::term_len`, exact on the sealed segment, a watermark-bounded
+      upper bound on the active tail) vs the post-pruning range width, biased toward scanning
+      at the margin, `K` the `ReadConfig::scan_bias` knob, every decision trace-logged (the
+      aggregate verdict at `debug`, per-item estimates at `trace`). The decision is
+      whole-query for now; the per-item planner is deferred (CLAUDE.md 8), with the per-item
+      logs as the data that would justify building it
+- [x] Broad-projection bypass: a query whose estimated result is a large fraction of the
+      range streams a filtered log scan rather than the index (`Query::all` stays the
+      zero-copy unfiltered bypass). Proven answer-invariant across `scan_bias` values, so the
+      planner only ever changes the path, never the result
 
 ### Phase 6d: Condition fallthrough onto the index
 
