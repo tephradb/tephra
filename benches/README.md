@@ -47,8 +47,36 @@ DCBDB_BENCH_DIR=/mnt/nvme cargo bench --bench write_path
 
 ## Comparing against other stores
 
-Once you add other event stores to the comparison, keep the workload identical: same event
-size, same tag shape, same durability setting (their equivalent of fsync-per-commit must be
-on), and the same physical device via `DCBDB_BENCH_DIR`. The `group_commit` group is the
-one to lead with, since group commit under concurrency is where this design is meant to
-win.
+Keep the workload identical: same event size, same tag shape, same durability setting
+(their equivalent of fsync-per-commit must be on), and the same physical device via
+`DCBDB_BENCH_DIR`.
+
+### `compare` bench: dcbdb vs umadb
+
+`benches/compare.rs` benchmarks dcbdb against [umadb](https://umadb.io), another
+DCB-compliant event store, through umadb's embedded (no gRPC) append API. It is gated
+behind the `umadb-compare` feature so the default build never needs umadb:
+
+```sh
+cargo bench --features umadb-compare --bench compare
+cargo bench --features umadb-compare --bench compare -- append_latency
+```
+
+Each group pairs the two engines (`dcbdb` vs `umadb`) under the same workload as
+`write_path`, one durable commit per call. Both are fully durable per append (dcbdb: one
+fsync via the group-commit path; umadb: two fsyncs via its copy-on-write dual-header
+B+tree), so it is an apples-to-apples "cost of one durable append" comparison of the two
+storage designs.
+
+Two scoping notes:
+
+- **Single-threaded only.** umadb's embedded `append` is single-writer by convention (its
+  concurrency is provided by the server writer thread, out of scope here), so there is no
+  concurrent group. dcbdb's concurrency lives in the `group_commit` group of `write_path`.
+- **Single-threaded dcbdb pays a thread hop.** A lone caller still round-trips to dcbdb's
+  writer thread per append; the coalescing win only shows under concurrency. Read the
+  `compare` numbers as per-append storage cost, and `write_path`'s `group_commit` for the
+  concurrency story.
+
+> umadb is a git dependency pinned to the rev the comparison was run against, and is only
+> fetched when the `umadb-compare` feature is enabled, so the default build never needs it.
