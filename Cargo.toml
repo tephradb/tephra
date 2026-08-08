@@ -16,8 +16,13 @@ thiserror = "2.0"
 tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
+criterion = "0.8"
 tempfile = "3"
 
 [features]
 tracing = ["dep:tracing", "seglog/tracing"]
 zstd = ["seglog/zstd"]
+
+[[bench]]
+name = "write_path"
+harness = false
