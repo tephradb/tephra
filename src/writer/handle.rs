@@ -4,18 +4,23 @@ use flume::{self as channel, Sender};
 
 use crate::Position;
 use crate::event::Event;
-use crate::index::IndexError;
 use crate::log::set::PositionRange;
 use crate::query::{AppendCondition, Query};
+use crate::read::{ReadHandle, Reads};
 
 use super::{AppendError, Message, Request};
 
 /// A cloneable, `Send` handle to the write coordinator. Every clone feeds the same
 /// single writer; dropping the last one (and the owning [`WriteCoordinator`]) shuts the
 /// coordinator down.
+///
+/// Also carries a [`ReadHandle`] so appends and reads share one handle, but the two are
+/// independent: [`read`](Self::read) runs on the caller's thread over the published
+/// snapshot and never touches the writer.
 #[derive(Clone)]
 pub struct WriteHandle {
     pub(super) tx: Sender<Message>,
+    pub(super) reader: ReadHandle,
 }
 
 impl WriteHandle {
@@ -53,28 +58,19 @@ impl WriteHandle {
         response.recv().map_err(|_| AppendError::Shutdown)?
     }
 
-    /// Runs `query` against the index, returning the matching positions ascending and
-    /// strictly after `after`.
-    ///
-    /// Serviced on the writer thread in submission order, so a query issued after an
-    /// `append` on the same handle sees that append (read-your-writes). Errs with
-    /// [`IndexError::Unindexable`] if the query touches a segment that could not be
-    /// indexed; the caller should then scan the log for that range. A shutdown coordinator
-    /// surfaces as an [`IndexError::Io`]-free channel drop, mapped to
-    /// [`SearchError::Shutdown`].
-    pub fn search(&self, query: Query, after: Position) -> Result<Vec<Position>, SearchError> {
-        let (reply, response) = channel::unbounded();
-        self.tx
-            .send(Message::Search {
-                query,
-                after,
-                reply,
-            })
-            .map_err(|_| SearchError::Shutdown)?;
-        response
-            .recv()
-            .map_err(|_| SearchError::Shutdown)?
-            .map_err(SearchError::Index)
+    /// Reads events matching `query`, ascending, strictly after `after`, up to the
+    /// watermark pinned now. Runs on the **caller's own thread** over the published read
+    /// snapshot: it never touches the writer thread, and read-your-writes still holds (the
+    /// writer publishes the watermark before replying to an append). See
+    /// [`ReadHandle::read`] and [`Reads`].
+    pub fn read(&self, query: Query, after: Position) -> Reads {
+        self.reader.read(query, after)
+    }
+
+    /// A standalone [`ReadHandle`] for pure readers, sharing this handle's published read
+    /// state without the ability to append.
+    pub fn reader(&self) -> ReadHandle {
+        self.reader.clone()
     }
 
     /// The `async` counterpart of [`append`](Self::append): identical semantics, but it
@@ -107,42 +103,4 @@ impl WriteHandle {
             .await
             .map_err(|_| AppendError::Shutdown)?
     }
-
-    /// The `async` counterpart of [`search`](Self::search): identical semantics, but it
-    /// yields to the executor instead of blocking the thread while the request queue is
-    /// full and while awaiting the reply. Read-your-writes still holds against an
-    /// `append_async` awaited earlier on the same handle.
-    #[cfg(feature = "async")]
-    pub async fn search_async(
-        &self,
-        query: Query,
-        after: Position,
-    ) -> Result<Vec<Position>, SearchError> {
-        let (reply, response) = channel::unbounded();
-        self.tx
-            .send_async(Message::Search {
-                query,
-                after,
-                reply,
-            })
-            .await
-            .map_err(|_| SearchError::Shutdown)?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| SearchError::Shutdown)?
-            .map_err(SearchError::Index)
-    }
-}
-
-/// Why an index query did not return positions.
-#[derive(Debug, thiserror::Error)]
-pub enum SearchError {
-    /// The index could not answer the query (an unindexable range, or an I/O or rebuild
-    /// failure). See [`IndexError`].
-    #[error(transparent)]
-    Index(IndexError),
-    /// The write coordinator has shut down and will not service the query.
-    #[error("write coordinator has shut down")]
-    Shutdown,
 }

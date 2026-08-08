@@ -127,6 +127,13 @@ impl IndexSet {
         })
     }
 
+    /// The per-sealed-segment index handles, aligned with the log's sealed segments, for
+    /// publishing into a read snapshot. `None` marks an unindexable sealed segment (a query
+    /// touching it must scan the log for that range).
+    pub(crate) fn sealed_index_arcs(&self) -> Vec<Option<Arc<IndexSegment>>> {
+        self.sealed.iter().map(|s| s.seg.clone()).collect()
+    }
+
     /// Feeds one committed event into the active tail at its assigned `position`.
     ///
     /// Best-effort: the write is already durable when this runs, so a too-many-types

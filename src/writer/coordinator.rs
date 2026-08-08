@@ -5,22 +5,22 @@ use std::thread::{self, JoinHandle};
 
 use flume::{self as channel, Receiver, Sender, TryRecvError};
 
-use crate::Position;
 use crate::event::EventRef;
 use crate::index::{IndexError, IndexSet};
 use crate::log::set::{LogError, SegmentSet};
-use crate::query::Query;
+use crate::read::{ReadConfig, ReadCore, ReadHandle, Snapshot};
 
 use super::batch::{Batch, MARKER_BYTES, measure};
 use super::handle::WriteHandle;
 use super::tips::TagTips;
-use super::{AppendError, Message, Request, SearchReply, WriterConfig, condition};
+use super::{AppendError, Message, Request, WriterConfig, condition};
 
 /// Owns the writer thread. Holds the join handle so shutdown is deterministic and the
 /// `SegmentSet` can be recovered for inspection or reopen.
 pub struct WriteCoordinator {
     shutdown: Sender<Message>,
     join: Option<JoinHandle<SegmentSet>>,
+    read_core: Arc<ReadCore>,
 }
 
 impl WriteCoordinator {
@@ -48,6 +48,10 @@ impl WriteCoordinator {
         );
 
         let index = IndexSet::open(&set)?;
+        // The shared read state: readers hold a clone and query it on their own thread,
+        // while the writer publishes to it at each commit seam.
+        let read_core = ReadCore::new(&set, &index);
+        let reader = ReadHandle::new(Arc::clone(&read_core), ReadConfig::default());
         let (tx, rx) = channel::bounded::<Message>(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         let worker = Worker {
@@ -58,6 +62,7 @@ impl WriteCoordinator {
             rx,
             pushback: None,
             shutdown: false,
+            read_core: Arc::clone(&read_core),
         };
         let shutdown = tx.clone();
         let join = thread::Builder::new()
@@ -68,9 +73,16 @@ impl WriteCoordinator {
             WriteCoordinator {
                 shutdown,
                 join: Some(join),
+                read_core,
             },
-            WriteHandle { tx },
+            WriteHandle { tx, reader },
         ))
+    }
+
+    /// A [`ReadHandle`] for reads that do not append, sharing the coordinator's published
+    /// read state. Reads run on the caller's thread and never touch the writer.
+    pub fn read_handle(&self) -> ReadHandle {
+        ReadHandle::new(Arc::clone(&self.read_core), ReadConfig::default())
     }
 
     /// Signals shutdown, joins the writer thread, and returns the `SegmentSet`. Requests
@@ -100,9 +112,10 @@ impl Drop for WriteCoordinator {
 /// The state owned by the writer thread.
 struct Worker {
     set: SegmentSet,
-    /// The derived index, fed inline at the commit seam and queried on this thread. Owned
-    /// here (not shared) in phase 5b: it is `!Sync`, so it cannot escape to a reader
-    /// thread until phase 6 gives the active tail a published watermark.
+    /// The derived index, fed inline at the commit seam and queried on this thread for the
+    /// condition check. Still writer-private in 6a (the `!Sync` active tail cannot escape);
+    /// off-thread reads see the sealed segments through the published [`Snapshot`], and the
+    /// active range through a bounded log scan, until 6b shares the active tail.
     index: IndexSet,
     tips: TagTips,
     cfg: WriterConfig,
@@ -112,6 +125,8 @@ struct Worker {
     /// request before it can be measured, so a one-slot buffer is required.
     pushback: Option<Request>,
     shutdown: bool,
+    /// The shared read state the writer publishes to at each commit seam.
+    read_core: Arc<ReadCore>,
 }
 
 impl Worker {
@@ -131,24 +146,15 @@ impl Worker {
     fn collect(&mut self) -> Option<Vec<Request>> {
         let first = match self.pushback.take() {
             Some(request) => request,
-            None => loop {
-                match self.rx.recv() {
-                    Ok(Message::Append(request)) => break request,
-                    // A query serviced between batches: answer it inline and keep waiting
-                    // for the first append of the next batch.
-                    Ok(Message::Search {
-                        query,
-                        after,
-                        reply,
-                    }) => self.answer_search(&query, after, reply),
-                    Ok(Message::Shutdown) => {
-                        self.shutdown = true;
-                        return None;
-                    }
-                    Err(_) => {
-                        self.shutdown = true;
-                        return None;
-                    }
+            None => match self.rx.recv() {
+                Ok(Message::Append(request)) => request,
+                Ok(Message::Shutdown) => {
+                    self.shutdown = true;
+                    return None;
+                }
+                Err(_) => {
+                    self.shutdown = true;
+                    return None;
                 }
             },
         };
@@ -176,14 +182,6 @@ impl Worker {
                     bytes += sum;
                     reqs.push(request);
                 }
-                // A query mid-drain: answer it against the index as it stands (the
-                // in-flight batch is not yet durable, so it is correctly not visible) and
-                // keep draining.
-                Ok(Message::Search {
-                    query,
-                    after,
-                    reply,
-                }) => self.answer_search(&query, after, reply),
                 Ok(Message::Shutdown) => {
                     self.shutdown = true;
                     break;
@@ -266,21 +264,22 @@ impl Worker {
                         .expect("committed record bytes decode; validated on append");
                     self.index.push(position, event);
                 }
+
+                // Publish to readers before replying, so a caller reading right after its
+                // append sees it (read-your-writes). Segments first (on rollover), then the
+                // watermark, so a reader that observes the new watermark also sees the
+                // segment covering it (see `crate::read` ordering note).
+                if self.set.sealed_len() > sealed_before {
+                    self.read_core
+                        .publish_segments(Snapshot::capture(&self.set, &self.index));
+                }
+                self.read_core.publish_watermark(self.set.last_position());
+
                 let next = self.set.next_position();
                 batch.commit_ok(range, &mut self.tips, next);
             }
             Err(err) => batch.commit_err(classify(err)),
         }
-    }
-
-    /// Answers an index query on the writer thread and replies. A dropped receiver (the
-    /// caller gave up) is fine.
-    fn answer_search(&self, query: &Query, after: Position, reply: SearchReply) {
-        let result = self
-            .index
-            .search_all(query, after)
-            .map(|positions| positions.collect());
-        let _ = reply.send(result);
     }
 }
 
@@ -330,6 +329,7 @@ mod tests {
     fn worker(dir: &TempDir, cfg: WriterConfig) -> (Worker, Sender<Message>) {
         let set = new_set(dir);
         let index = IndexSet::open(&set).unwrap();
+        let read_core = ReadCore::new(&set, &index);
         let (tx, rx) = channel::bounded(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         (
@@ -341,6 +341,7 @@ mod tests {
                 rx,
                 pushback: None,
                 shutdown: false,
+                read_core,
             },
             tx,
         )

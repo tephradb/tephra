@@ -4,6 +4,7 @@ pub mod event;
 pub mod index;
 pub mod log;
 pub mod query;
+pub mod read;
 pub mod writer;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]

@@ -177,6 +177,92 @@ impl Segment {
     pub fn event_count(&self) -> u64 {
         self.offsets.read().unwrap().len() as u64
     }
+
+    /// The byte offset of the data record at `local` (`position - base_position`), or
+    /// `None` if `local` is past the events currently in this segment.
+    pub(crate) fn data_offset(&self, local: usize) -> Option<u32> {
+        self.offsets.read().unwrap().get(local).copied()
+    }
+
+    /// Opens a fresh reader (its own file descriptor and read-ahead buffer) over this
+    /// segment. Segments are immutable once written past their flushed point, so a reader
+    /// can outlive a rollover. Used by concurrent readers, which must not share the one
+    /// cached reader ([`Segment::reader`]); the write coordinator's point reads reuse the
+    /// cached one.
+    pub(crate) fn open_reader(&self) -> Result<Reader<0>, LogError> {
+        Reader::<0>::open(&self.path, self.flushed_offset.clone())
+            .map_err(|source| LogError::read(&self.path, source))
+    }
+
+    /// Reads the data record at local position `local` using a caller-supplied `reader`,
+    /// with the random read hint. `None` if `local` is past this segment's events. Lets a
+    /// reader reuse one open fd across consecutive positions in the same segment rather than
+    /// opening one per record.
+    pub(crate) fn read_at_local(
+        &self,
+        reader: &mut Reader<0>,
+        local: usize,
+    ) -> Result<Option<Record>, LogError> {
+        let Some(offset) = self.data_offset(local) else {
+            return Ok(None);
+        };
+        let record = reader
+            .read_record(offset as u64, ReadHint::Random)
+            .map_err(|source| LogError::read(&self.path, source))?;
+        Ok(Some(Record {
+            position: Position::new(self.base_position.get() + local as u64),
+            data: record.data.into_owned(),
+        }))
+    }
+}
+
+/// A source of ordered, position-disjoint segments for a [`Scan`]: either the live
+/// [`SegmentSet`] (writer side) or an immutable read snapshot. Extracting this keeps the
+/// zero-copy segment-rolling scan (the highest-risk logic in layer 1) as **one**
+/// implementation shared by both sides, rather than a second copy over the same bytes
+/// (CLAUDE.md 5.4).
+///
+/// Segments are addressed by a logical index: sealed segments first (`0..segment_count`),
+/// then the active segment at `segment_count`.
+pub trait SegmentSource {
+    /// Bytes reserved at the start of every segment for its header.
+    fn header_size(&self) -> u64;
+
+    /// Number of sealed segments; the active segment sits at this index.
+    fn segment_count(&self) -> usize;
+
+    /// The segment at logical index `idx`, or `None` past the active one.
+    fn segment_at(&self, idx: usize) -> Option<&Arc<Segment>>;
+
+    /// Locates the segment owning `pos`: its logical index and a handle. `None` if `pos`
+    /// is the empty sentinel or precedes the first segment. Binary search over the
+    /// monotonic base positions, then the active segment.
+    fn locate(&self, pos: Position) -> Option<(usize, &Arc<Segment>)> {
+        if pos == Position::ZERO {
+            return None;
+        }
+        let active_idx = self.segment_count();
+        if let Some(active) = self.segment_at(active_idx)
+            && pos >= active.base_position
+        {
+            return Some((active_idx, active));
+        }
+        // Binary search the sealed segments for the last base <= pos.
+        let mut lo = 0usize;
+        let mut hi = active_idx; // exclusive
+        let mut found = None;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let base = self.segment_at(mid)?.base_position;
+            if base <= pos {
+                found = Some(mid);
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        found.and_then(|idx| self.segment_at(idx).map(|seg| (idx, seg)))
+    }
 }
 
 impl fmt::Debug for Segment {
@@ -600,7 +686,7 @@ impl SegmentSet {
         // Reuse the segment's cached reader (one open fd per segment).
         let mut guard = segment.reader.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(self.open_reader(segment)?);
+            *guard = Some(segment.open_reader()?);
         }
         let record = guard
             .as_mut()
@@ -619,7 +705,7 @@ impl SegmentSet {
     /// `pos` is clamped up to the first position, so `scan_from(Position::ZERO)` (the
     /// "before everything" empty sentinel) scans the whole log rather than nothing.
     /// It is a thin inclusive wrapper over [`scan_after`](Self::scan_after).
-    pub fn scan_from(&self, pos: Position) -> Scan<'_> {
+    pub fn scan_from(&self, pos: Position) -> Scan<&SegmentSet> {
         self.scan_at(pos.max(Position::new(FIRST_POSITION)))
     }
 
@@ -628,46 +714,15 @@ impl SegmentSet {
     /// This is the natural primitive for subscriptions, which hold "the last
     /// position I processed": `scan_after(Position::ZERO)` scans the whole log with no
     /// sentinel special case, and `scan_after(last)` resumes right after `last`.
-    pub fn scan_after(&self, pos: Position) -> Scan<'_> {
+    pub fn scan_after(&self, pos: Position) -> Scan<&SegmentSet> {
         self.scan_at(Position::new(pos.get().saturating_add(1)))
     }
 
-    /// Core scan constructor: emits records beginning at `first` (inclusive).
-    fn scan_at(&self, first: Position) -> Scan<'_> {
-        // Caught up (or the empty sentinel): a subscription sitting at the end is a
-        // normal, non-error state, so yield an empty stream rather than failing.
-        if first == Position::ZERO || first >= self.next_position {
-            return Scan::empty(self);
-        }
-
-        let (seg_idx, segment) = if first >= self.active.base_position {
-            (self.sealed.len(), &self.active)
-        } else {
-            let i = self.sealed.partition_point(|s| s.base_position <= first);
-            if i == 0 {
-                return Scan::failed(self, LogError::NotFound { position: first });
-            }
-            (i - 1, &self.sealed[i - 1])
-        };
-
-        let local = first.offset_from(segment.base_position) as usize;
-        let offset = match segment.offsets.read().unwrap().get(local) {
-            Some(offset) => *offset as u64,
-            None => return Scan::failed(self, LogError::NotFound { position: first }),
-        };
-
-        match self.open_reader(segment) {
-            Ok(reader) => Scan {
-                set: self,
-                seg_idx,
-                offset,
-                position: first,
-                reader: Some(reader),
-                pending_err: None,
-                done: false,
-            },
-            Err(err) => Scan::failed(self, err),
-        }
+    /// Core scan constructor: emits records beginning at `first` (inclusive), up to the
+    /// live tip. The writer scans its own live log, so the upper bound is
+    /// [`last_position`](Self::last_position).
+    fn scan_at(&self, first: Position) -> Scan<&SegmentSet> {
+        Scan::start(self, first, self.last_position())
     }
 
     /// The highest assigned position, or `Position::ZERO` if the log is empty.
@@ -698,6 +753,19 @@ impl SegmentSet {
         self.sealed.len()
     }
 
+    /// The sealed segments in base order. Cloned into a read snapshot so off-thread
+    /// readers hold the same immutable `Arc<Segment>`s the writer sealed.
+    pub fn sealed_arcs(&self) -> &[Arc<Segment>] {
+        &self.sealed
+    }
+
+    /// A handle to the active segment. Its offset sidecar updates live under an existing
+    /// reader, so a snapshot taken now still sees records appended before the reader's
+    /// watermark.
+    pub fn active_arc(&self) -> Arc<Segment> {
+        Arc::clone(&self.active)
+    }
+
     /// The directory holding the segment files. The index layer roots its own segments
     /// under this (`{dir}/index`) so it aligns to the log one-for-one.
     pub fn dir(&self) -> &Path {
@@ -719,23 +787,24 @@ impl SegmentSet {
             .map(|s| (s.base_position(), s.event_count()))
     }
 
-    /// Resolves the segment owning `pos`, or `None` if out of range. Binary search
-    /// over the sealed segments, then the active one.
+    /// Resolves the segment owning `pos`, or `None` if out of range. The segment lookup
+    /// itself is [`SegmentSource::locate`] (shared with the read path); this adds the
+    /// upper bound, since a position at or past `next_position` has not been assigned.
     pub fn segment_for(&self, pos: Position) -> Option<&Arc<Segment>> {
-        // Position 0 is the empty sentinel; anything at or past the next position
-        // has not been assigned.
-        if pos == Position::ZERO || pos >= self.next_position {
+        if pos >= self.next_position {
             return None;
         }
-        if pos >= self.active.base_position {
-            return Some(&self.active);
-        }
-        let i = self.sealed.partition_point(|s| s.base_position <= pos);
-        if i == 0 {
-            None
-        } else {
-            Some(&self.sealed[i - 1])
-        }
+        self.locate(pos).map(|(_, segment)| segment)
+    }
+}
+
+impl SegmentSource for SegmentSet {
+    fn header_size(&self) -> u64 {
+        self.config.header_size as u64
+    }
+
+    fn segment_count(&self) -> usize {
+        self.sealed.len()
     }
 
     /// The segment at logical index `idx`: sealed segments first, then the active
@@ -747,12 +816,30 @@ impl SegmentSet {
             Ordering::Greater => None,
         }
     }
-
-    fn open_reader(&self, segment: &Segment) -> Result<Reader<0>, LogError> {
-        Reader::<0>::open(&segment.path, segment.flushed_offset.clone())
-            .map_err(|source| LogError::read(&segment.path, source))
-    }
 }
+
+/// Wrapper sources forward to their target, so the one scan serves a borrow of the live
+/// [`SegmentSet`] (`Scan<&SegmentSet>`, writer side) and an owned snapshot
+/// (`Scan<Arc<Snapshot>>`, reader side) alike. One macro keeps the forwards in lockstep, so
+/// a new [`SegmentSource`] method is added in exactly one place.
+macro_rules! forward_segment_source {
+    ($wrapper:ty) => {
+        impl<T: SegmentSource + ?Sized> SegmentSource for $wrapper {
+            fn header_size(&self) -> u64 {
+                (**self).header_size()
+            }
+            fn segment_count(&self) -> usize {
+                (**self).segment_count()
+            }
+            fn segment_at(&self, idx: usize) -> Option<&Arc<Segment>> {
+                (**self).segment_at(idx)
+            }
+        }
+    };
+}
+
+forward_segment_source!(&T);
+forward_segment_source!(Arc<T>);
 
 /// Sequential scan over the log, starting from a position and rolling across
 /// segment boundaries. Yields records in position order; control records are
@@ -760,14 +847,24 @@ impl SegmentSet {
 ///
 /// A failure to open a segment or read a record is surfaced as an `Err` item and
 /// terminates the scan — it never looks like a clean end-of-stream.
-pub struct Scan<'a> {
-    set: &'a SegmentSet,
-    /// Logical index of the segment currently being read (see [`SegmentSet::segment_at`]).
+///
+/// The scan **owns** its [`SegmentSource`] (`S`), so it can be either a borrow of the live
+/// [`SegmentSet`] (`Scan<&SegmentSet>`, writer side) or an owned read snapshot
+/// (`Scan<Arc<Snapshot>>`, reader side) that keeps its segments alive for the scan's whole
+/// lifetime with no self-referential borrow. Blanket impls of [`SegmentSource`] for `&T`
+/// and `Arc<T>` make both forms work through the one implementation.
+pub struct Scan<S: SegmentSource> {
+    source: S,
+    /// Logical index of the segment currently being read (see [`SegmentSource::segment_at`]).
     seg_idx: usize,
     /// Byte offset within the current segment of the next record to read.
     offset: u64,
     /// Global position of the next record to emit.
     position: Position,
+    /// Highest position to emit (inclusive). The writer bounds to its live tip; a reader
+    /// snapshot bounds to its pinned watermark, so it never reads past what was durable
+    /// (and index-fed) when the scan began.
+    upto: Position,
     /// The reader for the current segment. `Reader` owns its 64 KB read-ahead
     /// buffer, so keeping it here (rather than reopening per record) is what makes
     /// the scan do roughly one syscall per read-ahead window, not one per record.
@@ -777,24 +874,59 @@ pub struct Scan<'a> {
     done: bool,
 }
 
-impl<'a> Scan<'a> {
-    fn empty(set: &'a SegmentSet) -> Self {
+impl<S: SegmentSource> Scan<S> {
+    /// Starts a scan of `source` emitting records from `first` (inclusive) up to `upto`
+    /// (inclusive). `first == Position::ZERO` or `first > upto` yields an empty stream (a
+    /// caught-up subscription is a normal, non-error state); a `first` that no segment
+    /// covers surfaces `NotFound` as the sole item.
+    pub(crate) fn start(source: S, first: Position, upto: Position) -> Self {
+        if first == Position::ZERO || first > upto {
+            return Scan::empty(source);
+        }
+        let (seg_idx, offset) = match source.locate(first) {
+            Some((seg_idx, segment)) => {
+                let local = first.offset_from(segment.base_position) as usize;
+                match segment.data_offset(local) {
+                    Some(offset) => (seg_idx, offset),
+                    None => return Scan::failed(source, LogError::NotFound { position: first }),
+                }
+            }
+            None => return Scan::failed(source, LogError::NotFound { position: first }),
+        };
+        let reader = match source.segment_at(seg_idx).unwrap().open_reader() {
+            Ok(reader) => reader,
+            Err(err) => return Scan::failed(source, err),
+        };
         Scan {
-            set,
+            source,
+            seg_idx,
+            offset: offset as u64,
+            position: first,
+            upto,
+            reader: Some(reader),
+            pending_err: None,
+            done: false,
+        }
+    }
+
+    fn empty(source: S) -> Self {
+        Scan {
+            source,
             seg_idx: 0,
             offset: 0,
             position: Position::ZERO,
+            upto: Position::ZERO,
             reader: None,
             pending_err: None,
             done: true,
         }
     }
 
-    fn failed(set: &'a SegmentSet, err: LogError) -> Self {
+    fn failed(source: S, err: LogError) -> Self {
         Scan {
             pending_err: Some(err),
             done: false,
-            ..Scan::empty(set)
+            ..Scan::empty(source)
         }
     }
 
@@ -802,17 +934,17 @@ impl<'a> Scan<'a> {
     /// record. Returns `false` when there are no more segments.
     fn advance_segment(&mut self) -> Result<bool, LogError> {
         let next_idx = self.seg_idx + 1;
-        let Some(segment) = self.set.segment_at(next_idx) else {
+        let Some(segment) = self.source.segment_at(next_idx) else {
             return Ok(false);
         };
-        self.reader = Some(self.set.open_reader(segment)?);
-        self.offset = self.set.config.header_size as u64;
+        self.reader = Some(segment.open_reader()?);
+        self.offset = self.source.header_size();
         self.seg_idx = next_idx;
         Ok(true)
     }
 }
 
-impl Scan<'_> {
+impl<S: SegmentSource> Scan<S> {
     /// Advances to the next record and returns a view borrowing the reader's
     /// read-ahead buffer.
     ///
@@ -830,6 +962,12 @@ impl Scan<'_> {
             return Some(Err(err));
         }
         if self.done {
+            return None;
+        }
+        // Stop at the upper bound: `self.position` is always the next data record to emit,
+        // so a reader snapshot never yields past its pinned watermark.
+        if self.position > self.upto {
+            self.done = true;
             return None;
         }
 
@@ -862,7 +1000,7 @@ impl Scan<'_> {
         // borrow the read-ahead buffer (locked by seglog's
         // `test_sequential_read_borrows_even_large_records`), so `data` is a slice
         // into it, zero copy.
-        let set = self.set;
+        let source = &self.source;
         let seg_idx = self.seg_idx;
         let reader = self.reader.as_mut().unwrap();
         match reader.read_record(offset, ReadHint::Sequential) {
@@ -883,7 +1021,7 @@ impl Scan<'_> {
             }
             Err(err) => {
                 self.done = true;
-                Some(Err(LogError::read(scan_segment_path(set, seg_idx), err)))
+                Some(Err(LogError::read(scan_segment_path(source, seg_idx), err)))
             }
         }
     }
@@ -893,16 +1031,16 @@ impl Scan<'_> {
     /// `Ok(None)` when the log is exhausted. Header-only, so it holds no payload
     /// borrow while it swaps readers.
     fn position_at_data(&mut self) -> Result<Option<usize>, LogError> {
-        let set = self.set;
         loop {
             if self.reader.is_none() && !self.advance_segment()? {
                 return Ok(None);
             }
             let seg_idx = self.seg_idx;
+            let path = scan_segment_path(&self.source, seg_idx);
             let reader = self.reader.as_mut().unwrap();
             let kind = reader
                 .peek(self.offset)
-                .map_err(|err| LogError::read(scan_segment_path(set, seg_idx), err))?;
+                .map_err(|err| LogError::read(path, err))?;
             match kind {
                 RecordKind::Data { total_len } => return Ok(Some(total_len)),
                 RecordKind::Control { total_len } => self.offset += total_len as u64,
@@ -913,8 +1051,9 @@ impl Scan<'_> {
 }
 
 /// The path of the segment at logical index `idx`, for error reporting.
-fn scan_segment_path(set: &SegmentSet, idx: usize) -> PathBuf {
-    set.segment_at(idx)
+fn scan_segment_path<S: SegmentSource>(source: &S, idx: usize) -> PathBuf {
+    source
+        .segment_at(idx)
         .map(|segment| segment.path.clone())
         .unwrap_or_default()
 }
@@ -1105,7 +1244,7 @@ mod tests {
     }
 
     /// Drains a lending [`Scan`] into owned records.
-    fn drain(mut scan: Scan) -> Vec<Record> {
+    fn drain<S: SegmentSource>(mut scan: Scan<S>) -> Vec<Record> {
         let mut out = Vec::new();
         while let Some(item) = scan.next() {
             out.push(item.unwrap().to_owned());

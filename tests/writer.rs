@@ -44,6 +44,16 @@ fn event(ty: &str, tag_strs: &[&str]) -> Event {
     Event::new(&EventType::new(ty).unwrap(), &tags(tag_strs), b"data").unwrap()
 }
 
+/// Reads a query through the handle and collects just the matching positions.
+fn read_positions(handle: &WriteHandle, query: Query, after: Position) -> Vec<Position> {
+    let mut reads = handle.read(query, after);
+    let mut out = Vec::new();
+    while let Some(item) = reads.next() {
+        out.push(item.expect("read failed").position);
+    }
+    out
+}
+
 fn unique_guard(tag: &str) -> AppendCondition {
     AppendCondition::new(Query::item(QueryItem::with_tags(tags(&[tag]))))
 }
@@ -226,24 +236,22 @@ fn index_search_sees_own_writes_across_rollovers() {
             .unwrap();
         expected.push(range.first);
 
-        let got = handle
-            .search(
-                Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
-                Position::ZERO,
-            )
-            .unwrap();
+        let got = read_positions(
+            &handle,
+            Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+            Position::ZERO,
+        );
         assert_eq!(got, expected, "read-your-writes after append {i}");
     }
 
     // A type filter and an `after` bound also compose across the sealed segments.
-    let enrolled = handle
-        .search(
-            Query::item(QueryItem::of_types(vec![
-                EventType::new("Enrolled").unwrap(),
-            ])),
-            Position::new(40),
-        )
-        .unwrap();
+    let enrolled = read_positions(
+        &handle,
+        Query::item(QueryItem::of_types(vec![
+            EventType::new("Enrolled").unwrap(),
+        ])),
+        Position::new(40),
+    );
     assert!(enrolled.iter().all(|p| p.get() > 40));
     assert!(!enrolled.is_empty());
 
@@ -295,13 +303,15 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 #[cfg(feature = "async")]
 #[test]
-fn append_async_assigns_dense_positions_and_search_async_reads_own_writes() {
+fn append_async_assigns_dense_positions_and_read_sees_own_writes() {
     let dir = TempDir::new().unwrap();
     let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
 
     block_on(async {
-        // Every event carries course:c1, so after the i-th append the query must return
-        // exactly positions 1..=i: read-your-writes through the async pair.
+        // Every event carries course:c1, so after the i-th append the read must return
+        // exactly positions 1..=i. `read` is synchronous (it runs on this thread over the
+        // published snapshot); read-your-writes holds because `append_async` resolves only
+        // after the writer has published the watermark.
         let mut expected = Vec::new();
         for i in 0..20u64 {
             let range = handle
@@ -312,13 +322,11 @@ fn append_async_assigns_dense_positions_and_search_async_reads_own_writes() {
             assert_eq!(range.first, Position::new(i + 1), "dense positions");
             expected.push(range.first);
 
-            let got = handle
-                .search_async(
-                    Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
-                    Position::ZERO,
-                )
-                .await
-                .unwrap();
+            let got = read_positions(
+                &handle,
+                Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+                Position::ZERO,
+            );
             assert_eq!(got, expected, "read-your-writes after async append {i}");
         }
     });

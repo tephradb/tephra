@@ -237,14 +237,57 @@ isolation, before any serialization rigor or coordinator change.
 
 ## Phase 6: Query planner and read paths (layers 4 and 5)
 
-- [ ] Compile `Query` into iterators: AND intersection, OR union, ascending merge across
-      segments
-- [ ] `after` restriction and segment pruning
-- [ ] Cost model per item: posting length (exact, from the term dictionary) vs
-      post-pruning position range width
-- [ ] `read(query, options)` as a streaming API
-- [ ] Bypass path: `Query.all()` and broad projections scan the log, never the index
-- [ ] Wire `TagTips` fallthrough to the index instead of a full scan
+Split into 6a (off-thread read foundation), 6b (append-only active tail plus published
+watermark), 6c (cost model, benchmark-first), and 6d (condition fallthrough onto the
+index). See the phase-6 plan for the confirmed decisions behind each.
+
+### Phase 6a: Off-thread read foundation
+
+- [x] Reads run on the **caller's own thread** over a shared `Arc<ReadCore>` (published
+      sealed `Arc<Segment>`/`Arc<IndexSegment>` plus an atomic watermark), not the writer
+      thread. `Message::Search` (the 5b placeholder that rode the writer channel) is dropped;
+      `WriteHandle::read` / `ReadHandle` execute on the caller (`src/read`)
+- [x] One zero-copy scan shared by the writer and read snapshots: `log::Scan` made generic
+      over an owned `SegmentSource` (`&SegmentSet` for the writer, `Arc<Snapshot>` for a
+      reader), with an `upto` watermark bound, so there is no second scan implementation
+- [x] `read(query, after)` as a streaming lending iterator of events (`Reads`), ascending,
+      `after`-exclusive, with `after` restriction and per-segment pruning; cross-segment
+      combine is lazy ordered concatenation. `Reads::watermark()` exposes the pinned
+      watermark (the phase-7 resume seam)
+- [x] Bypass path: `Query::all()` streams a filtered log scan (never the index). The active
+      segment's range is answered by a bounded log scan in 6a (the active index stays
+      writer-private); an unindexable sealed segment falls back to scanning its own range,
+      never a short answer
+- [x] Snapshot published before the watermark (writer), watermark loaded before the snapshot
+      (reader), so a read snapshot always covers its watermark; read-your-writes holds (the
+      writer publishes before replying). Differential test vs the scan oracle across many
+      sealed segments, a concurrent-readers consistency test, and a watermark-resume test
+      (`tests/read.rs`)
+
+### Phase 6b: Append-only active tail plus published watermark
+
+- [ ] Convert the `TailIndex` postings and type column to chunked append-only vectors (an
+      append never moves existing elements), and the term dictionary to a concurrent map, so
+      readers evaluate the active tail lock-free bounded by the watermark, replacing 6a's
+      active-range scan. No lock held across query evaluation (enforced structurally)
+
+### Phase 6c: Cost model (benchmark-first)
+
+- [ ] A read-path benchmark measuring the index-vs-scan crossover *shape* (selectivity,
+      range width, payload size, cold vs hot); the benchmark is the deliverable, not a tuned
+      `K`
+- [ ] Per-item planner: posting length (exact, from the term dictionary) vs post-pruning
+      position range width, biased toward scanning at the margin, `K` a `ReadConfig` knob,
+      every decision trace-logged
+- [ ] Broad-projection bypass: a query whose result is a large fraction of the range scans
+      the log rather than the index
+
+### Phase 6d: Condition fallthrough onto the index
+
+- [ ] Wire the `TagTips` `Unknown` fallthrough to an early-terminating index existence check
+      (over the writer-private active `TailIndex` plus the sealed segments) instead of a full
+      scan, with a scan fallback on an unindexable segment; keep `verify_tips`; the index
+      existence verdict differential-tested to never disagree with the scan oracle
 
 ## Phase 7: Subscriptions
 

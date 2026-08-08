@@ -698,6 +698,34 @@ the boundary. This is subtle and is where event stores usually have bugs.
 Readers are lock-free over immutable segments plus an atomically published watermark.
 Immutability means readers never block the writer.
 
+**Reads run on the caller's own thread**, over an `Arc<ReadCore>` the writer publishes to
+at each commit seam. There is no reader pool and no channel hop, and the writer thread is
+never touched: sealed segments are shared as immutable `Arc`s (lock-free), and how far a
+read may see is an atomically published watermark. A read is pinned to the watermark it
+loads at call time: it returns a consistent *prefix*, not a live view, and cannot tell "no
+more events" from "no more events yet" (that distinction is phase 7's). `Reads` exposes its
+pinned watermark, the seam a later read or subscription resumes from with no gap.
+
+**The governing concurrency rule: no lock may be held across query evaluation.** A lock
+held for a single hash probe (or one `Arc` clone) is acceptable; a lock held while
+intersecting posting lists is not. A query-duration lock on the writer's path would make
+one slow reader the throughput ceiling, and that coupling is expensive to undo once callers
+depend on it. Enforce it structurally (the evaluator sees only the shared append-only reads
+and atomics, never a lock guard), not with a timing test. This is why the active tail is an
+append-only structure published by an atomic watermark (chunked vectors that never move
+existing elements), not an `RwLock` evaluated under the read guard.
+
+**Snapshot / watermark ordering.** The writer publishes the segment set (on rollover)
+before the watermark (every commit); a reader loads the watermark before the segment set.
+With acquire/release ordering the loaded snapshot always covers the loaded watermark: if a
+reader observes watermark `W`, the segment set it then loads was published no earlier than
+the one current when `W` was stored, and segment sets only grow.
+
+Phase 6a lands the caller-thread reader, the published snapshot, and the streaming `read`.
+The active *index* stays writer-private in 6a (the active *range* is answered by a bounded
+log scan); 6b converts the active tail to the append-only, watermark-published form above
+and lets readers evaluate it lock-free.
+
 ---
 
 ## 10. Scale constraints

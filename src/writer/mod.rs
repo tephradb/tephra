@@ -25,12 +25,11 @@ use thiserror::Error;
 
 use crate::Position;
 use crate::event::{DecodeError, Event};
-use crate::index::IndexError;
 use crate::log::set::{LogError, PositionRange};
-use crate::query::{AppendCondition, Query};
+use crate::query::AppendCondition;
 
 pub use coordinator::WriteCoordinator;
-pub use handle::{SearchError, WriteHandle};
+pub use handle::WriteHandle;
 
 /// Configuration for the write coordinator.
 #[derive(Clone, Copy, Debug)]
@@ -109,9 +108,6 @@ pub enum AppendError {
 /// The reply channel for one request (a per-call oneshot).
 type Reply = Sender<Result<PositionRange, AppendError>>;
 
-/// The reply channel for one index query (a per-call oneshot).
-type SearchReply = Sender<Result<Vec<Position>, IndexError>>;
-
 /// One append request handed to the coordinator. Events are pre-encoded on the caller
 /// thread, so the coordinator does no encoding.
 struct Request {
@@ -120,19 +116,12 @@ struct Request {
     reply: Reply,
 }
 
-/// What flows over the coordinator's channel: an append, an index query, or the explicit
-/// shutdown sentinel (drop-based shutdown works too, via channel disconnect).
+/// What flows over the coordinator's channel: an append or the explicit shutdown sentinel
+/// (drop-based shutdown works too, via channel disconnect).
 ///
-/// The query rides the same channel as the append so it is serviced on the writer thread
-/// in submission order. That gives read-your-writes (a query after an append sees it,
-/// because feeding precedes the append reply) at the cost of serializing reads behind
-/// writes; phase 6 moves reads off this thread onto a published watermark.
+/// Reads no longer ride this channel: as of phase 6 they run on the caller's own thread
+/// over a published read snapshot ([`crate::read`]), off the writer thread entirely.
 enum Message {
     Append(Request),
-    Search {
-        query: Query,
-        after: Position,
-        reply: SearchReply,
-    },
     Shutdown,
 }
