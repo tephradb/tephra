@@ -51,7 +51,7 @@ fn unique_guard(tag: &str) -> AppendCondition {
 #[test]
 fn concurrent_appends_are_dense_and_unique() {
     let dir = TempDir::new().unwrap();
-    let (coord, handle) = WriteCoordinator::start(open(&dir), config());
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
 
     const THREADS: u64 = 8;
     const PER_THREAD: u64 = 250;
@@ -95,7 +95,7 @@ fn overlapping_uniqueness_guard_lets_exactly_one_win() {
     // they land in the same drain (one SameBatch conflict) or different drains (one
     // Durable conflict), exactly one may win.
     let dir = TempDir::new().unwrap();
-    let (coord, handle) = WriteCoordinator::start(open(&dir), config());
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
 
     const THREADS: usize = 16;
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
@@ -132,7 +132,7 @@ fn overlapping_uniqueness_guard_lets_exactly_one_win() {
 #[test]
 fn explicit_shutdown_returns_a_consistent_set() {
     let dir = TempDir::new().unwrap();
-    let (coord, handle) = WriteCoordinator::start(open(&dir), config());
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
 
     for i in 0..10 {
         handle
@@ -153,7 +153,7 @@ fn explicit_shutdown_returns_a_consistent_set() {
 fn drop_based_shutdown_persists_acknowledged_writes() {
     let dir = TempDir::new().unwrap();
     {
-        let (coord, handle) = WriteCoordinator::start(open(&dir), config());
+        let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
         for i in 0..5 {
             handle
                 .append(vec![event("E", &[&format!("k:{i}")])], None)
@@ -176,7 +176,7 @@ fn tiny_queue_still_serves_all_writes() {
         queue_capacity: 1,
         ..config()
     };
-    let (coord, handle) = WriteCoordinator::start(open(&dir), cfg);
+    let (coord, handle) = WriteCoordinator::start(open(&dir), cfg).unwrap();
 
     let mut joins = Vec::new();
     for t in 0..4 {
@@ -201,9 +201,60 @@ fn tiny_queue_still_serves_all_writes() {
 }
 
 #[test]
+fn index_search_sees_own_writes_across_rollovers() {
+    // Read-your-writes through the index: a query issued right after an append must see
+    // that append, including the batch that triggered a rollover (visible in the freshly
+    // sealed segment) and everything before it. Tiny segments force many rollovers mid-run.
+    let dir = TempDir::new().unwrap();
+    let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+    let cfg = WriterConfig {
+        queue_capacity: 64,
+        max_batch_records: 64,
+        max_batch_bytes: 256,
+        tips_window: 1_000_000,
+        verify_tips: true,
+    };
+    let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
+
+    // Every event carries course:c1, so after the i-th append the query must return
+    // exactly positions 1..=i.
+    let mut expected = Vec::new();
+    for i in 0..80u64 {
+        let ty = if i % 2 == 0 { "Enrolled" } else { "Renamed" };
+        let range = handle
+            .append(vec![event(ty, &["course:c1"])], None)
+            .unwrap();
+        expected.push(range.first);
+
+        let got = handle
+            .search(
+                Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+                Position::ZERO,
+            )
+            .unwrap();
+        assert_eq!(got, expected, "read-your-writes after append {i}");
+    }
+
+    // A type filter and an `after` bound also compose across the sealed segments.
+    let enrolled = handle
+        .search(
+            Query::item(QueryItem::of_types(vec![
+                EventType::new("Enrolled").unwrap(),
+            ])),
+            Position::new(40),
+        )
+        .unwrap();
+    assert!(enrolled.iter().all(|p| p.get() > 40));
+    assert!(!enrolled.is_empty());
+
+    drop(handle);
+    coord.shutdown();
+}
+
+#[test]
 fn append_with_no_events_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let (coord, handle) = WriteCoordinator::start(open(&dir), config());
+    let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
     assert!(matches!(
         handle.append(vec![], None),
         Err(AppendError::Empty)

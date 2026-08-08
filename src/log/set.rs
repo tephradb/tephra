@@ -698,6 +698,27 @@ impl SegmentSet {
         self.sealed.len()
     }
 
+    /// The directory holding the segment files. The index layer roots its own segments
+    /// under this (`{dir}/index`) so it aligns to the log one-for-one.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The base (first) position of the active segment. The index layer rebuilds the
+    /// active segment's tail index by scanning from here on open.
+    pub fn active_base(&self) -> Position {
+        self.active.base_position
+    }
+
+    /// Each sealed segment's `(base_position, event_count)`, in order. The index layer
+    /// pairs one on-disk index segment with each of these, pruning and rebuilding by the
+    /// same disjoint ranges the log uses.
+    pub fn sealed_segments(&self) -> impl Iterator<Item = (Position, u64)> + '_ {
+        self.sealed
+            .iter()
+            .map(|s| (s.base_position(), s.event_count()))
+    }
+
     /// Resolves the segment owning `pos`, or `None` if out of range. Binary search
     /// over the sealed segments, then the active one.
     pub fn segment_for(&self, pos: Position) -> Option<&Arc<Segment>> {

@@ -67,6 +67,15 @@ impl TermInterner {
         &self.terms[id.0 as usize]
     }
 
+    /// Every interned `(tag, id)` in id order. Used by the sealer, which re-sorts by the
+    /// tag string to build the FST (whose keys must be inserted in lexicographic order).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, TermId)> {
+        self.terms
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_ref(), TermId(i as u32)))
+    }
+
     pub fn len(&self) -> usize {
         self.terms.len()
     }
@@ -120,6 +129,12 @@ impl TypeInterner {
     /// The type string for a previously interned id.
     pub fn type_name(&self, id: TypeId) -> &str {
         &self.types[id.0 as usize]
+    }
+
+    /// Every interned type string in id order. Used by the sealer to write the type
+    /// dictionary, whose position equals the [`TypeId`] value.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.types.iter().map(|s| s.as_ref())
     }
 
     pub fn len(&self) -> usize {

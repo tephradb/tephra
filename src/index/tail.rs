@@ -14,11 +14,13 @@
 //! last element of its posting list); the two are kept separate for now and revisited
 //! when the condition fallthrough is wired to the index in phase 6.
 
+use std::borrow::Cow;
+
 use crate::Position;
 use crate::event::EventRef;
 
 use super::interner::{TermInterner, TooManyTypes, TypeInterner};
-use super::{TermId, TypeId};
+use super::{SegmentIndex, TermId, TypeId};
 
 /// An index over the events of one segment, fed strictly in position order.
 #[derive(Debug)]
@@ -112,6 +114,58 @@ impl TailIndex {
 
     /// The [`TypeId`] value of the event at local position `local`.
     pub fn type_at(&self, local: u32) -> u16 {
+        self.type_column[local as usize]
+    }
+
+    // --- sealer accessors (crate-internal): the inputs [`super::segment`] needs to
+    // encode this tail index into an on-disk index segment. ---
+
+    /// The dense type column, one [`TypeId`] value per local position, written verbatim.
+    pub(crate) fn type_column(&self) -> &[u16] {
+        &self.type_column
+    }
+
+    /// The type strings in [`TypeId`] order, written as the type dictionary.
+    pub(crate) fn type_names(&self) -> impl Iterator<Item = &str> {
+        self.types.names()
+    }
+
+    /// Every tag and its ascending postings, sorted by tag string so the sealer can feed
+    /// the FST in the lexicographic key order it requires.
+    pub(crate) fn terms_sorted_with_postings(&self) -> Vec<(&str, &[u32])> {
+        let mut terms: Vec<(&str, &[u32])> = self
+            .terms
+            .iter()
+            .map(|(tag, id)| (tag, self.postings[id.get() as usize].as_slice()))
+            .collect();
+        terms.sort_by(|a, b| a.0.cmp(b.0));
+        terms
+    }
+}
+
+/// The tail index is the in-memory arm of [`SegmentIndex`]: its postings are already
+/// `Vec<u32>` slices, so `term_postings` borrows them ([`Cow::Borrowed`]) with no copy.
+/// The on-disk [`IndexSegment`](super::IndexSegment) is the owned arm.
+impl SegmentIndex for TailIndex {
+    fn base(&self) -> Position {
+        self.base
+    }
+
+    fn len(&self) -> u32 {
+        self.type_column.len() as u32
+    }
+
+    fn term_postings(&self, tag: &str) -> Option<Cow<'_, [u32]>> {
+        self.terms
+            .get(tag)
+            .map(|id| Cow::Borrowed(self.postings[id.get() as usize].as_slice()))
+    }
+
+    fn type_id(&self, name: &str) -> Option<u16> {
+        self.types.get(name).map(|id| id.get())
+    }
+
+    fn type_at(&self, local: u32) -> u16 {
         self.type_column[local as usize]
     }
 }

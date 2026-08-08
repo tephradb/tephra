@@ -77,6 +77,17 @@ impl<'a> Batch<'a> {
         &self.records
     }
 
+    /// Each committed record paired with its assigned global position, in order. The
+    /// coordinator feeds these into the index before replying (read-your-writes). One
+    /// record is one event, so positions run densely from the batch's first position.
+    pub(super) fn committed_records(&self) -> impl Iterator<Item = (Position, &'a [u8])> + '_ {
+        let first = self.first.get();
+        self.records
+            .iter()
+            .enumerate()
+            .map(move |(i, &bytes)| (Position::new(first + i as u64), bytes))
+    }
+
     /// Stages `events`, assigning them a dense position range, recording their tags into
     /// the staged tips, and remembering `reply` for the commit. The request must already
     /// have passed its condition check.

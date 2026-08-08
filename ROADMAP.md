@@ -195,8 +195,8 @@ isolation, before any serialization rigor or coordinator change.
 - [x] Index-driven evaluator (`index::search`): AND over an item's tag postings, type
       filter via the column, OR/union across items, `after` exclusive. Returns an
       ascending, deduped `impl Iterator<Item = Position>`: the ascending-per-segment
-      output is a 5b requirement (cross-segment union is a k-merge), distinct from the
-      phase-6 planner streaming
+      output is a 5b requirement (cross-segment combine is ordered concatenation of
+      disjoint runs, not a k-way merge), distinct from the phase-6 planner streaming
 - [x] Differential test (`tests/index.rs`): a random workload appended to a `SegmentSet`
       and fed to a `TailIndex`; for random queries and `after` bounds, `search` returns
       the exact positions the phase-4 scan oracle does. Anchored by a small fixed-dataset
@@ -209,16 +209,31 @@ isolation, before any serialization rigor or coordinator change.
 
 ### Phase 5b: On-disk index segments and wiring
 
-- [ ] Index segment format: header (CRC + golden byte lock) with min/max position, `fst`
-      term dictionary, postings region
-- [ ] Tiered postings: singletons inlined in the term value, small terms as varint deltas;
-      dense terms as Roaring deferred (correctness is identical, so add it after)
-- [ ] Persist the dense `u16` type column per segment
-- [ ] Inline feeding at the commit seam (the `TagTips::absorb` point); seal one index
-      segment per sealed log segment on rollover
-- [ ] Recovery: rebuild index state for any log tail that was durable but not indexed
-- [ ] Extend the differential test across multiple sealed segments and their composition
-- [ ] Segment pruning by header comparison for `after: p`
+- [x] Index segment format (`index::header`, `index::segment`): 64-byte CRC-locked header
+      (`"EVIX"`, golden byte lock + single-bit-flip suite) with base/event-count (min/max
+      position) and a second body CRC, `fst` term dictionary, tiered postings region, dense
+      type column. Header/body corruption is recoverable (rebuild from log), not fatal
+- [x] Tiered postings (`index::postings`): singletons inlined in the FST value, small terms
+      as hand-rolled LEB128 varint deltas; dense/Roaring tier reserved but deferred (a
+      decode of it is a named hard error, never a silent skip)
+- [x] Persist the dense `u16` type column per segment (plus a type dictionary for
+      name-to-id), read back through the shared `Arc<[u8]>`. Loaded into memory, not mmap'd
+      (SIGBUS on truncation, writer-thread page-fault stalls, cache control); CLAUDE.md 7
+      updated
+- [x] Inline feeding at the commit seam (`commit_ok`), **before the reply** for
+      read-your-writes; seal one index segment per sealed log segment on rollover, publishing
+      the in-memory segment before the fsync. `search` made generic over a `SegmentIndex`
+      trait so the one evaluator serves the in-memory tail and the on-disk segment
+- [x] Recovery (`index::recovery`, `IndexSet::open`): pure `Rebuilder` over `(position,
+      event)`; rebuild any missing/corrupt/mismatched `.idx` from a log scan, and always
+      rebuild the active tail by scan (covers the durable-but-unindexed tail)
+- [x] Extended the differential test across multiple sealed segments (`tests/index.rs` +
+      `index::set` tests): small segments force rollovers, then `IndexSet::search_all` equals
+      the scan oracle across random queries and `after`; plus delete/corrupt/reopen recovery
+      and live feed-and-seal
+- [x] Segment pruning by header comparison for `after: p` (`max = base + count - 1 <= after`
+      skips a segment). A degraded (unindexable) touched segment errors with its range rather
+      than answering short (CLAUDE.md 7)
 
 ## Phase 6: Query planner and read paths (layers 4 and 5)
 

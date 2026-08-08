@@ -7,32 +7,42 @@
 //! model, no planning); the planner and its streaming API are phase 6.
 //!
 //! Output is an **ascending, deduped** iterator of global positions strictly after
-//! `after`. The ascending-iterator contract is load-bearing for 5b, where a query spans
-//! several per-segment indexes and the cross-segment union is a k-merge of these streams.
+//! `after`. The ascending-per-segment contract is load-bearing for 5b: a query spans
+//! several per-segment indexes, and because the segments are position-disjoint and
+//! ordered, the cross-segment combine is ordered concatenation of disjoint ascending runs,
+//! not a k-way merge (see [`IndexSet::search_all`](super::IndexSet)).
+
+use std::borrow::Cow;
 
 use crate::Position;
 use crate::query::{Query, QueryItem};
 
-use super::TailIndex;
+use super::SegmentIndex;
 
 /// Positions of events matching `query`, ascending, deduped, strictly after `after`.
+///
+/// Generic over [`SegmentIndex`] so the identical evaluator serves the in-memory
+/// [`TailIndex`](super::TailIndex) and the on-disk [`IndexSegment`](super::IndexSegment):
+/// there is one definition of the query semantics, pinned to the spec by the tests below
+/// and differential-tested against the scan oracle.
 ///
 /// Empty `Query::Items` matches nothing (OR over zero items); `Query::All` matches every
 /// event. Within an item it is AND over tags and "one of" over types, an empty tag list
 /// constraining only on type and an empty type list matching any type, exactly as
 /// `Query::matches` and the DCB spec define.
-pub fn search<'a>(
-    index: &'a TailIndex,
+pub fn search<'a, I: SegmentIndex>(
+    index: &'a I,
     query: &Query,
     after: Position,
 ) -> impl Iterator<Item = Position> + 'a {
     let locals = match query {
-        Query::All => (0..index.len() as u32).collect(),
+        Query::All => (0..index.len()).collect(),
         Query::Items(items) => {
             // Union across items, then sort + dedup so the output is ascending with no
             // duplicate where items overlap. Per-item local sets are already ascending;
-            // the query-level merge is materialized here (small) but the return type
-            // stays an iterator so 5b composes segments by merging, not re-sorting.
+            // the query-level merge is materialized here (small), and the cross-segment
+            // combine in `IndexSet::search_all` is ordered concatenation over disjoint
+            // segments, so nothing re-sorts at the segment boundary.
             let mut locals = Vec::new();
             for item in items {
                 item_locals(index, item, &mut locals);
@@ -51,7 +61,7 @@ pub fn search<'a>(
 }
 
 /// Appends the local positions matching `item` (ascending) to `out`.
-fn item_locals(index: &TailIndex, item: &QueryItem, out: &mut Vec<u32>) {
+fn item_locals<I: SegmentIndex>(index: &I, item: &QueryItem, out: &mut Vec<u32>) {
     // Resolve the type constraint up front. `None` means no type filter (any type). If the
     // item lists types but none are indexed, it matches nothing.
     let type_ids: Option<Vec<u16>> = if item.types.is_empty() {
@@ -60,7 +70,7 @@ fn item_locals(index: &TailIndex, item: &QueryItem, out: &mut Vec<u32>) {
         let ids: Vec<u16> = item
             .types
             .iter()
-            .filter_map(|t| index.type_id(t.as_str()).map(id_value))
+            .filter_map(|t| index.type_id(t.as_str()))
             .collect();
         if ids.is_empty() {
             return;
@@ -76,14 +86,14 @@ fn item_locals(index: &TailIndex, item: &QueryItem, out: &mut Vec<u32>) {
         // No tag constraint: walk the dense type column directly and keep matches, rather
         // than materializing a full-length candidate vector just to filter it. This is the
         // type-only path the column exists to make cheap.
-        out.extend((0..index.len() as u32).filter(|&local| keep(local)));
+        out.extend((0..index.len()).filter(|&local| keep(local)));
     } else {
         // Tag AND: intersect the posting lists of every required tag (bounded by the
         // smallest list), then apply the type filter.
-        let mut lists: Vec<&[u32]> = Vec::with_capacity(item.tags.len());
+        let mut lists: Vec<Cow<'_, [u32]>> = Vec::with_capacity(item.tags.len());
         for tag in item.tags.iter() {
-            match index.term_id(tag.as_str()) {
-                Some(id) => lists.push(index.postings(id)),
+            match index.term_postings(tag.as_str()) {
+                Some(list) => lists.push(list),
                 // A required tag no indexed event carries: the item matches nothing.
                 None => return,
             }
@@ -96,7 +106,9 @@ fn item_locals(index: &TailIndex, item: &QueryItem, out: &mut Vec<u32>) {
 ///
 /// Walks the shortest list and keeps only elements present in all others (binary search,
 /// since each list is ascending), so the cost is the smallest list times a log factor.
-fn intersect(mut lists: Vec<&[u32]>) -> Vec<u32> {
+/// Takes [`Cow`] because the on-disk segment yields owned decoded lists while the tail
+/// index borrows its slices; both are read the same way through the deref.
+fn intersect(mut lists: Vec<Cow<'_, [u32]>>) -> Vec<u32> {
     lists.sort_by_key(|list| list.len());
     let (shortest, rest) = lists.split_first().expect("intersect called with no lists");
     shortest
@@ -106,16 +118,11 @@ fn intersect(mut lists: Vec<&[u32]>) -> Vec<u32> {
         .collect()
 }
 
-/// The raw `u16` of a `TypeId`. A free function so `search` need not name the private
-/// field of the newtype defined in the parent module.
-fn id_value(id: super::TypeId) -> u16 {
-    id.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::{Event, EventType, Tag, Tags};
+    use crate::index::TailIndex;
     use crate::query::QueryItem;
     use smallvec::SmallVec;
 

@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 crc32fast = "1.5"
+fst = { version = "0.4.7", default-features = false }
 seglog = { path = "crates/seglog" }
 smallvec = "1"
 thiserror = "2.0"

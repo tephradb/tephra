@@ -575,9 +575,12 @@ predicate are both pinned to the spec rather than only to each other.
 
 `search` returns an **ascending, deduped `impl Iterator<Item = Position>`, not a `Vec`**.
 The per-segment ascending-output contract is load-bearing for 5b: a query spans several
-per-segment indexes and the cross-segment union is a k-merge of these streams, so a `Vec`
-would force a materialize-then-sort per segment that 5b would rewrite. This is distinct
-from the phase-4 (layer 4) planner's streaming, which is a later concern.
+per-segment indexes, and because those segments are position-disjoint and ordered, the
+cross-segment combine is **ordered concatenation of disjoint ascending runs, not a k-way
+merge** (segment N's positions are all below segment N+1's, so chaining them in order is
+already sorted, with no comparisons). This is the same "merging is concatenation" property
+as section 2, applied to the read path. It is distinct from the phase-4 (layer 4)
+planner's streaming, which is a later concern.
 
 The `TailIndex` is fed **in position order** via `push(position, event)`, guarded by a
 real (not `debug_assert`) contiguity assert: out-of-order feeding would silently produce
@@ -596,7 +599,7 @@ dictionary, small terms as varint deltas, dense terms as Roaring bitmaps. AND is
 intersection, OR is union, both ascending by construction.
 
 **Types (low cardinality) -> dense column.** A `u16` type_id array indexed by
-`position - base_position`. Two bytes per event, mmap'd, cache-friendly.
+`position - base_position`. Two bytes per event, loaded into memory, cache-friendly.
 
 - Type-only query: sequential scan of the column, roughly 100x less I/O than a log scan,
   and counting projections never touch the log.
@@ -615,6 +618,52 @@ Payloads live in a separate block-compressed blob region per segment, addressed
 separately, so condition checks and count-style projections never decompress. This also
 gives a place for crypto-shredding on erasure requests without touching positions or
 indexes.
+
+### 7.1 On-disk index segment (5b)
+
+One `.idx` file per sealed `.log`, under `{log_dir}/index`, named `{base:020}.idx`. Layout
+is a 64-byte CRC-locked header (`"EVIX"` magic, golden byte lock, single-bit-flip suite)
+then `[type column | type dictionary | postings region | FST]`. The FST value is a `u64`:
+top two bits tag the posting tier (singleton inlined, small as varint deltas, dense/Roaring
+reserved and deferred), low bits are the inlined position or a postings-region offset.
+
+**Loaded into memory, not mmap'd.** Each `.idx` is read into one `Arc<[u8]>` and its CRCs
+verified once at load; the FST and every region are read out of that shared buffer, and
+sealed segments share it lock-free. mmap was considered and rejected: a truncated or
+removed file under a live mapping is SIGBUS (process death), not a `Result`; a page fault
+would stall the single writer thread (phase 6 puts the condition fallthrough there), which
+is the throughput ceiling; and mmap hands cache policy to the OS when we want the term
+dictionary kept hotter than postings. If the working set ever exceeds RAM we would add
+explicit paging with our own cache, not mmap.
+
+**Two CRCs, and index corruption is recoverable, not fatal.** The header CRC protects the
+position range and section offsets (a wrong `base`/`event_count` would poison the segment,
+as with the log header); a separate body CRC over `[64 .. EOF]` detects a corrupt-but-
+derived index. The asymmetry with the log is the point: **the log is the source of truth
+and the index is disposable**, so a corrupt index header *or* body is rebuilt by replaying
+the log segment, never a refuse-to-open. Recovery on open loads each `.idx` whose base and
+event count match the log segment, and rebuilds (from a log scan, re-sealing a fresh `.idx`)
+anything missing, corrupt, or mismatched. The active segment's tail index is always rebuilt
+by scan and never persisted (like the offset sidecar), which also covers a durable-but-
+unindexed tail after a crash.
+
+**Feeding, sealing, read-your-writes.** The active `TailIndex` is fed at the commit seam
+(`commit_ok`) **before the append reply is sent**, so a client that reads immediately after
+its append sees its own write through the index. On a log rollover the completed tail is
+sealed: its in-memory segment is published to readers before the file is fsynced (reader
+visibility does not wait on durability), and a failed `.idx` write is logged and ignored
+(the in-memory segment is authoritative; the next open rebuilds the file). Never an
+unpublish, never a write failure. In 5b the `IndexSet` is owned and read on the writer
+thread only; it is `!Sync` (a `PhantomData<Cell<()>>` marker) so it cannot escape to a
+reader thread until phase 6 gives the active tail a published watermark.
+
+**A degraded segment errors, never answers short.** If a single segment holds more distinct
+event types than the `u16` type column can address (not a real workload, but possible), it
+is marked unindexable rather than silently mis-indexed: the write still succeeds (it is
+durable), the segment is never sealed as authoritative, and any query whose range touches it
+returns an `Unindexable` error naming the range (so the caller scans the log for it), never
+a short answer. A global type registry that rejects at `Event` construction is *not* the
+fix: it would reintroduce a global type id space, which segment-local ids deliberately avoid.
 
 ---
 

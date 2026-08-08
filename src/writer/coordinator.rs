@@ -4,12 +4,16 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
+use crate::Position;
+use crate::event::EventRef;
+use crate::index::{IndexError, IndexSet};
 use crate::log::set::{LogError, SegmentSet};
+use crate::query::Query;
 
 use super::batch::{Batch, MARKER_BYTES, measure};
 use super::handle::WriteHandle;
 use super::tips::TagTips;
-use super::{AppendError, Message, Request, WriterConfig, condition};
+use super::{AppendError, Message, Request, SearchReply, WriterConfig, condition};
 
 /// Owns the writer thread. Holds the join handle so shutdown is deterministic and the
 /// `SegmentSet` can be recovered for inspection or reopen.
@@ -22,7 +26,14 @@ impl WriteCoordinator {
     /// Spawns the writer thread, taking ownership of `set`. Returns the owner and a
     /// cloneable handle. Panics if `cfg` is inconsistent with `set` (a programming
     /// error, checked once at start).
-    pub fn start(set: SegmentSet, cfg: WriterConfig) -> (WriteCoordinator, WriteHandle) {
+    ///
+    /// Opens the derived index for `set` first, rebuilding anything missing, corrupt, or
+    /// never persisted from the log. This is the one fallible step: an I/O failure here is
+    /// surfaced rather than run in a degraded, index-less mode.
+    pub fn start(
+        set: SegmentSet,
+        cfg: WriterConfig,
+    ) -> Result<(WriteCoordinator, WriteHandle), IndexError> {
         assert!(cfg.queue_capacity >= 1, "queue_capacity must be at least 1");
         assert!(
             cfg.max_batch_records >= 1,
@@ -35,10 +46,12 @@ impl WriteCoordinator {
             set.segment_capacity(),
         );
 
+        let index = IndexSet::open(&set)?;
         let (tx, rx) = mpsc::sync_channel::<Message>(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         let worker = Worker {
             set,
+            index,
             tips,
             cfg,
             rx,
@@ -50,13 +63,13 @@ impl WriteCoordinator {
             .name("dcbdb-writer".to_string())
             .spawn(move || worker.run())
             .expect("spawn writer thread");
-        (
+        Ok((
             WriteCoordinator {
                 shutdown,
                 join: Some(join),
             },
             WriteHandle { tx },
-        )
+        ))
     }
 
     /// Signals shutdown, joins the writer thread, and returns the `SegmentSet`. Requests
@@ -86,6 +99,10 @@ impl Drop for WriteCoordinator {
 /// The state owned by the writer thread.
 struct Worker {
     set: SegmentSet,
+    /// The derived index, fed inline at the commit seam and queried on this thread. Owned
+    /// here (not shared) in phase 5b: it is `!Sync`, so it cannot escape to a reader
+    /// thread until phase 6 gives the active tail a published watermark.
+    index: IndexSet,
     tips: TagTips,
     cfg: WriterConfig,
     rx: Receiver<Message>,
@@ -113,15 +130,24 @@ impl Worker {
     fn collect(&mut self) -> Option<Vec<Request>> {
         let first = match self.pushback.take() {
             Some(request) => request,
-            None => match self.rx.recv() {
-                Ok(Message::Append(request)) => request,
-                Ok(Message::Shutdown) => {
-                    self.shutdown = true;
-                    return None;
-                }
-                Err(_) => {
-                    self.shutdown = true;
-                    return None;
+            None => loop {
+                match self.rx.recv() {
+                    Ok(Message::Append(request)) => break request,
+                    // A query serviced between batches: answer it inline and keep waiting
+                    // for the first append of the next batch.
+                    Ok(Message::Search {
+                        query,
+                        after,
+                        reply,
+                    }) => self.answer_search(&query, after, reply),
+                    Ok(Message::Shutdown) => {
+                        self.shutdown = true;
+                        return None;
+                    }
+                    Err(_) => {
+                        self.shutdown = true;
+                        return None;
+                    }
                 }
             },
         };
@@ -149,6 +175,14 @@ impl Worker {
                     bytes += sum;
                     reqs.push(request);
                 }
+                // A query mid-drain: answer it against the index as it stands (the
+                // in-flight batch is not yet durable, so it is correctly not visible) and
+                // keep draining.
+                Ok(Message::Search {
+                    query,
+                    after,
+                    reply,
+                }) => self.answer_search(&query, after, reply),
                 Ok(Message::Shutdown) => {
                     self.shutdown = true;
                     break;
@@ -210,13 +244,42 @@ impl Worker {
             return;
         }
 
+        // A rollover, if one happens, occurs inside `append_batch` before the records
+        // land, so it grows `sealed_len`; capture the count first to detect it.
+        let sealed_before = self.set.sealed_len();
         match self.set.append_batch(batch.records()) {
             Ok(range) => {
+                // Feed the index before replying, so a caller that reads right after its
+                // append sees its own write (read-your-writes). The write is already
+                // durable here, so nothing below can turn it into a failure.
+                if self.set.sealed_len() > sealed_before {
+                    // The batch rolled to a new segment: seal the tail that covers the
+                    // just-completed segment, then start the new one at this batch's base.
+                    self.index.seal_active(range.first);
+                }
+                for (position, bytes) in batch.committed_records() {
+                    // These bytes were validated when the caller encoded the event and
+                    // again by `append_batch`, so a decode failure here is an integrity
+                    // bug, not a normal outcome.
+                    let event = EventRef::from_bytes(bytes)
+                        .expect("committed record bytes decode; validated on append");
+                    self.index.push(position, event);
+                }
                 let next = self.set.next_position();
                 batch.commit_ok(range, &mut self.tips, next);
             }
             Err(err) => batch.commit_err(classify(err)),
         }
+    }
+
+    /// Answers an index query on the writer thread and replies. A dropped receiver (the
+    /// caller gave up) is fine.
+    fn answer_search(&self, query: &Query, after: Position, reply: SearchReply) {
+        let result = self
+            .index
+            .search_all(query, after)
+            .map(|positions| positions.collect());
+        let _ = reply.send(result);
     }
 }
 
@@ -267,11 +330,13 @@ mod tests {
 
     fn worker(dir: &TempDir, cfg: WriterConfig) -> (Worker, SyncSender<Message>) {
         let set = new_set(dir);
+        let index = IndexSet::open(&set).unwrap();
         let (tx, rx) = mpsc::sync_channel(cfg.queue_capacity);
         let tips = TagTips::new(set.next_position(), cfg.tips_window);
         (
             Worker {
                 set,
+                index,
                 tips,
                 cfg,
                 rx,

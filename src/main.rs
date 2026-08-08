@@ -30,7 +30,7 @@ fn main() {
     let set = SegmentSet::open(&dir, SegmentConfig::new(16 * 1024 * 1024)).unwrap();
 
     // The write coordinator owns the log; callers talk to it through a cloneable handle.
-    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default());
+    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
 
     // Unconditional append: a student enrols on a course.
     let range = handle

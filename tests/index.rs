@@ -9,7 +9,7 @@
 
 use dcbdb::Position;
 use dcbdb::event::{Event, EventRef, EventType, Tag, Tags};
-use dcbdb::index::{TailIndex, search};
+use dcbdb::index::{IndexSet, TailIndex, search};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::query::{Query, QueryItem};
 use smallvec::SmallVec;
@@ -133,4 +133,53 @@ fn index_search_agrees_with_scan_over_random_workload() {
             );
         }
     }
+}
+
+#[test]
+fn index_set_agrees_with_scan_across_many_sealed_segments() {
+    // The 5b composition contract: a small segment forces many rollovers, so the workload
+    // spans a dozen-plus sealed on-disk index segments plus the active tail. `IndexSet`
+    // rebuilds and seals them all on open, and `search_all` (ordered concatenation over
+    // disjoint segments, plus pruning) must return exactly what the scan oracle does for
+    // every query and `after`.
+    let dir = TempDir::new().unwrap();
+    // Small enough that a few events fill a segment: exercises rollover and pruning hard.
+    let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(1 << 9)).unwrap();
+
+    let mut rng = Rng(0x0BAD_C0DE_F00D_1337);
+    for _ in 0..400 {
+        let event = random_event(&mut rng);
+        set.append_batch(&[event.as_bytes()]).unwrap();
+    }
+    assert!(
+        set.sealed_len() >= 5,
+        "small segments should have sealed many: {}",
+        set.sealed_len()
+    );
+
+    // Open rebuilds one on-disk index segment per sealed log segment (writing .idx files)
+    // and the active tail by scan.
+    let index = IndexSet::open(&set).unwrap();
+
+    let last = set.last_position().get();
+    let mut rng = Rng(0xFEED_FACE_CAFE_BEEF);
+    for _ in 0..2000 {
+        let query = random_query(&mut rng);
+        let after = Position::new(rng.below(last + 1));
+        let from_index: Vec<Position> = index.search_all(&query, after).unwrap().collect();
+        let from_scan = scan_baseline(&set, &query, after);
+        assert_eq!(
+            from_index, from_scan,
+            "IndexSet disagreed with scan for query {query:?} after {after}"
+        );
+    }
+
+    // Reopening loads the persisted .idx files (not a rebuild) and still agrees.
+    let reopened = IndexSet::open(&set).unwrap();
+    let q = Query::item(QueryItem::of_types(vec![
+        EventType::new("Enrolled").unwrap(),
+    ]));
+    let from_index: Vec<Position> = reopened.search_all(&q, Position::ZERO).unwrap().collect();
+    let from_scan = scan_baseline(&set, &q, Position::ZERO);
+    assert_eq!(from_index, from_scan);
 }
