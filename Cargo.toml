@@ -1,21 +1,21 @@
 [workspace]
 members = [
-    "crates/dcbdb",
     "crates/seglog",
-    "crates/dcbdb-core",
-    "crates/dcbdb-proto",
-    "crates/dcbdb-server",
-    "crates/dcbdb-client",
+    "crates/tephra",
+    "crates/tephra-client",
+    "crates/tephra-proto",
+    "crates/tephra-server",
+    "crates/tephra-types",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # Internal crates
-dcbdb = { path = "crates/dcbdb" }
-dcbdb-core = { path = "crates/dcbdb-core" }
-dcbdb-proto = { path = "crates/dcbdb-proto" }
-dcbdb-client = { path = "crates/dcbdb-client" }
 seglog = { path = "crates/seglog" }
+tephra = { path = "crates/tephra" }
+tephra-client = { path = "crates/tephra-client" }
+tephra-proto = { path = "crates/tephra-proto" }
+tephra-types = { path = "crates/tephra-types" }
 
 # Third-party
 argh = "0.1"
@@ -35,7 +35,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Only pulled in by the `umadb-compare` bench feature (the dcbdb-vs-umadb comparison).
+# Only pulled in by the `umadb-compare` bench feature (the tephra-vs-umadb comparison).
 # Pinned to the exact rev the comparison was run against, so the numbers reproduce.
 umadb-core = { git = "https://github.com/umadb-io/umadb", rev = "cb4e9161c5617ded16aaf3db0c2f61bbfbf39701" }
 umadb-dcb = { git = "https://github.com/umadb-io/umadb", rev = "cb4e9161c5617ded16aaf3db0c2f61bbfbf39701" }

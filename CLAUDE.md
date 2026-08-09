@@ -878,25 +878,25 @@ startup would otherwise read everything.
 ## 13. Module layout
 
 The workspace splits along one line: the **shared vocabulary** (the types a client and the
-engine both speak) lives in a tiny pure crate, `dcbdb-core`, and everything with I/O or the
-codec stays in the engine (`dcbdb`).
+engine both speak) lives in a tiny pure crate, `tephra-types`, and everything with I/O or the
+codec stays in the engine (`tephra`).
 
-- `crates/dcbdb-core`: `Position`, `EventType`/`Tag`/`Tags` (+ `NameError`/`TagsError`),
+- `crates/tephra-types`: `Position`, `EventType`/`Tag`/`Tags` (+ `NameError`/`TagsError`),
   `Query`/`QueryItem`/`AppendCondition`. Pure data and validation, no I/O, no codec, no match
   predicate. The single source of truth for name/tag validation.
-- `dcbdb` (engine) depends on and re-exports the vocabulary, so `dcbdb::Query` **is**
-  `dcbdb_core::Query`. It keeps the packed `Event`/`EventRef` codec (the on-disk record form,
+- `tephra` (engine) depends on and re-exports the vocabulary, so `tephra::Query` **is**
+  `tephra_types::Query`. It keeps the packed `Event`/`EventRef` codec (the on-disk record form,
   deliberately not a DTO) and the match predicate.
-- `crates/dcbdb-proto` depends on `dcbdb-core` (not the engine) and owns the wire<->vocabulary
-  conversions (`convert`), reused by both server and client. `crates/dcbdb-client` speaks the
+- `crates/tephra-proto` depends on `tephra-types` (not the engine) and owns the wire<->vocabulary
+  conversions (`convert`), reused by both server and client. `crates/tephra-client` speaks the
   vocabulary plus its own friendly owned `Event`, with the protobuf types hidden.
 
 The engine's own module layout:
 
 ```
 src/
-  lib.rs            // crate root: re-exports dcbdb-core vocabulary + engine types
-  main.rs           // dcbdb binary entry point
+  lib.rs            // crate root: re-exports tephra-types vocabulary + engine types
+  main.rs           // tephra binary entry point
   event.rs          // Event, EventRef, TagsRef codec (re-exports EventType/Tag/Tags from core)
   query.rs          // Matches predicate over EventRef (re-exports Query/QueryItem/AppendCondition)
 

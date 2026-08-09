@@ -350,68 +350,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dcbdb"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "criterion",
- "dashmap",
- "dcbdb-core",
- "flume",
- "fst",
- "seglog",
- "smallvec",
- "tempfile",
- "thiserror",
- "tracing",
- "umadb-core",
- "umadb-dcb",
-]
-
-[[package]]
-name = "dcbdb-client"
-version = "0.1.0"
-dependencies = [
- "dcbdb-core",
- "dcbdb-proto",
-]
-
-[[package]]
-name = "dcbdb-core"
-version = "0.1.0"
-dependencies = [
- "smallvec",
- "thiserror",
-]
-
-[[package]]
-name = "dcbdb-proto"
-version = "0.1.0"
-dependencies = [
- "dcbdb-core",
- "protobuf",
- "protobuf-codegen",
-]
-
-[[package]]
-name = "dcbdb-server"
-version = "0.1.0"
-dependencies = [
- "argh",
- "config",
- "ctrlc",
- "dcbdb",
- "dcbdb-client",
- "dcbdb-proto",
- "protobuf",
- "serde",
- "socket2 0.6.5",
- "tempfile",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1185,68 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "tephra"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "criterion",
+ "dashmap",
+ "flume",
+ "fst",
+ "seglog",
+ "smallvec",
+ "tempfile",
+ "tephra-types",
+ "thiserror",
+ "tracing",
+ "umadb-core",
+ "umadb-dcb",
+]
+
+[[package]]
+name = "tephra-client"
+version = "0.1.0"
+dependencies = [
+ "tephra-proto",
+ "tephra-types",
+]
+
+[[package]]
+name = "tephra-proto"
+version = "0.1.0"
+dependencies = [
+ "protobuf",
+ "protobuf-codegen",
+ "tephra-types",
+]
+
+[[package]]
+name = "tephra-server"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "config",
+ "ctrlc",
+ "protobuf",
+ "serde",
+ "socket2 0.6.5",
+ "tempfile",
+ "tephra",
+ "tephra-client",
+ "tephra-proto",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tephra-types"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]

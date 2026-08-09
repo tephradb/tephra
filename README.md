@@ -1,8 +1,8 @@
-# dcbdb
+# tephra
 
 A DCB-compliant, immutable event store with global ordering.
 
-`dcbdb` stores an append-only, position-addressed log of events. Data is written once and
+`tephra` stores an append-only, position-addressed log of events. Data is written once and
 never updated or deleted: the primary key is a dense, monotonic `u64` (a `Position`)
 assigned by a single writer. Everything else (the tag and type indexes) is derived from
 the log and rebuildable by replaying it, so there is no write-ahead log for indexes, no
@@ -27,20 +27,20 @@ aggregate), DCB derives the boundary per decision from a query.
 
 | Crate | Purpose |
 |---|---|
-| `dcbdb` (root) | The core embedded event store: log, write coordinator, index, read paths. |
+| `tephra` (root) | The core embedded event store: log, write coordinator, index, read paths. |
 | `crates/seglog` | The low-level segmented record log (framing, CRCs, batch commit markers, recovery). |
-| `crates/dcbdb-proto` | The wire protocol: protobuf message types plus length-prefixed framing. No dependency on the engine. |
-| `crates/dcbdb-server` | A synchronous, thread-per-connection TCP server exposing the store over the wire protocol. |
-| `crates/dcbdb-client` | A synchronous TCP client for the server. |
+| `crates/tephra-proto` | The wire protocol: protobuf message types plus length-prefixed framing. No dependency on the engine. |
+| `crates/tephra-server` | A synchronous, thread-per-connection TCP server exposing the store over the wire protocol. |
+| `crates/tephra-client` | A synchronous TCP client for the server. |
 
 ## Usage
 
 ```rust
-use dcbdb::{
+use tephra::{
     AppendCondition, Event, EventType, Position, Query, QueryItem, Tag, Tags,
     WriteCoordinator, WriterConfig,
 };
-use dcbdb::log::set::{SegmentConfig, SegmentSet};
+use tephra::log::set::{SegmentConfig, SegmentSet};
 
 // Open (or create) a log directory and start the single-writer coordinator.
 let set = SegmentSet::open("./data", SegmentConfig::new(1 << 26))?;

@@ -1,0 +1,47 @@
+[package]
+name = "tephra"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seglog.workspace = true
+tephra-types.workspace = true
+
+crc32fast.workspace = true
+dashmap.workspace = true
+flume.workspace = true
+fst.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing = { workspace = true, optional = true }
+
+# Only pulled in by the `umadb-compare` bench feature (the tephra-vs-umadb comparison).
+# Pinned to the exact rev the comparison was run against, so the numbers reproduce.
+umadb-core = { workspace = true, optional = true }
+umadb-dcb = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[features]
+async = ["flume/async"]
+tracing = ["dep:tracing", "seglog/tracing"]
+# Enables the tephra-vs-umadb comparison bench (`--bench compare`).
+umadb-compare = ["dep:umadb-core", "dep:umadb-dcb"]
+
+[[bench]]
+name = "write_path"
+harness = false
+
+[[bench]]
+name = "read_path"
+harness = false
+
+[[bench]]
+name = "condition_path"
+harness = false
+
+[[bench]]
+name = "compare"
+harness = false

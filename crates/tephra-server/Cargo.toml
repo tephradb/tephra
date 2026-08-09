@@ -1,0 +1,32 @@
+[package]
+name = "tephra-server"
+description = "Synchronous, thread-per-connection TCP server exposing a tephra event store over the length-prefixed protobuf protocol"
+edition = "2024"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[dependencies]
+tephra.workspace = true
+tephra-proto.workspace = true
+
+argh.workspace = true
+config = { workspace = true, features = ["toml"] }
+ctrlc.workspace = true
+protobuf.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+socket2.workspace = true
+
+[dev-dependencies]
+tephra-client.workspace = true
+
+tempfile.workspace = true
+
+[[bin]]
+name = "tephra-server"
+path = "src/main.rs"
+
+[lib]
+name = "tephra_server"
+path = "src/lib.rs"
