@@ -1,36 +1,41 @@
 //! The `dcbdb-server` binary: opens an event store on disk and serves it over TCP.
 //!
-//! Usage:
+//! Configuration is layered (later sources win): built-in defaults, then a TOML file passed
+//! with `--config`, then `DCBDB__*` environment variables, then the command-line flags. The
+//! command line carries only the launch essentials:
 //!
 //! ```text
-//! dcbdb-server [BIND_ADDR] [DATA_DIR]
+//! dcbdb-server [--config PATH] [--bind ADDR] [--data-dir DIR] [--log FILTER]
 //! ```
 //!
-//! Defaults: `BIND_ADDR=127.0.0.1:9000`, `DATA_DIR=./dcbdb-data`. The segment size and
-//! maximum frame length can be overridden with the `DCBDB_SEGMENT_SIZE` and
-//! `DCBDB_MAX_FRAME_LEN` environment variables. Logging is controlled with `RUST_LOG`.
+//! Everything else (segment size, group-commit sizing, tips window, planner bias, frame and
+//! read-batch limits) is set in the config file or the environment. See `dcbdb.example.toml`.
 
-use std::env;
+mod settings;
+
 use std::error::Error;
 use std::process::ExitCode;
 
-use dcbdb::log::set::{SegmentConfig, SegmentSet};
-use dcbdb::writer::{WriteCoordinator, WriterConfig};
-use dcbdb_server::{Server, ServerConfig};
+use dcbdb::log::set::SegmentSet;
+use dcbdb::writer::WriteCoordinator;
+use dcbdb_server::Server;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:9000";
-const DEFAULT_DIR: &str = "dcbdb-data";
-const DEFAULT_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
+use settings::{Args, Settings};
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    let args: Args = argh::from_env();
+    let settings = match settings::load(&args) {
+        Ok(settings) => settings,
+        Err(err) => {
+            // Tracing is not up yet, so report the config failure on stderr directly.
+            eprintln!("configuration error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    init_tracing(&settings);
 
-    match run() {
+    match run(settings) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(%err, "server exited with error");
@@ -39,22 +44,41 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = env::args().skip(1);
-    let addr = args.next().unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let dir = args.next().unwrap_or_else(|| DEFAULT_DIR.to_string());
+/// Initialises tracing. An explicit `log` setting (from `--log`, the file, or the env) wins;
+/// otherwise `RUST_LOG` is honoured, falling back to `info`.
+fn init_tracing(settings: &Settings) {
+    let filter = match &settings.log {
+        Some(filter) => EnvFilter::new(filter.clone()),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
-    let segment_size = env_usize("DCBDB_SEGMENT_SIZE", DEFAULT_SEGMENT_SIZE)?;
-    let mut server_config = ServerConfig::default();
-    if let Some(max_frame_len) = env_opt_u32("DCBDB_MAX_FRAME_LEN")? {
-        server_config.max_frame_len = max_frame_len;
+fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
+    let set = SegmentSet::open(&settings.data_dir, settings.segment_config())?;
+
+    // segment.size is operator-settable while the coordinator asserts
+    // max_batch_bytes <= segment capacity, so a small segment size against the default batch
+    // budget would otherwise panic at startup. Clamp with a warning instead.
+    let capacity = set.segment_capacity();
+    let mut writer_config = settings.writer_config();
+    if writer_config.max_batch_bytes > capacity {
+        tracing::warn!(
+            requested = writer_config.max_batch_bytes,
+            capacity,
+            "max_batch_bytes exceeds segment capacity; clamping to capacity"
+        );
+        writer_config.max_batch_bytes = capacity;
     }
 
-    let set = SegmentSet::open(&dir, SegmentConfig::new(segment_size))?;
-    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default())?;
-    tracing::info!(dir, segment_size, "opened event store");
+    let (coordinator, handle) = WriteCoordinator::start(set, writer_config)?;
+    tracing::info!(
+        data_dir = %settings.data_dir,
+        segment_size = settings.segment.size,
+        "opened event store"
+    );
 
-    let server = Server::bind(&addr, handle, server_config)?;
+    let server = Server::bind(&settings.bind, handle, settings.server_config())?;
     let shutdown = server.shutdown_handle();
 
     // Ctrl-C triggers a graceful shutdown: the accept loop stops and in-flight connections
@@ -69,18 +93,4 @@ fn run() -> Result<(), Box<dyn Error>> {
     coordinator.shutdown();
     run_result?;
     Ok(())
-}
-
-fn env_usize(key: &str, default: usize) -> Result<usize, Box<dyn Error>> {
-    match env::var(key) {
-        Ok(value) => Ok(value.parse().map_err(|err| format!("{key}: {err}"))?),
-        Err(_) => Ok(default),
-    }
-}
-
-fn env_opt_u32(key: &str) -> Result<Option<u32>, Box<dyn Error>> {
-    match env::var(key) {
-        Ok(value) => Ok(Some(value.parse().map_err(|err| format!("{key}: {err}"))?)),
-        Err(_) => Ok(None),
-    }
 }
