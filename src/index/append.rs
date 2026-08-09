@@ -1,7 +1,7 @@
 //! Append-only, concurrently-readable columnar storage for the active tail.
 //!
 //! The active segment's index is fed by the single writer thread and read by any number of
-//! caller threads, bounded on read by the published watermark (CLAUDE.md 9). These two
+//! caller threads, bounded on read by the published watermark. These two
 //! structures are the storage that makes that sound without `unsafe`:
 //!
 //! - [`ChunkedVec<T>`]: a chunked vector whose chunks never move once allocated, so a
@@ -12,7 +12,7 @@
 //!   atomic, or has atomic fields), so this type never hands out `&mut T`: the writer's
 //!   stores and readers' loads never alias.
 //! - [`PostingSlot`]: one tag's posting list, inline for the common rare-tag case (heap-free)
-//!   and spilling to a [`ChunkedVec`] only when hot (UmaDB-style tiering, CLAUDE.md 15).
+//!   and spilling to a [`ChunkedVec`] only when hot (UmaDB-style tiering).
 //!
 //! ## Two orderings, kept separate
 //!

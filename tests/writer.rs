@@ -264,10 +264,10 @@ fn index_search_sees_own_writes_across_rollovers() {
 #[test]
 fn durable_conflict_detected_through_the_index_across_sealed_segments() {
     // With verify off, the durable arm runs the index existence check alone (no scan
-    // cross-check), so this exercises the real production path (phase 6d). Tiny segments
+    // cross-check), so this exercises the real production path. Tiny segments
     // force seals, so the guarded tag lives in an early *sealed* segment: the check must
     // find it there, proving the index path works across sealed segments, not just the
-    // active tail. This is the `after`-omitted uniqueness guard, the shape 6d most improves.
+    // active tail. This is the `after`-omitted uniqueness guard, the shape the index most improves.
     let dir = TempDir::new().unwrap();
     let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
     let cfg = WriterConfig {

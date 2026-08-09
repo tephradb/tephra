@@ -10,10 +10,10 @@
 //!   query path trusts blindly: a wrong `base_position` or `event_count` would poison
 //!   the whole position space derived from this segment, the same argument the log
 //!   header makes for its own CRC. The separate `body_crc` field covers the regions
-//!   after the header (`[SIZE .. EOF]`) and is verified by [`super::segment`] at open,
+//!   after the header (`[SIZE .. EOF]`) and is verified by `super::segment` at open,
 //!   not here, since this type sees only the 64-byte header.
 //! - **Corruption is recoverable, not fatal.** An index segment is *derived* from the
-//!   log (CLAUDE.md 2, the log is the source of truth). A corrupt index header or body
+//!   log (the log is the source of truth). A corrupt index header or body
 //!   is rebuilt by replaying the log segment, never a refuse-to-open. The log header,
 //!   by contrast, is authoritative and its corruption is fatal. The caller maps every
 //!   error here to "rebuild this segment".
@@ -22,7 +22,7 @@
 //! O(1), and are cross-checked against `event_count` and each other on decode: a
 //! header claiming the type column at offset 12 is [`IndexHeaderError::BadSectionLayout`],
 //! never a wild read. The one whole-file check (`fst_off + fst_len == file_len`) needs
-//! the file length and so lives in [`super::segment`] alongside the body CRC.
+//! the file length and so lives in `super::segment` alongside the body CRC.
 
 use std::ops::Range;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -154,7 +154,7 @@ impl IndexSegmentHeader {
 
     /// Decodes and validates the 64-byte header. Checks internal consistency only; the
     /// body CRC and the `fst_off + fst_len == file_len` check need the whole file and
-    /// are performed by [`super::segment`].
+    /// are performed by `super::segment`.
     pub fn from_bytes(buf: &[u8; INDEX_HEADER_SIZE]) -> Result<Self, IndexHeaderError> {
         // An unwritten (all-zero) header is not corruption: a segment file created but
         // not yet written. Distinguish it before anything else, exactly like the log.

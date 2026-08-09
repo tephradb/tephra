@@ -3,7 +3,7 @@
 //! Reads run on the **caller's own thread**, over an immutable snapshot the writer
 //! publishes at each commit. There is no reader pool and no channel hop, and the writer
 //! thread is never touched: sealed segments are shared as immutable `Arc`s (lock-free), and
-//! how far a read may see is an atomically published watermark (CLAUDE.md 6, 9).
+//! how far a read may see is an atomically published watermark.
 //!
 //! [`ReadCore`] holds the shared state; a cloneable [`ReadHandle`] runs a [`Query`] against
 //! it with [`ReadHandle::read`], returning a lending [`Reads`] iterator of events in
@@ -13,8 +13,9 @@
 //!
 //! A [`Reads`] is pinned to the watermark read at call time ([`Reads::watermark`]): it
 //! returns a consistent *prefix* of the log, not a live view, and a caller cannot tell "no
-//! more events" from "no more events yet". That distinction is phase 7's (subscriptions);
-//! exposing the pinned watermark is the seam a later read/subscription resumes from with no
+//! more events" from "no more events yet". That distinction belongs to subscriptions
+//! (not yet implemented); exposing the pinned watermark is the seam a later
+//! read/subscription resumes from with no
 //! gap.
 //!
 //! ## Snapshot / watermark ordering
@@ -27,12 +28,12 @@
 //!
 //! ## Index-driven reads
 //!
-//! The planner ([`estimate_matches`](crate::index::estimate_matches) + [`choose`], phase 6c)
-//! picks between two modes per read by estimating the result size from exact posting lengths
-//! (CLAUDE.md 8): a **selective** query
+//! The planner ([`estimate_matches`] + [`choose`])
+//! picks between two modes per read by estimating the result size from exact posting
+//! lengths: a **selective** query
 //! is answered through the index (sealed segments via their on-disk index [`search`], the
 //! **active** segment via a watermark-bounded [`ActiveView`](crate::index::ActiveView) over
-//! the shared `Arc<ActiveTail>` the writer publishes in phase 6b), then each matching event
+//! the shared `Arc<ActiveTail>` the writer publishes), then each matching event
 //! is fetched by position; a **broad** query streams a sequential log scan instead, avoiding
 //! one random fetch per event. The choice only ever changes which correct path runs. A
 //! degraded segment never answers short: an unindexable sealed segment, or an active segment
@@ -57,7 +58,7 @@ use crate::query::Query;
 
 use crate::index::IndexSet;
 
-/// Configuration for the read paths: the index-vs-scan cost model's tuning (CLAUDE.md 8).
+/// Configuration for the read paths: the index-vs-scan cost model's tuning.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadConfig {
     /// The planner's `K`: the index is chosen only when the post-pruning range is at least
@@ -71,8 +72,8 @@ pub struct ReadConfig {
 impl Default for ReadConfig {
     fn default() -> Self {
         // Index when the estimated result is at most ~1/4 of the range. A placeholder until
-        // `benches/read_path.rs` locates the real crossover (CLAUDE.md 8; the deliverable is
-        // the benchmark, not a tuned `K`).
+        // `benches/read_path.rs` locates the real crossover (the deliverable is the
+        // benchmark, not a tuned `K`).
         ReadConfig { scan_bias: 4 }
     }
 }
@@ -81,8 +82,8 @@ impl Default for ReadConfig {
 /// indexes (aligned one-for-one), plus the active log segment. Shared behind an `Arc`;
 /// grown only on rollover.
 ///
-/// Implements [`SegmentSource`] so the one zero-copy [`Scan`] serves reads unchanged
-/// (CLAUDE.md 5.4): sealed segments occupy logical indices `0..sealed_log.len()`, the
+/// Implements [`SegmentSource`] so the one zero-copy [`Scan`] serves reads unchanged:
+/// sealed segments occupy logical indices `0..sealed_log.len()`, the
 /// active segment sits at `sealed_log.len()`.
 pub struct Snapshot {
     header_size: u64,
@@ -93,7 +94,7 @@ pub struct Snapshot {
     active_log: Arc<Segment>,
     /// The active segment's shared in-memory index. A reader queries it lock-free through a
     /// watermark-bounded [`ActiveView`](crate::index::ActiveView), so the active range is
-    /// index-driven like the sealed ranges rather than scanned (phase 6b).
+    /// index-driven like the sealed ranges rather than scanned.
     active_index: Arc<ActiveTail>,
 }
 
@@ -121,7 +122,7 @@ impl Snapshot {
 
 // The snapshot crosses to reader threads as an immutable `Arc`, so it must be `Send + Sync`.
 // Its active index (`Arc<ActiveTail>`) is the only interior-mutable member; locking this in
-// keeps a future non-`Sync` addition from silently regressing the read path (CLAUDE.md 9).
+// keeps a future non-`Sync` addition from silently regressing the read path.
 const _: fn() = || {
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -152,7 +153,7 @@ impl SegmentSource for Snapshot {
 pub struct ReadCore {
     /// The current segment snapshot. Swapped only on rollover (a normal commit leaves it
     /// untouched), so cloning the inner `Arc` under a brief read lock is a single op, never
-    /// held across query evaluation (CLAUDE.md 9).
+    /// held across query evaluation.
     segments: RwLock<Arc<Snapshot>>,
     /// Last durable (and index-fed) position. Stored on every commit.
     watermark: AtomicU64,
@@ -232,7 +233,7 @@ pub enum ReadError {
 
 /// A lending iterator over the events matching a read, in ascending position order.
 ///
-/// Three internal shapes (chosen by [`Reads::plan`] via the cost model): the bypass path
+/// Three internal shapes (chosen by `Reads::plan` via the cost model): the bypass path
 /// streams a log scan, either unfiltered (`Query::all`, zero-copy) or filtered (a broad
 /// query, copying one matched record at a time); the indexed path plans the ascending
 /// *positions* (a `Vec<Position>`, cheap `u64`s, small for a selective query) and fetches
@@ -276,7 +277,7 @@ struct ScanFilteredState {
 enum Mode {
     /// Bypass, unfiltered: a zero-copy streaming scan of the whole `(after, watermark]`
     /// range, yielding every record. This is the `Query::all` projection-catch-up path, the
-    /// highest-volume read (CLAUDE.md 9), kept at disk bandwidth with no per-event copy.
+    /// highest-volume read, kept at disk bandwidth with no per-event copy.
     Scan { scan: Box<Scan<Arc<Snapshot>>> },
     /// Bypass, filtered: the same streaming scan, but keeping only records matching `query`.
     /// The planner routes a broad (but not full-log) query here so a large result set never
@@ -293,12 +294,12 @@ enum Mode {
 
 impl Reads {
     /// The watermark this read was pinned to. A later read or subscription resumed from here
-    /// continues with no gap (the phase-7 seam).
+    /// continues with no gap (the subscription resume seam).
     pub fn watermark(&self) -> Position {
         self.watermark
     }
 
-    /// Plans the read (CLAUDE.md 8). Estimates the result size from exact posting lengths and
+    /// Plans the read. Estimates the result size from exact posting lengths and
     /// picks the cheaper mode: a broad query streams a filtered log scan
     /// ([`Access::Scan`]), a selective one gathers positions from the index and fetches
     /// events on demand ([`Access::Index`]). The choice only ever changes which correct path
@@ -546,7 +547,7 @@ fn segment_width(after: Position, base: Position, effective_max: u64) -> u64 {
 
 /// The per-segment result estimate ([`estimate_matches`]), also emitting one per-item trace
 /// line so a mis-chosen plan can be attributed to the item whose estimate was off (and so
-/// the per-item data that would justify per-item mode mixing is captured; CLAUDE.md 8).
+/// the per-item data that would justify per-item mode mixing is captured).
 fn estimate_segment<I: SegmentIndex>(index: &I, query: &Query, seg_width: u64) -> u64 {
     let estimate = estimate_matches(index, query, seg_width);
     #[cfg(feature = "tracing")]
@@ -608,16 +609,16 @@ fn plan_positions(
         }
     }
 
-    // Active segment's range: query the shared active tail through a watermark-bounded view
-    // (phase 6b), index-driven like the sealed segments rather than scanned. The view exposes
+    // Active segment's range: query the shared active tail through a watermark-bounded view,
+    // index-driven like the sealed segments rather than scanned. The view exposes
     // only locals at or before the pinned watermark, so it never yields a position past `wm`,
     // and its positions are all above every sealed segment's (disjoint, active range last), so
     // the concatenation stays globally ascending.
     //
     // Unless the active segment latched unindexable: then its columns are truncated relative to
     // the watermark (feeding stopped but positions kept arriving), so the view would answer
-    // short or wrong. Fall back to a log scan of the range, mirroring the sealed `None` arm and
-    // 6a. The flag is read live off the shared tail because the latch fires mid-segment with no
+    // short or wrong. Fall back to a log scan of the range, mirroring the sealed `None` arm.
+    // The flag is read live off the shared tail because the latch fires mid-segment with no
     // snapshot republish.
     let active_base = snapshot.active_log.base_position();
     if watermark >= active_base {
@@ -724,7 +725,7 @@ mod tests {
     /// Regression: when the active segment latches unindexable, feeding stops but positions
     /// keep arriving, so the tail's columns are truncated relative to the watermark. A reader
     /// must not trust the short tail; it scans the log for the active range instead (mirroring
-    /// the sealed unindexable arm and 6a). Reproduced white-box with a tail deliberately fed
+    /// the sealed unindexable arm). Reproduced white-box with a tail deliberately fed
     /// only a prefix of a fully-durable single segment, then latched.
     #[test]
     fn active_unindexable_reader_scans_the_log_for_complete_results() {

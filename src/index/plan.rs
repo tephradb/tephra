@@ -4,7 +4,7 @@
 //! then fetch each event by a random read) and a broad query by a single sequential log
 //! scan. The index wins only when the result is a small fraction of the range: one random
 //! fetch per matching event beats a sequential scan at disk bandwidth only while there are
-//! few of them (CLAUDE.md 8). This module is the estimator that decides which.
+//! few of them. This module is the estimator that decides which.
 //!
 //! It is pure and cheap: [`estimate_matches`] bounds the result size from **exact posting
 //! lengths** ([`SegmentIndex::term_len`], free from the term dictionary, no statistics and
@@ -13,8 +13,8 @@
 //! never a wrong answer: both execution modes return the identical positions the scan oracle
 //! does.
 //!
-//! Granularity: 6c makes one **whole-query** decision (aggregated across the touched
-//! segments in [`crate::read`]). The ROADMAP's per-*item* planner (index the narrow items,
+//! Granularity: the planner makes one **whole-query** decision (aggregated across the
+//! touched segments in [`crate::read`]). A per-*item* planner (index the narrow items,
 //! scan the broad ones, in one read) is the future refinement; the per-item estimates
 //! [`estimate_item`] exposes, logged by the read path, are the data that says whether it
 //! would pay.

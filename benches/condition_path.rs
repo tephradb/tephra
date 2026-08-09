@@ -1,9 +1,9 @@
-//! Condition-path benchmark: the append-condition uniqueness guard, index vs scan (phase 6d).
+//! Condition-path benchmark: the append-condition uniqueness guard, index vs scan.
 //!
 //! The uniqueness guard (`after: 0`, "fail if **any** event matches", the `after`-omitted
-//! shape in CLAUDE.md 1) is the most common DCB condition and the one phase 6d most improves.
+//! shape) is the most common DCB condition and the one the index most improves.
 //! Its durable arm always falls through the tips (the floor starts above `0`, so it can never
-//! rule `after: 0` out), and 6d resolves that fallthrough with an early-terminating index
+//! rule `after: 0` out), and the index resolves that fallthrough with an early-terminating
 //! existence check instead of a linear log decode. This bench measures the two, so the
 //! crossover (O(surviving segments) FST probes vs O(total events) decode) is visible as
 //! history grows.
@@ -37,7 +37,7 @@
 //! both are CPU-bound, so these numbers measure decode/probe cost, useful for spotting the
 //! shape and regressions, not the durable-storage latency (the scan would pay real sequential
 //! I/O on a cold cache). Point `DCBDB_BENCH_DIR` at the device under test. This mirrors the
-//! fsync/tmpfs caveat in `write_path.rs` and `read_path.rs`, and relates to phase 8's deferred
+//! fsync/tmpfs caveat in `write_path.rs` and `read_path.rs`, and relates to the deferred
 //! "condition-check latency with and without tips".
 
 use std::hint::black_box;

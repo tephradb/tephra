@@ -11,8 +11,8 @@ use crate::read::{ReadHandle, Reads};
 use super::{AppendError, Message, Request};
 
 /// A cloneable, `Send` handle to the write coordinator. Every clone feeds the same
-/// single writer; dropping the last one (and the owning [`WriteCoordinator`]) shuts the
-/// coordinator down.
+/// single writer; dropping the last one (and the owning
+/// [`WriteCoordinator`](super::WriteCoordinator)) shuts the coordinator down.
 ///
 /// Also carries a [`ReadHandle`] so appends and reads share one handle, but the two are
 /// independent: [`read`](Self::read) runs on the caller's thread over the published
@@ -32,7 +32,8 @@ impl WriteHandle {
     /// condition to guard the write against concurrent conflicting events. On success
     /// the returned [`PositionRange`] covers the assigned positions, dense and in order.
     ///
-    /// Blocks if the request queue is full (backpressure). A [`ConflictSite::SameBatch`]
+    /// Blocks if the request queue is full (backpressure). A
+    /// [`ConflictSite::SameBatch`](super::ConflictSite::SameBatch)
     /// conflict is retryable; see [`AppendError`] and
     /// [`ConflictSite`](super::ConflictSite).
     pub fn append(

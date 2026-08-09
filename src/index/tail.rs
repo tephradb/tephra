@@ -1,8 +1,8 @@
 //! The active tail: the in-memory index over the one *active* (still-growing) segment,
 //! shared lock-free between the writer thread that feeds it and any reader thread that
-//! queries it, bounded on read by the published watermark (CLAUDE.md 9).
+//! queries it, bounded on read by the published watermark.
 //!
-//! Two structures, split on cardinality (CLAUDE.md 3, 7):
+//! Two structures, split on cardinality:
 //!
 //! - **Tags (high cardinality) -> an inverted index.** Each distinct tag interns to a
 //!   [`TermId`](super::TermId) (via a concurrent [`DashMap`]) whose [`PostingSlot`] holds the
@@ -23,10 +23,10 @@
 //!   posting slot's own length (postings).
 //! - The two interners are `DashMap`s: the writer inserts under one shard lock, a reader
 //!   probes under one shard lock. A single-probe hold satisfies "no lock across query
-//!   evaluation" (CLAUDE.md 9). The reverse (id -> string) maps the sealer needs are
+//!   evaluation". The reverse (id -> string) maps the sealer needs are
 //!   reconstructed from the `DashMap`s at seal time, so nothing reader-facing is duplicated.
 //!
-//! This is the in-memory counterpart of the on-disk index segment built in 5b; the two share
+//! This is the in-memory counterpart of the on-disk index segment; the two share
 //! one evaluator ([`search`](super::search)) via the [`SegmentIndex`] trait, [`ActiveView`]
 //! being the tail's implementation of it.
 
@@ -175,7 +175,7 @@ impl ActiveTail {
 
     /// Whether this segment is unindexable: its columns are truncated relative to the
     /// watermark, so a reader must scan the log for its range rather than query the tail.
-    /// Acquire, paired with [`mark_unindexable`](Self::mark_unindexable) and the watermark.
+    /// Acquire, paired with `mark_unindexable` and the watermark.
     pub fn is_unindexable(&self) -> bool {
         self.unindexable.load(Ordering::Acquire)
     }
@@ -207,7 +207,7 @@ impl ActiveTail {
         let type_column = self.type_column.snapshot();
         let postings = self.postings.snapshot();
         // Clamp to what the cloned type column actually covers, so `type_at` is always in
-        // range regardless of the watermark/backbone timing argument (CLAUDE.md 9).
+        // range regardless of the watermark/backbone timing argument.
         let upto_len = upto_len.min(type_column.covered());
         ActiveView {
             base: self.base,
@@ -265,7 +265,7 @@ impl ActiveTail {
 /// A watermark-bounded, lock-free reader view over an [`ActiveTail`]. It owns cloned backbone
 /// snapshots (taken after the watermark load) and shared `DashMap` handles, so evaluating a
 /// query over it touches only atomics and single-shard probes, never a lock held across the
-/// evaluation (CLAUDE.md 9).
+/// evaluation.
 pub struct ActiveView {
     base: Position,
     /// Visible local count: only locals `0..upto_len` are exposed.
@@ -280,7 +280,7 @@ pub struct ActiveView {
 /// [`ActiveView`]. Unlike the zero-copy on-disk borrow, `term_postings` materializes an owned
 /// vector: the postings are chunked (not one contiguous slice) and are truncated to the
 /// watermark, so a copy is unavoidable here. It is bounded by one segment and off the hot
-/// sealed path; 6c measures whether it warrants a lending-iterator contract change.
+/// sealed path; a benchmark measures whether it warrants a lending-iterator contract change.
 impl SegmentIndex for ActiveView {
     fn base(&self) -> Position {
         self.base
@@ -329,7 +329,7 @@ pub struct TooManyTypes {
     pub max: usize,
 }
 
-// The active tail is shared across threads from 6b on: the writer feeds it while readers
+// The active tail is shared across threads: the writer feeds it while readers
 // query it lock-free. Lock in both bounds so a future change that reintroduces a non-atomic
 // field fails the build rather than silently regressing.
 const _: fn() = || {

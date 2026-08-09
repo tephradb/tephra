@@ -19,10 +19,10 @@
 //!   (an inlined singleton, or an offset into the postings region).
 //!
 //! Reading loads the whole file into one `Arc<[u8]>` and verifies both CRCs once (mmap
-//! is deliberately not used: CLAUDE.md 9). The FST and every region are then read
+//! is deliberately not used). The FST and every region are then read
 //! straight out of that shared buffer, so a segment is cheap to clone and share across
 //! readers. A corrupt segment is never fatal: the caller rebuilds it from the log, which
-//! is the source of truth (CLAUDE.md 2).
+//! is the source of truth.
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -198,7 +198,7 @@ impl IndexSegment {
 }
 
 /// Writes `bytes` to `path` durably: the file is synced, then the parent directory is
-/// synced so the new name is durable too (CLAUDE.md 4.4).
+/// synced so the new name is durable too.
 pub fn write_segment_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(bytes)?;

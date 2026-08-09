@@ -2,7 +2,7 @@
 //! LEB128 varint it is built on.
 //!
 //! A term's postings are stored in one of a few representations, chosen by how many
-//! events carry the tag (CLAUDE.md 7, "tiered postings by term frequency"). The tier
+//! events carry the tag ("tiered postings by term frequency"). The tier
 //! and its payload are packed into the `u64` value the FST term dictionary maps each
 //! tag to, so a lookup that hits the FST already knows how to find the list without a
 //! second indirection:
@@ -14,7 +14,7 @@
 //!   postings region, where the list is a `varint(count)` followed by `count` varint
 //!   deltas (`first` absolute, then `pos[i] - pos[i-1]`), reconstructing the ascending
 //!   local positions.
-//! - **tier2, dense (Roaring).** Reserved but never emitted in phase 5b: a Roaring
+//! - **tier2, dense (Roaring).** Reserved but never emitted: a Roaring
 //!   bitmap for very frequent tags. Decoding one is a hard, named error rather than a
 //!   silent skip, so the day it is added it cannot be mistaken for a corrupt list.
 //!
@@ -49,7 +49,7 @@ pub enum PostingsError {
     OffsetOutOfBounds { offset: usize, len: usize },
     #[error("local position overflows u32 while decoding delta-encoded postings")]
     PositionOverflow,
-    #[error("dense (Roaring) postings are reserved but not implemented until after phase 5b")]
+    #[error("dense (Roaring) postings are reserved but not yet implemented")]
     ReservedDenseTier,
 }
 
@@ -146,7 +146,7 @@ pub fn decode_postings(value: u64, region: &[u8]) -> Result<Cow<'static, [u32]>,
 ///
 /// A singleton is length `1` from the value alone; a small term reads only the leading
 /// `varint(count)` at its offset (not the deltas), which is what makes exact posting
-/// lengths "free from the term dictionary" (CLAUDE.md 8) for the query planner. The
+/// lengths "free from the term dictionary" for the query planner. The
 /// reserved dense tier is a named error, exactly as [`decode_postings`].
 pub fn posting_len(value: u64, region: &[u8]) -> Result<u32, PostingsError> {
     let tier = value >> TIER_SHIFT;

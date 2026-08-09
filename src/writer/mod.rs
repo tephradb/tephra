@@ -8,9 +8,9 @@
 //!
 //! The correctness core is the append condition under group commit: several independent
 //! decisions can be drained into one batch, and two of them can conflict with each other
-//! (the uniqueness-guard pattern). That case is handled by a batch-local
-//! [`StagedTips`](tips::StagedTips) consulted alongside the durable
-//! [`TagTips`](tips::TagTips); see [`condition`] and [`coordinator`].
+//! (the uniqueness-guard pattern). That case is handled by a batch-local `StagedTips`
+//! consulted alongside the durable `TagTips`; see the condition evaluator and the
+//! coordinator loop.
 
 mod batch;
 mod condition;
@@ -49,13 +49,13 @@ pub struct WriterConfig {
     /// runtime flag (not a cargo feature) so the property test can flip it per case.
     pub verify_tips: bool,
     /// Force the append-condition durable arm to resolve `Verdict::Unknown` with the scan
-    /// oracle instead of the index existence check ([`condition`], phase 6d). An operational
+    /// oracle instead of the index existence check. An operational
     /// escape hatch (the log is the source of truth, so the scan is always safe) and the A/B
     /// control the `condition_path` benchmark uses to measure index-vs-scan. `false` in
     /// production.
     pub condition_force_scan: bool,
     /// Read-path tuning for the handles this coordinator hands out (the index-vs-scan cost
-    /// model, CLAUDE.md 8). Reads run off the writer thread, so this only configures the
+    /// model). Reads run off the writer thread, so this only configures the
     /// planner, never the append path.
     pub read: ReadConfig,
 }
@@ -132,7 +132,7 @@ struct Request {
 /// What flows over the coordinator's channel: an append or the explicit shutdown sentinel
 /// (drop-based shutdown works too, via channel disconnect).
 ///
-/// Reads no longer ride this channel: as of phase 6 they run on the caller's own thread
+/// Reads do not ride this channel: they run on the caller's own thread
 /// over a published read snapshot ([`crate::read`]), off the writer thread entirely.
 enum Message {
     Append(Request),

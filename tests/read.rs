@@ -208,7 +208,7 @@ fn read_matches_scan_over_random_workload_across_segments() {
 
 #[test]
 fn the_planner_never_changes_the_answer() {
-    // The cost model (6c) picks index-vs-scan purely for speed, so for any `scan_bias` the
+    // The cost model picks index-vs-scan purely for speed, so for any `scan_bias` the
     // read must return the identical result. Replay one workload into three coordinators:
     // bias 1 forces the index arm (even broad queries plan positions), bias u32::MAX forces
     // the filtered-scan arm (even selective queries stream + filter), and 4 is the default.
@@ -322,7 +322,7 @@ fn concurrent_reads_of_the_active_index_see_a_consistent_prefix() {
     // Every event carries course:c1, so a *tag* query pinned at watermark W must return
     // exactly 1..=W. Unlike `Query::all` (which streams a bypass log scan), a tag query
     // routes through the index: sealed segments via their on-disk index, and the active range
-    // via the shared, watermark-bounded `ActiveView` (phase 6b). Readers hammer the active
+    // via the shared, watermark-bounded `ActiveView`. Readers hammer the active
     // tail while the writer feeds it, so a torn view of the chunked postings/type column, a
     // posting past the watermark, or a backbone not yet covering a visible local would each
     // break the dense-prefix assert. Small segments force constant rollover, so there is
@@ -375,7 +375,7 @@ fn concurrent_reads_of_the_active_index_see_a_consistent_prefix() {
 fn watermark_resume_has_no_gap_or_duplicate() {
     // A read pinned at W1 returns 1..=W1 and reports W1; after more appends, a read resumed
     // from W1 returns exactly W1+1..=W2 with no gap and no duplicate at the boundary. This
-    // is the phase-7 catch-up seam.
+    // is the subscription catch-up seam.
     let (coord, handle, _dir) = coordinator();
 
     let mut rng = Rng(0x5EED_5EED_5EED_5EED);

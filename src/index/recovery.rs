@@ -1,6 +1,6 @@
 //! Rebuilding an index from the log, pure over the events it is fed.
 //!
-//! The log is the source of truth and the index is derived (CLAUDE.md 2), so any index
+//! The log is the source of truth and the index is derived, so any index
 //! state that is missing, corrupt, or never persisted is reconstructed by replaying the
 //! log segment it covers. This module holds the pure core of that reconstruction: a
 //! [`Rebuilder`] that a caller drives one `(position, event)` at a time, and a free
@@ -8,7 +8,7 @@
 //! against hand-built inputs, exactly like the log's own recovery rule.
 //!
 //! The file-scanning wrapper that feeds these from a [`SegmentSet`](crate::log::set::SegmentSet)
-//! scan lives in [`super::set`], because a log scan is a lending iterator that cannot be
+//! scan lives in `super::set`, because a log scan is a lending iterator that cannot be
 //! expressed as `Iterator<Item = (Position, EventRef)>`.
 
 use crate::Position;
@@ -23,7 +23,7 @@ use super::ActiveTail;
 /// distinct event types, which the dense type column cannot address. It is not a real
 /// workload (event types are low cardinality by domain), but it must not be silently
 /// mis-indexed: an unindexable range makes queries over it error loudly rather than
-/// return a short answer (CLAUDE.md 7). `count` is always the true number of events in
+/// return a short answer. `count` is always the true number of events in
 /// the range, even when `unindexable`, so the range can still be named and pruned.
 #[derive(Debug)]
 pub struct Rebuilt {

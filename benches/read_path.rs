@@ -1,6 +1,6 @@
-//! Read-path benchmark: the index-vs-scan crossover (phase 6c).
+//! Read-path benchmark: the index-vs-scan crossover.
 //!
-//! This is the deliverable of phase 6c (CLAUDE.md 8): not a tuned `K`, but the measurement
+//! This is not a tuned `K`, but the measurement
 //! that reveals *where* the index stops paying for itself. A selective query answered
 //! through the index touches few events (one random fetch each); a broad query answered by a
 //! sequential scan reads the whole range once at disk bandwidth. Somewhere between those the

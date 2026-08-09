@@ -31,8 +31,8 @@
 //!
 //! ## The fsync caveat (read this before trusting a number)
 //!
-//! The whole point of this store is that "the ceiling is fsync, not ordering" (CLAUDE.md
-//! 10). A `TempDir` under `/tmp` is very often a `tmpfs` (RAM) mount, where `fsync` is
+//! The whole point of this store is that the ceiling is fsync, not ordering.
+//! A `TempDir` under `/tmp` is very often a `tmpfs` (RAM) mount, where `fsync` is
 //! effectively a no-op, so latencies look 10x to 100x better than any real disk. Numbers
 //! from a tmpfs measure the coordinator's CPU and coalescing behaviour, which is useful
 //! for spotting regressions, but they are **not** a fair comparison against another

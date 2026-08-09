@@ -117,7 +117,7 @@ struct Worker {
     /// The derived index, fed inline at the commit seam. The writer feeds it here; off-thread
     /// reads query the same segments through the published [`Snapshot`], including the active
     /// segment's shared [`ActiveTail`](crate::index::ActiveTail), which they read lock-free
-    /// through a watermark-bounded view (phase 6b).
+    /// through a watermark-bounded view.
     index: IndexSet,
     tips: TagTips,
     cfg: WriterConfig,
@@ -677,7 +677,7 @@ mod tests {
         }
     }
 
-    // --- phase 6d: the index-backed durable arm and its scan fallback ---
+    // --- the index-backed durable arm and its scan fallback ---
 
     /// Builds a worker over a tiny-segment log so a modest workload seals several segments,
     /// exercising both the sealed-segment and active-tail halves of the condition check.

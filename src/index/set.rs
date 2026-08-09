@@ -3,20 +3,20 @@
 //! active one, and answering a [`Query`] across all of them.
 //!
 //! Ownership mirrors the log: sealed segments are immutable `Arc<IndexSegment>` (reading
-//! them is lock-free), and the active tail is fed in position order at the commit seam. As
-//! of phase 6b the active tail is an `Arc<ActiveTail>`, append-only and shared: the writer
+//! them is lock-free), and the active tail is fed in position order at the commit seam. The
+//! active tail is an `Arc<ActiveTail>`, append-only and shared: the writer
 //! feeds it while reader threads query it lock-free through a watermark-bounded
 //! [`ActiveView`](super::ActiveView), so the set is `Sync` and its active `Arc` is published
-//! into the read snapshot (CLAUDE.md 9).
+//! into the read snapshot.
 //!
 //! Cross-segment combination is **ordered concatenation, not a k-merge**: segments are
 //! position-disjoint and ordered, so each one's per-query output is a globally-ascending,
-//! non-overlapping run and concatenating them in order is already sorted (CLAUDE.md 2).
+//! non-overlapping run and concatenating them in order is already sorted.
 //!
 //! A degraded segment (one whose log holds more distinct types than the dense type
 //! column can address) is never silently skipped: [`search_all`](IndexSet::search_all)
 //! errors with the unanswerable range so the caller falls back to a log scan, rather than
-//! returning a short answer (CLAUDE.md 7).
+//! returning a short answer.
 
 use std::fs::File;
 use std::io;
@@ -166,7 +166,7 @@ impl IndexSet {
     /// The in-memory segment is published to the sealed set before the file is written, so
     /// readers see it without waiting on the fsync. A failed write is logged and ignored:
     /// the in-memory segment is authoritative for this process and rebuild-on-open
-    /// re-derives the file next start (CLAUDE.md 2). It is never turned into a write
+    /// re-derives the file next start. It is never turned into a write
     /// failure or an unpublish.
     pub fn seal_active(&mut self, new_base: Position) {
         let base = self.active_base;
@@ -213,7 +213,7 @@ impl IndexSet {
     ///
     /// Prunes segments whose whole range is at or before `after` by header comparison, and
     /// errors up front (before any positions are produced) if any surviving segment is
-    /// unindexable, so a covering query never gets a short answer (CLAUDE.md 7). Shared by
+    /// unindexable, so a covering query never gets a short answer. Shared by
     /// [`search_all`](Self::search_all) and [`find_match`](Self::find_match) so the pruning
     /// and unindexable checks have exactly one definition.
     fn plan_touched(&self, after: Position) -> Result<Vec<Touched<'_>>, IndexError> {
@@ -257,7 +257,7 @@ impl IndexSet {
     /// Positions matching `query`, ascending, deduped, strictly after `after`, across
     /// every segment.
     ///
-    /// Prunes and unindexable-checks via [`plan_touched`](Self::plan_touched), then
+    /// Prunes and unindexable-checks via `plan_touched`, then
     /// concatenates the touched segments' ascending per-segment outputs. The materialized
     /// order is already globally ascending because the segments are disjoint and ordered.
     pub fn search_all(
@@ -279,7 +279,7 @@ impl IndexSet {
 
     /// The first (lowest) position matching `query` strictly after `after`, or `None` if no
     /// indexed event matches. The early-terminating existence check the append-condition
-    /// durable arm uses in place of a linear log scan (CLAUDE.md 6, phase 6d).
+    /// durable arm uses in place of a linear log scan.
     ///
     /// Probes the touched segments in ascending base order and returns as soon as one yields
     /// a match: because the segments are position-disjoint and ordered, the first match in
@@ -465,8 +465,8 @@ impl IndexError {
     }
 }
 
-// Lock in that the set is `Send` (it moves into the writer thread) and `Sync`: as of
-// phase 6b the active tail is a shared `Arc<ActiveTail>` that reader threads query
+// Lock in that the set is `Send` (it moves into the writer thread) and `Sync`: the
+// active tail is a shared `Arc<ActiveTail>` that reader threads query
 // lock-free, so `&IndexSet` may cross threads. A future change reintroducing a
 // non-`Sync` field would fail this build.
 const _: fn() = || {

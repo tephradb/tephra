@@ -5,8 +5,8 @@
 //!
 //! - [`ActiveTail`]: a per-segment index, per-tag postings plus a dense type column, fed
 //!   in position order and shared lock-free for reading via a watermark-bounded
-//!   [`ActiveView`] (phase 6b). Tag and type interning use concurrent maps.
-//! - [`search`]: the index-driven query evaluator, the counterpart to phase 4's scan
+//!   [`ActiveView`]. Tag and type interning use concurrent maps.
+//! - [`search`]: the index-driven query evaluator, the counterpart to the scan
 //!   oracle (`writer::condition`). It answers a [`Query`](crate::query::Query)
 //!   identically to a scan, which the differential test pins down.
 //!
@@ -72,7 +72,7 @@ impl TypeId {
 /// it lives in memory (an [`ActiveView`] over the [`ActiveTail`]) or on disk
 /// ([`IndexSegment`]).
 ///
-/// The two share exactly one evaluator (CLAUDE.md 6, 7.0). Both return
+/// The two share exactly one evaluator. Both return
 /// [`term_postings`](SegmentIndex::term_postings) as an owned [`Cow::Owned`]: the on-disk
 /// segment decodes varint deltas, the active view materializes its chunked, watermark-
 /// truncated postings. Positions are segment-local (`global - base`).
@@ -94,7 +94,7 @@ pub trait SegmentIndex {
 
     /// How many events carry `tag`, or `None` if no indexed event does, **without
     /// materializing the postings**. The query planner ([`estimate_matches`]) uses this as a
-    /// cheap result-size estimate (CLAUDE.md 8, "exact posting lengths come free from the
+    /// cheap result-size estimate ("exact posting lengths come free from the
     /// term dictionary").
     ///
     /// **Exact on the on-disk [`IndexSegment`]** (the FST value carries the count); an

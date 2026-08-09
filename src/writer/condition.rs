@@ -1,5 +1,5 @@
 //! Append-condition evaluation: the one definition of "does a matching event exist
-//! after `after`" that the index (phase 5) is differential-tested against.
+//! after `after`" that the index is differential-tested against.
 //!
 //! Two arms, and neither may ever produce a false negative (silently accepting a
 //! conflicting write):
@@ -8,8 +8,8 @@
 //!    has complete knowledge of the batch. Conservative and tag-only; no scan is
 //!    possible because staged records are not durable yet.
 //! 2. The durable arm fast-rejects with [`TagTips`] and, on [`Verdict::Unknown`], resolves
-//!    with an **early-terminating index existence check** ([`IndexSet::find_match`], phase
-//!    6d) rather than a linear log decode. The scan oracle ([`scan_for_match`]) stays as the
+//!    with an **early-terminating index existence check** ([`IndexSet::find_match`])
+//!    rather than a linear log decode. The scan oracle ([`scan_for_match`]) stays as the
 //!    fallback when a touched segment is unindexable, as the `verify` cross-check, and as the
 //!    escape hatch `force_scan` forces.
 
@@ -68,7 +68,7 @@ pub fn evaluate(
             Ok(found) => Ok(found.map(ConflictSite::Durable)),
             // A touched segment is unindexable (in practice the only error, since
             // `find_match` does no I/O). Fall back to the scan oracle over the durable log,
-            // which is always authoritative (CLAUDE.md 2, 7). Warn: a silently degraded
+            // which is always authoritative. Warn: a silently degraded
             // segment forcing this repeatedly is worth noticing.
             Err(_err) => {
                 #[cfg(feature = "tracing")]
@@ -86,8 +86,8 @@ pub fn evaluate(
 /// The scan is authoritative, so its result is returned either way. A disagreement means a
 /// bug in the tips or the index existence check: it is logged at error with both verdicts
 /// and panics in debug builds so tests fail loudly, but in release the writer thread
-/// survives on the oracle's answer rather than poisoning every future append (CLAUDE.md 7's
-/// "a degraded component errors, never answers short" applied to the verify path).
+/// survives on the oracle's answer rather than poisoning every future append (the
+/// "a degraded component errors, never answers short" rule applied to the verify path).
 fn verified_against_scan(
     fast: Option<Position>,
     set: &SegmentSet,

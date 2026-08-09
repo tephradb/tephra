@@ -424,7 +424,7 @@ impl<const H: usize> Writer<H> {
     /// current write offset. No-op if `offset >= write_offset`.
     ///
     /// The bytes on disk beyond `offset` are left in place as garbage. They carry no
-    /// commit marker, so [`recover`] discards them on the next open, and the next
+    /// commit marker, so `recover` discards them on the next open, and the next
     /// append overwrites them. This relies on segment files never being recycled.
     pub fn rewind_to(&mut self, offset: u64) -> Result<(), WriteError> {
         if offset >= self.write_offset {

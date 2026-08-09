@@ -1,5 +1,5 @@
 //! Differential test: the in-memory index must answer every query identically to the
-//! phase-4 scan baseline.
+//! scan baseline.
 //!
 //! The scan baseline (`scan_after` + `Query::matches`) is the permanent oracle the whole
 //! index is defined against. Here a random workload is appended to a real `SegmentSet`
@@ -106,7 +106,7 @@ fn scan_baseline(set: &SegmentSet, query: &Query, after: Position) -> Vec<Positi
 fn index_search_agrees_with_scan_over_random_workload() {
     let dir = TempDir::new().unwrap();
     // One roomy segment: the differential contract for the in-memory half is a single
-    // logical index; multi-segment composition and pruning are phase 5b.
+    // logical index; multi-segment composition and pruning are covered separately.
     let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(1 << 20)).unwrap();
     let index = ActiveTail::new(set.next_position());
 
@@ -137,7 +137,7 @@ fn index_search_agrees_with_scan_over_random_workload() {
 
 #[test]
 fn index_set_agrees_with_scan_across_many_sealed_segments() {
-    // The 5b composition contract: a small segment forces many rollovers, so the workload
+    // The composition contract: a small segment forces many rollovers, so the workload
     // spans a dozen-plus sealed on-disk index segments plus the active tail. `IndexSet`
     // rebuilds and seals them all on open, and `search_all` (ordered concatenation over
     // disjoint segments, plus pruning) must return exactly what the scan oracle does for

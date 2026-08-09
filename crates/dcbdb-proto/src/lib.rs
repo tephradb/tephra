@@ -4,7 +4,7 @@
 //!
 //! The messages are defined in `proto/dcbdb.proto` and generated at build time by the
 //! official `protobuf-codegen` (see `build.rs`). Framing is a 4-byte big-endian length
-//! prefix in front of each serialized message; see [`framing`].
+//! prefix in front of each serialized message; see the `framing` module.
 
 mod framing;
 

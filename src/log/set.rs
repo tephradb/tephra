@@ -157,7 +157,7 @@ pub struct Segment {
     /// The asymmetry is benign: a sealed segment is fully synced, so its committed
     /// end is followed by the zero-filled `fallocate` tail. Reading against the
     /// frozen `Some` extent and reading against the file length (`None`) therefore
-    /// yield the same records — both stop at the same truncation marker.
+    /// yield the same records: both stop at the same truncation marker.
     flushed_offset: Option<FlushedOffset>,
     /// Byte offset of each data record, indexed by `position - base_position`.
     /// Never persisted in v1: derivable by one sequential scan on open.
@@ -219,8 +219,7 @@ impl Segment {
 /// A source of ordered, position-disjoint segments for a [`Scan`]: either the live
 /// [`SegmentSet`] (writer side) or an immutable read snapshot. Extracting this keeps the
 /// zero-copy segment-rolling scan (the highest-risk logic in layer 1) as **one**
-/// implementation shared by both sides, rather than a second copy over the same bytes
-/// (CLAUDE.md 5.4).
+/// implementation shared by both sides, rather than a second copy over the same bytes.
 ///
 /// Segments are addressed by a logical index: sealed segments first (`0..segment_count`),
 /// then the active segment at `segment_count`.
@@ -642,7 +641,7 @@ impl SegmentSet {
         // `create` fallocates (zero-filling) then makes the file and its directory
         // entry durable, so the file reads back as an unwritten segment until we
         // write the header. Writing the header only changes file content, not the
-        // directory entry, so `sync_all` on the file is enough — no second fsync
+        // directory entry, so `sync_all` on the file is enough, no second fsync
         // of the directory is needed.
         let mut writer = Writer::<0>::create(&path, config.segment_size, config.header_size as u64)
             .map_err(|source| LogError::write(&path, source))?;
@@ -846,7 +845,7 @@ forward_segment_source!(Arc<T>);
 /// skipped silently, and it never reads past the active segment's flushed point.
 ///
 /// A failure to open a segment or read a record is surfaced as an `Err` item and
-/// terminates the scan — it never looks like a clean end-of-stream.
+/// terminates the scan: it never looks like a clean end-of-stream.
 ///
 /// The scan **owns** its [`SegmentSource`] (`S`), so it can be either a borrow of the live
 /// [`SegmentSet`] (`Scan<&SegmentSet>`, writer side) or an owned read snapshot
@@ -971,10 +970,10 @@ impl<S: SegmentSource> Scan<S> {
             return None;
         }
 
-        // Phase 1: position the cursor on the next data record, skipping control
+        // Step 1: position the cursor on the next data record, skipping control
         // records and rolling across segments. This is header-only (`peek`), so it
-        // holds no payload borrow while it swaps readers — which is what lets the
-        // borrowing read in phase 2 return a view without fighting the borrow checker
+        // holds no payload borrow while it swaps readers, which is what lets the
+        // borrowing read in step 2 return a view without fighting the borrow checker
         // at a segment boundary.
         let total_len = match self.position_at_data() {
             Ok(Some(total_len)) => total_len,
@@ -996,7 +995,7 @@ impl<S: SegmentSource> Scan<S> {
         self.offset = offset + total_len as u64;
         self.position = position.next();
 
-        // Phase 2: one borrowing read of the data record. Sequential reads always
+        // Step 2: one borrowing read of the data record. Sequential reads always
         // borrow the read-ahead buffer (locked by seglog's
         // `test_sequential_read_borrows_even_large_records`), so `data` is a slice
         // into it, zero copy.
@@ -1432,7 +1431,7 @@ mod tests {
             append_one(&mut set, format!("e{i}").as_bytes());
         }
 
-        // scan_from(0) means "from before everything" — the whole log, not nothing.
+        // scan_from(0) means "from before everything": the whole log, not nothing.
         let positions: Vec<Position> = drain(set.scan_from(Position(0)))
             .iter()
             .map(|r| r.position)

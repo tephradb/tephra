@@ -21,7 +21,7 @@
 //! throw away diagnosability in the one component whose failure mode (a false negative
 //! that silently accepts a conflicting write) is invisible by design: a `u64` cannot
 //! answer "which tag" when a spurious rejection or a property-test disagreement is
-//! investigated. Phase 5 replaces this with an exact `TermId` interner, which discards a
+//! investigated. The index interns tags to an exact `TermId` instead, which discards a
 //! hash rather than building on one. A window-bounded map of string keys costs a few MB
 //! at realistic write rates; revisit only if profiling says it matters.
 

@@ -1,13 +1,14 @@
-//! The index-driven query evaluator: the counterpart to phase 4's scan oracle.
+//! The index-driven query evaluator: the counterpart to the scan oracle.
 //!
 //! [`search`] answers a [`Query`] against a [`SegmentIndex`] with the same semantics the
 //! scan uses (`Query::matches` over `scan_after`), driven by postings instead of a linear
 //! decode. The differential test pins the two together: they must return the identical
 //! ascending position set for every query. This evaluator is deliberately simple (no cost
-//! model, no planning); the planner and its streaming API are phase 6.
+//! model, no planning); the planner and its streaming API live in the read paths.
 //!
 //! Output is an **ascending, deduped** iterator of global positions strictly after
-//! `after`. The ascending-per-segment contract is load-bearing for 5b: a query spans
+//! `after`. The ascending-per-segment contract is load-bearing for cross-segment
+//! composition: a query spans
 //! several per-segment indexes, and because the segments are position-disjoint and
 //! ordered, the cross-segment combine is ordered concatenation of disjoint ascending runs,
 //! not a k-way merge (see [`IndexSet::search_all`](super::IndexSet)).
@@ -177,7 +178,7 @@ mod tests {
             .collect()
     }
 
-    // --- spec-anchored expectations (answers derived from CLAUDE.md 1, not the code) ---
+    // --- spec-anchored expectations (answers derived from the DCB spec, not the code) ---
 
     #[test]
     fn spec_empty_types_matches_any_type() {
