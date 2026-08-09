@@ -103,7 +103,8 @@ count, never for correctness. This is the thing LSM compaction can never be.
 | 4. Query planner | Chooses index vs scan per query item using exact posting lengths. |
 | 5. Read paths | Condition check, decision-model read, projection catch-up / subscriptions. |
 
-Layers 1 and 2 are the current build target. 3 onward are designed but not built.
+All five layers are implemented. Subscriptions (live-tail handoff) and the items in
+section 12 remain future work.
 
 ---
 
@@ -840,20 +841,17 @@ startup would otherwise read everything.
 
 ```
 src/
-  lib.rs
-  error.rs
+  lib.rs            // crate root: module declarations + curated re-exports
+  main.rs           // dcbdb binary entry point
+  position.rs       // Position (PositionRange lives in log/set.rs)
   event.rs          // Event, EventRef, EventType, Tag, Tags, codec
   query.rs          // Query, QueryItem, AppendCondition, match predicate
-  position.rs       // Position, PositionRange
 
   log/
-    mod.rs          // Log is the layer-1 entry point
-    segment.rs      // Segment: one seglog file + header + offset sidecar
+    mod.rs          // layer-1 entry point (declares header + set)
     header.rs       // SegmentHeader encode/decode
-    offsets.rs      // Offsets: position -> byte offset, built by scan
-    set.rs          // SegmentSet: discovery, ordering, rollover, active segment
-    scan.rs         // Scan: lending iterator over positions
-    recovery.rs     // pure run validation over a byte slice
+    set.rs          // SegmentSet + Segment (one seglog file, offset sidecar), Scan
+                    // (lending iterator), Record/RecordRef, PositionRange, recovery
 
   writer/
     mod.rs
@@ -863,20 +861,25 @@ src/
     condition.rs    // evaluates AppendCondition (two arms: staged, then durable)
     tips.rs         // TagTips (durable, lossy) + StagedTips (batch, complete)
 
+  read/
+    mod.rs          // layer-5 off-thread read paths: ReadCore, ReadHandle, Snapshot, Reads
+
   index/
     mod.rs          // TermId, TypeId, SegmentIndex trait; re-exports
     append.rs       // AppendColumn (chunked atomic append-only vec) + PostingSlot (inline/spill)
     tail.rs         // ActiveTail: shared per-tag postings + dense type column, fed in position order; ActiveView reader
     search.rs       // index-driven Query evaluator, ascending iterator (differential oracle)
     plan.rs         // layer-4 cost model: estimate_matches (posting-length bound) + choose
+    header.rs       // IndexSegmentHeader encode/decode
+    postings.rs     // tiered posting-list encoding (singleton / varint-delta) + LEB128
     segment.rs      // IndexSegment: on-disk index format, encode/decode
     set.rs          // IndexSet: sealed IndexSegments + active ActiveTail, search_all, seal/rebuild
     recovery.rs     // Rebuilder: reconstruct the tail from a log scan
 ```
 
-Naming: `Log`, not `Store` or `EventLog` (it reads as `crate::log::Log`). `SegmentSet`,
-not `SegmentManager`; nothing is called a manager. "Tip" is the standard word for the
-latest entry on a branch; it is not a cache.
+Naming: the layer-1 entry point is `SegmentSet` (in `crate::log::set`), not `Store`,
+`EventLog`, or `SegmentManager`; nothing is called a manager. "Tip" is the standard word
+for the latest entry on a branch; it is not a cache.
 
 `Segment` is one type covering both the active writable segment and sealed ones,
 distinguished by an `Option<Writer>`. A `Segment`/`SealedSegment` split looks cleaner and
