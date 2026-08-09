@@ -454,7 +454,6 @@ impl<const H: usize> Writer<H> {
         self.sync()?;
         Ok(())
     }
-
 }
 
 /// Largest total record length that still leaves room for a commit marker after `start_offset`.
