@@ -1226,8 +1226,8 @@ mod tests {
         let set = open(dir.path(), 4096);
 
         // Fresh log: next position is 1, and last_position is the empty sentinel 0.
-        assert_eq!(set.next_position(), Position(1));
-        assert_eq!(set.last_position(), Position(0));
+        assert_eq!(set.next_position(), Position::new(1));
+        assert_eq!(set.last_position(), Position::new(0));
         assert_eq!(set.sealed_len(), 0);
         assert!(dir.path().join("00000000000000000001.log").exists());
     }
@@ -1248,15 +1248,15 @@ mod tests {
             for i in 1..=5u64 {
                 append_one(&mut set, format!("event-{i}").as_bytes());
             }
-            assert_eq!(set.next_position(), Position(6));
+            assert_eq!(set.next_position(), Position::new(6));
         }
 
         let set = open(dir.path(), 4096);
-        assert_eq!(set.next_position(), Position(6));
-        assert_eq!(set.last_position(), Position(5));
+        assert_eq!(set.next_position(), Position::new(6));
+        assert_eq!(set.last_position(), Position::new(5));
         for i in 1..=5u64 {
-            let record = set.read_at(Position(i)).unwrap();
-            assert_eq!(record.position, Position(i));
+            let record = set.read_at(Position::new(i)).unwrap();
+            assert_eq!(record.position, Position::new(i));
             assert_eq!(record.data, format!("event-{i}").into_bytes());
         }
     }
@@ -1270,14 +1270,14 @@ mod tests {
         let n = 20u64;
         for i in 1..=n {
             let pos = append_one(&mut set, format!("evt{i:03}").as_bytes());
-            assert_eq!(pos, Position(i));
+            assert_eq!(pos, Position::new(i));
         }
 
-        assert_eq!(set.next_position(), Position(n + 1));
+        assert_eq!(set.next_position(), Position::new(n + 1));
         assert!(set.sealed_len() >= 1, "expected at least one rollover");
 
         for i in 1..=n {
-            let record = set.read_at(Position(i)).unwrap();
+            let record = set.read_at(Position::new(i)).unwrap();
             assert_eq!(record.data, format!("evt{i:03}").into_bytes());
         }
     }
@@ -1293,17 +1293,17 @@ mod tests {
         assert!(set.sealed_len() >= 2);
         for i in 1..=n {
             assert_eq!(
-                set.read_at(Position(i)).unwrap().data,
+                set.read_at(Position::new(i)).unwrap().data,
                 format!("r{i:04}").into_bytes()
             );
         }
         // The empty sentinel and a position past the end are both absent.
         assert!(matches!(
-            set.read_at(Position(0)),
+            set.read_at(Position::new(0)),
             Err(LogError::NotFound { .. })
         ));
         assert!(matches!(
-            set.read_at(Position(n + 1)),
+            set.read_at(Position::new(n + 1)),
             Err(LogError::NotFound { .. })
         ));
     }
@@ -1318,11 +1318,11 @@ mod tests {
         }
 
         let start = 5u64;
-        let got = drain(set.scan_from(Position(start)));
+        let got = drain(set.scan_from(Position::new(start)));
         assert_eq!(got.len() as u64, n - start + 1);
         for (idx, record) in got.iter().enumerate() {
             let pos = start + idx as u64;
-            assert_eq!(record.position, Position(pos));
+            assert_eq!(record.position, Position::new(pos));
             assert_eq!(record.data, format!("s{pos}").into_bytes());
         }
     }
@@ -1337,11 +1337,11 @@ mod tests {
         }
         assert!(set.sealed_len() >= 2);
 
-        let got = drain(set.scan_from(Position(1)));
+        let got = drain(set.scan_from(Position::new(1)));
         assert_eq!(got.len() as u64, n);
         for (idx, record) in got.iter().enumerate() {
             let pos = idx as u64 + 1;
-            assert_eq!(record.position, Position(pos));
+            assert_eq!(record.position, Position::new(pos));
             assert_eq!(record.data, format!("x{pos:04}").into_bytes());
         }
     }
@@ -1355,14 +1355,14 @@ mod tests {
         }
 
         // scan_from(0) means "from before everything": the whole log, not nothing.
-        let positions: Vec<Position> = drain(set.scan_from(Position(0)))
+        let positions: Vec<Position> = drain(set.scan_from(Position::new(0)))
             .iter()
             .map(|r| r.position)
             .collect();
-        assert_eq!(positions, vec![Position(1), Position(2), Position(3)]);
+        assert_eq!(positions, vec![Position::new(1), Position::new(2), Position::new(3)]);
 
         // Past the end is a normal caught-up state: empty, not an error.
-        assert!(set.scan_from(Position(5)).next().is_none());
+        assert!(set.scan_from(Position::new(5)).next().is_none());
     }
 
     #[test]
@@ -1374,24 +1374,24 @@ mod tests {
         }
 
         // scan_after(0) scans the whole log with no sentinel special case.
-        let all: Vec<Position> = drain(set.scan_after(Position(0)))
+        let all: Vec<Position> = drain(set.scan_after(Position::new(0)))
             .iter()
             .map(|r| r.position)
             .collect();
-        assert_eq!(all, vec![Position(1), Position(2), Position(3)]);
+        assert_eq!(all, vec![Position::new(1), Position::new(2), Position::new(3)]);
 
         // scan_after(pos) is exclusive: it resumes strictly after `pos`.
-        let resumed: Vec<Position> = drain(set.scan_after(Position(1)))
+        let resumed: Vec<Position> = drain(set.scan_after(Position::new(1)))
             .iter()
             .map(|r| r.position)
             .collect();
-        assert_eq!(resumed, vec![Position(2), Position(3)]);
+        assert_eq!(resumed, vec![Position::new(2), Position::new(3)]);
 
         // scan_after(last) is the caught-up state: empty, not an error.
         assert!(set.scan_after(set.last_position()).next().is_none());
 
         // Inclusive/exclusive agree: scan_from(n) == scan_after(n - 1).
-        let from2: Vec<Position> = drain(set.scan_from(Position(2)))
+        let from2: Vec<Position> = drain(set.scan_from(Position::new(2)))
             .iter()
             .map(|r| r.position)
             .collect();
@@ -1436,7 +1436,7 @@ mod tests {
             Err(LogError::EmptyRecord)
         ));
         // A rejected empty record must not have advanced anything.
-        assert_eq!(set.next_position(), Position(1));
+        assert_eq!(set.next_position(), Position::new(1));
     }
 
     #[test]
@@ -1448,12 +1448,12 @@ mod tests {
             for i in 1..=3u64 {
                 append_one(&mut set, format!("e{i}").as_bytes());
             }
-            assert_eq!(set.next_position(), Position(4));
+            assert_eq!(set.next_position(), Position::new(4));
         }
 
         // Simulate a crash between create and header write for the next segment: a
         // zero-filled trailing file at the next base position.
-        let ghost = dir.path().join(segment_file_name(Position(4)));
+        let ghost = dir.path().join(segment_file_name(Position::new(4)));
         fs::write(&ghost, vec![0u8; segment_size]).unwrap();
 
         let set = open(dir.path(), segment_size);
@@ -1461,10 +1461,10 @@ mod tests {
             !ghost.exists(),
             "zero-filled trailing segment should be deleted"
         );
-        assert_eq!(set.next_position(), Position(4));
+        assert_eq!(set.next_position(), Position::new(4));
         for i in 1..=3u64 {
             assert_eq!(
-                set.read_at(Position(i)).unwrap().data,
+                set.read_at(Position::new(i)).unwrap().data,
                 format!("e{i}").into_bytes()
             );
         }
@@ -1505,8 +1505,8 @@ mod tests {
         }
 
         // The first segment's file is named for base position 1.
-        let path = dir.path().join(segment_file_name(Position(1)));
-        let bogus = SegmentHeader::new(Position(7));
+        let path = dir.path().join(segment_file_name(Position::new(1)));
+        let bogus = SegmentHeader::new(Position::new(7));
         let file = File::options().write(true).open(&path).unwrap();
         file.write_all_at(&bogus.to_bytes(), 0).unwrap();
         file.sync_all().unwrap();
@@ -1524,13 +1524,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut set = open(dir.path(), 4096);
         let range = set.append_batch(&[b"a", b"bb", b"ccc"]).unwrap();
-        assert_eq!(range.first, Position(1));
-        assert_eq!(range.last, Position(3));
+        assert_eq!(range.first, Position::new(1));
+        assert_eq!(range.last, Position::new(3));
         assert_eq!(range.count(), 3);
-        assert_eq!(set.next_position(), Position(4));
-        assert_eq!(set.read_at(Position(1)).unwrap().data, b"a");
-        assert_eq!(set.read_at(Position(2)).unwrap().data, b"bb");
-        assert_eq!(set.read_at(Position(3)).unwrap().data, b"ccc");
+        assert_eq!(set.next_position(), Position::new(4));
+        assert_eq!(set.read_at(Position::new(1)).unwrap().data, b"a");
+        assert_eq!(set.read_at(Position::new(2)).unwrap().data, b"bb");
+        assert_eq!(set.read_at(Position::new(3)).unwrap().data, b"ccc");
     }
 
     #[test]
@@ -1543,9 +1543,9 @@ mod tests {
         }
         let mut set = open(dir.path(), segment_size);
         let pos = append_one(&mut set, b"after"); // position 2
-        assert_eq!(pos, Position(2));
-        assert_eq!(set.read_at(Position(1)).unwrap().data, b"before");
-        assert_eq!(set.read_at(Position(2)).unwrap().data, b"after");
+        assert_eq!(pos, Position::new(2));
+        assert_eq!(set.read_at(Position::new(1)).unwrap().data, b"before");
+        assert_eq!(set.read_at(Position::new(2)).unwrap().data, b"after");
     }
 
     /// Data payload for the 1-based `position` in the single-record-per-batch logs
@@ -1571,7 +1571,7 @@ mod tests {
         assert_eq!(set.sealed_len(), 0, "test assumes a single segment");
         drop(set);
 
-        let path = dir.join(segment_file_name(Position(FIRST_POSITION)));
+        let path = dir.join(segment_file_name(Position::new(FIRST_POSITION)));
         let bytes = fs::read(&path).unwrap();
 
         let batch_size = REC_OVERHEAD + record_len + MARKER;
@@ -1601,7 +1601,7 @@ mod tests {
             for byte in corrupt.iter_mut().skip(cutoff) {
                 *byte = 0xFF;
             }
-            let path = dir.path().join(segment_file_name(Position(FIRST_POSITION)));
+            let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
             fs::write(&path, &corrupt).unwrap();
 
             let set = open(dir.path(), segment_size);
@@ -1610,12 +1610,12 @@ mod tests {
             let survived = commit_ends.iter().filter(|&&end| end <= cutoff).count() as u64;
             assert_eq!(
                 set.next_position(),
-                Position(survived + 1),
+                Position::new(survived + 1),
                 "cutoff {cutoff}: expected {survived} surviving events"
             );
 
             for p in 1..=survived {
-                let record = set.read_at(Position(p)).unwrap();
+                let record = set.read_at(Position::new(p)).unwrap();
                 assert_eq!(
                     record.data,
                     payload_for(p, record_len),
@@ -1638,7 +1638,7 @@ mod tests {
             let recs: Vec<Vec<u8>> = (0..5).map(|i| vec![b'B' + i as u8; rec_len]).collect();
             let refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
             set.append_batch(&refs).unwrap(); // batch B: positions 2..=6
-            assert_eq!(set.next_position(), Position(7));
+            assert_eq!(set.next_position(), Position::new(7));
         }
 
         // Flip one byte inside record 2 of batch B, leaving batch B's commit marker
@@ -1646,7 +1646,7 @@ mod tests {
         let batch_a = REC_OVERHEAD + 4 + MARKER;
         let rec_stride = REC_OVERHEAD + rec_len;
         let rec2_data = HEADER + batch_a + rec_stride + REC_OVERHEAD;
-        let path = dir.path().join(segment_file_name(Position(FIRST_POSITION)));
+        let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
         let file = File::options().read(true).write(true).open(&path).unwrap();
         let mut byte = [0u8; 1];
         file.read_exact_at(&mut byte, rec2_data as u64).unwrap();
@@ -1658,12 +1658,12 @@ mod tests {
         let set = open(dir.path(), segment_size);
         assert_eq!(
             set.next_position(),
-            Position(2),
+            Position::new(2),
             "whole batch B must roll back"
         );
-        assert_eq!(set.read_at(Position(1)).unwrap().data, b"aaaa");
+        assert_eq!(set.read_at(Position::new(1)).unwrap().data, b"aaaa");
         assert!(matches!(
-            set.read_at(Position(2)),
+            set.read_at(Position::new(2)),
             Err(LogError::NotFound { .. })
         ));
     }
@@ -1687,17 +1687,17 @@ mod tests {
         let survive = 3usize;
         let cut = HEADER + survive * batch_size + 5; // partway into batch index 3
 
-        let path = dir.path().join(segment_file_name(Position(FIRST_POSITION)));
+        let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
         let file = File::options().write(true).open(&path).unwrap();
         file.set_len(cut as u64).unwrap();
         file.sync_all().unwrap();
         drop(file);
 
         let set = open(dir.path(), segment_size);
-        assert_eq!(set.next_position(), Position(survive as u64 + 1));
+        assert_eq!(set.next_position(), Position::new(survive as u64 + 1));
         for p in 1..=survive as u64 {
             assert_eq!(
-                set.read_at(Position(p)).unwrap().data,
+                set.read_at(Position::new(p)).unwrap().data,
                 payload_for(p, record_len)
             );
         }

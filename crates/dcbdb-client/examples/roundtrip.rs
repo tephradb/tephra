@@ -11,7 +11,7 @@
 use std::env;
 use std::error::Error;
 
-use dcbdb_client::{Client, condition, event, query_all, query_item, query_items};
+use dcbdb_client::{AppendCondition, Client, Event, Position, Query, QueryItem};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let addr = env::args()
@@ -21,39 +21,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("connected to {addr}");
 
     let range = client.append(
-        vec![event("Enrolled", &["course:c1", "student:s1"], b"{}")],
+        [Event::new("Enrolled", &["course:c1", "student:s1"], b"{}")?],
         None,
     )?;
-    println!("appended Enrolled at position {}", range.first());
+    println!("appended Enrolled at position {}", range.first);
 
     // A uniqueness guard: reserve a username, failing if one already exists.
-    let guard = condition(query_items(vec![query_item(&[], &["username:alice"])]), 0);
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["username:alice"])?)));
     let range = client.append(
-        vec![event("UsernameReserved", &["username:alice"], b"{}")],
+        [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
         Some(guard),
     )?;
-    println!("reserved username:alice at position {}", range.first());
+    println!("reserved username:alice at position {}", range.first);
 
     // The same guard now conflicts with the event just written.
-    let guard = condition(query_items(vec![query_item(&[], &["username:alice"])]), 0);
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["username:alice"])?)));
     match client.append(
-        vec![event("UsernameReserved", &["username:alice"], b"{}")],
+        [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
         Some(guard),
     ) {
         Ok(_) => println!("second reservation unexpectedly succeeded"),
         Err(err) => println!("second reservation rejected: {err}"),
     }
 
-    let (events, watermark) = client.read_all(query_all(), 0)?;
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO)?;
     println!("log holds {} events (watermark {watermark}):", events.len());
     for sequenced in &events {
         let ev = sequenced.event();
-        let tags: Vec<&str> = ev.tags().iter().map(|t| t.to_str().unwrap()).collect();
-        println!(
-            "  {} {} {tags:?}",
-            sequenced.position(),
-            ev.r#type().to_str().unwrap()
-        );
+        let tags: Vec<&str> = ev.tags().collect();
+        println!("  {} {} {tags:?}", sequenced.position(), ev.event_type());
     }
     Ok(())
+}
+
+/// Builds a validated tag set for a query item.
+fn tags(items: &[&str]) -> Result<dcbdb_client::Tags, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(items.len());
+    for tag in items {
+        out.push(dcbdb_client::Tag::new(*tag)?);
+    }
+    Ok(dcbdb_client::Tags::new(out)?)
 }

@@ -163,7 +163,7 @@ mod tests {
         SegmentHeader {
             version: 0,
             created_at_nanos: 60 * 60 * 24 * 15695 * 1_000_000_000,
-            base_position: Position(123456789),
+            base_position: Position::new(123456789),
         }
     }
 
@@ -194,12 +194,12 @@ mod tests {
             SegmentHeader {
                 version: 0,
                 created_at_nanos: 0,
-                base_position: Position(0),
+                base_position: Position::new(0),
             },
             SegmentHeader {
                 version: 0,
                 created_at_nanos: u64::MAX,
-                base_position: Position(u64::MAX),
+                base_position: Position::new(u64::MAX),
             },
         ] {
             assert_eq!(SegmentHeader::from_bytes(&h.to_bytes()).unwrap(), h);
@@ -208,11 +208,11 @@ mod tests {
 
     #[test]
     fn new_round_trips() {
-        let h = SegmentHeader::new(Position(42));
+        let h = SegmentHeader::new(Position::new(42));
         let decoded = SegmentHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(decoded, h);
         assert_eq!(decoded.version, SegmentHeader::VERSION);
-        assert_eq!(decoded.base_position, Position(42));
+        assert_eq!(decoded.base_position, Position::new(42));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::thread;
 use dcbdb::Position;
 use dcbdb::event::{Event, EventRef, EventType, Tag, Tags};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
-use dcbdb::query::{Query, QueryItem};
+use dcbdb::query::{Matches, Query, QueryItem};
 use dcbdb::read::{ReadConfig, ReadError};
 use dcbdb::writer::{WriteCoordinator, WriteHandle, WriterConfig};
 use smallvec::SmallVec;

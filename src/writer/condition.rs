@@ -19,7 +19,7 @@ use crate::Position;
 use crate::event::EventRef;
 use crate::index::IndexSet;
 use crate::log::set::SegmentSet;
-use crate::query::AppendCondition;
+use crate::query::{AppendCondition, Matches};
 
 use super::tips::{StagedTips, TagTips, Verdict};
 use super::{AppendError, ConflictSite};

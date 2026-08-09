@@ -1,17 +1,26 @@
 //! A synchronous, blocking TCP client for a dcbdb event store.
 //!
+//! The client speaks clean Rust types: the shared vocabulary from
+//! [`dcbdb-core`](dcbdb_core) ([`Query`], [`QueryItem`], [`AppendCondition`], [`Position`],
+//! [`EventType`], [`Tag`], [`Tags`]) plus a friendly owned [`Event`] and [`SequencedEvent`].
+//! The wire protobuf types are an implementation detail hidden behind these; the raw wire
+//! module is still available as [`proto`] for low-level use, but it is not the API.
+//!
 //! One request is in flight at a time per [`Client`] (the server answers a connection's
-//! requests sequentially); open more clients for concurrency. The client speaks the wire
-//! protobuf types directly ([`proto`]) and never links the storage engine.
+//! requests sequentially); open more clients for concurrency.
 //!
 //! ```no_run
-//! use dcbdb_client::{Client, event, query_all};
+//! use dcbdb_client::{Client, Event, Position, Query};
 //!
-//! let mut client = Client::connect("127.0.0.1:9000").unwrap();
-//! client.append(vec![event("Enrolled", &["course:c1"], b"{}")], None).unwrap();
-//! let (events, _watermark) = client.read_all(query_all(), 0).unwrap();
-//! for sequenced in events {
-//!     println!("{}: {}", sequenced.position(), sequenced.event().r#type().to_str().unwrap());
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut client = Client::connect("127.0.0.1:9000")?;
+//!     client.append([Event::new("Enrolled", &["course:c1"], b"{}")?], None)?;
+//!
+//!     let (events, _watermark) = client.read_all(Query::all(), Position::ZERO)?;
+//!     for sequenced in events {
+//!         println!("{}: {}", sequenced.position(), sequenced.event().event_type());
+//!     }
+//!     Ok(())
 //! }
 //! ```
 
@@ -20,10 +29,18 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::{error, fmt};
 
+use dcbdb_proto::convert as wire;
 use dcbdb_proto::dcbdb as pb;
 use dcbdb_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame, write_frame};
 
-/// The wire protobuf types, re-exported so callers can build and inspect messages.
+/// The shared vocabulary types, re-exported so the client's public API is one coherent set.
+pub use dcbdb_core::{
+    AppendCondition, EventType, NameError, Position, Query, QueryItem, Tag, Tags, TagsError,
+};
+pub use dcbdb_proto::convert::ErrorCode;
+
+/// The raw wire protobuf types, re-exported for low-level use. This is an escape hatch, not
+/// the primary API: prefer the clean types above ([`Event`], [`Query`], and friends).
 pub use dcbdb_proto::dcbdb as proto;
 
 /// The request id the server uses for an error it cannot attribute to a specific request (an
@@ -31,6 +48,126 @@ pub use dcbdb_proto::dcbdb as proto;
 /// so this sentinel never collides with a real one, and such an error is accepted as applying
 /// to the request currently in flight.
 const UNATTRIBUTED_REQUEST_ID: u64 = 0;
+
+// ---------------------------------------------------------------------------
+// Value types
+// ---------------------------------------------------------------------------
+
+/// A friendly owned event: a type, a set of tags, and an opaque payload.
+///
+/// Construct with [`Event::new`], which validates the type and tags through the shared
+/// `dcbdb-core` constructors (the same rules the server enforces).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    event_type: EventType,
+    tags: Tags,
+    payload: Vec<u8>,
+}
+
+impl Event {
+    /// Builds an event, validating the type and tags (non-empty, within the length limit,
+    /// no duplicate tags).
+    pub fn new(
+        event_type: impl AsRef<str>,
+        tags: &[&str],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<Event, BuildError> {
+        let event_type = EventType::new(event_type).map_err(BuildError::Name)?;
+        let mut collected: Vec<Tag> = Vec::with_capacity(tags.len());
+        for tag in tags {
+            collected.push(Tag::new(*tag).map_err(BuildError::Name)?);
+        }
+        let tags = Tags::new(collected).map_err(BuildError::Tags)?;
+        Ok(Event {
+            event_type,
+            tags,
+            payload: payload.into(),
+        })
+    }
+
+    /// The event type.
+    pub fn event_type(&self) -> &str {
+        self.event_type.as_str()
+    }
+
+    /// The tags, in sorted order.
+    pub fn tags(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.tags.iter().map(|tag| tag.as_str())
+    }
+
+    /// The opaque payload bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// An event together with the position it was assigned in the global order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencedEvent {
+    position: Position,
+    event: Event,
+}
+
+impl SequencedEvent {
+    /// The global position of this event (1-based).
+    pub fn position(&self) -> Position {
+        self.position
+    }
+
+    /// The event.
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Consumes this into its owned [`Event`], dropping the position.
+    pub fn into_event(self) -> Event {
+        self.event
+    }
+}
+
+/// The outcome of a successful append: the position range the batch was assigned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppendResult {
+    /// The position of the first event in the batch.
+    pub first: Position,
+    /// The position of the last event in the batch.
+    pub last: Position,
+}
+
+/// One item from a [`SubscribeStream`]: a matching event, or a live-edge marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubEvent {
+    /// A matching event, in ascending position order.
+    Event(SequencedEvent),
+    /// The subscription drained everything up to this watermark and is now tailing live.
+    /// Re-armed: delivered again after each subsequent catch-up burst, watermark
+    /// non-decreasing.
+    CaughtUp(Position),
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Why building an [`Event`] failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BuildError {
+    /// An event type or tag was empty or too long.
+    Name(NameError),
+    /// The tag set contained a duplicate.
+    Tags(TagsError),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BuildError::Name(err) => write!(f, "{err}"),
+            BuildError::Tags(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl error::Error for BuildError {}
 
 /// Why a client operation failed.
 #[derive(Debug)]
@@ -40,15 +177,15 @@ pub enum ClientError {
     /// The server closed the connection where a response was expected.
     UnexpectedEof,
     /// The server sent a response that does not fit the protocol (for example the wrong
-    /// frame kind for the request).
+    /// frame kind for the request, or an event that fails to decode).
     Protocol(String),
     /// The server returned an error response. `retryable` distinguishes an advisory
     /// same-batch append conflict (retry) from a terminal durable one.
     Server {
-        code: pb::ErrorCode,
+        code: ErrorCode,
         message: String,
         retryable: bool,
-        conflict_position: Option<u64>,
+        conflict_position: Option<Position>,
     },
 }
 
@@ -91,6 +228,10 @@ impl From<io::Error> for ClientError {
         ClientError::Frame(FrameError::Io(err))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
 
 /// A connection to a dcbdb server.
 pub struct Client {
@@ -135,19 +276,19 @@ impl Client {
     }
 
     /// Appends `events` as one atomic batch, optionally guarded by `condition`. Blocks until
-    /// the server replies.
+    /// the server replies, returning the position range the batch was assigned.
     pub fn append(
         &mut self,
-        events: Vec<pb::Event>,
-        condition: Option<pb::AppendCondition>,
-    ) -> Result<pb::AppendResponse, ClientError> {
+        events: impl IntoIterator<Item = Event>,
+        condition: Option<AppendCondition>,
+    ) -> Result<AppendResult, ClientError> {
         let id = self.next_id();
         let mut append = pb::AppendRequest::new();
         for event in events {
-            append.events_mut().push(event);
+            append.events_mut().push(event_to_pb(&event));
         }
         if let Some(condition) = condition {
-            append.set_condition(condition);
+            append.set_condition(wire::condition_to_pb(&condition));
         }
         let mut request = pb::Request::new();
         request.set_request_id(id);
@@ -157,7 +298,10 @@ impl Client {
         let response = self.recv()?;
         check_response_id(&response, id)?;
         match response.kind() {
-            pb::response::KindOneof::Append(append) => Ok(append.to_owned()),
+            pb::response::KindOneof::Append(append) => Ok(AppendResult {
+                first: Position::new(append.first()),
+                last: Position::new(append.last()),
+            }),
             pb::response::KindOneof::Error(error) => Err(server_error(error)),
             other => Err(ClientError::Protocol(format!(
                 "unexpected response to append: {other:?}"
@@ -167,11 +311,11 @@ impl Client {
 
     /// Starts a read, returning a streaming iterator over the matching events in ascending
     /// position order. The stream borrows the client until it is dropped.
-    pub fn read(&mut self, query: pb::Query, after: u64) -> Result<ReadStream<'_>, ClientError> {
+    pub fn read(&mut self, query: Query, after: Position) -> Result<ReadStream<'_>, ClientError> {
         let id = self.next_id();
         let mut read = pb::ReadRequest::new();
-        read.set_query(query);
-        read.set_after(after);
+        read.set_query(wire::query_to_pb(&query));
+        read.set_after(after.get());
         let mut request = pb::Request::new();
         request.set_request_id(id);
         request.set_read(read);
@@ -191,9 +335,9 @@ impl Client {
     /// the read was pinned to.
     pub fn read_all(
         &mut self,
-        query: pb::Query,
-        after: u64,
-    ) -> Result<(Vec<pb::SequencedEvent>, u64), ClientError> {
+        query: Query,
+        after: Position,
+    ) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
         let mut stream = self.read(query, after)?;
         let mut events = Vec::new();
         for item in stream.by_ref() {
@@ -217,13 +361,13 @@ impl Client {
     /// down, ending the stream.
     pub fn subscribe(
         &mut self,
-        query: pb::Query,
-        after: u64,
+        query: Query,
+        after: Position,
     ) -> Result<(SubscribeStream<'_>, SubscribeCancel), ClientError> {
         let id = self.next_id();
         let mut subscribe = pb::SubscribeRequest::new();
-        subscribe.set_query(query);
-        subscribe.set_after(after);
+        subscribe.set_query(wire::query_to_pb(&query));
+        subscribe.set_after(after.get());
         let mut request = pb::Request::new();
         request.set_request_id(id);
         request.set_subscribe(subscribe);
@@ -249,16 +393,9 @@ impl Client {
     }
 }
 
-/// One item from a [`SubscribeStream`]: a matching event, or a live-edge marker.
-#[derive(Clone, Debug)]
-pub enum SubEvent {
-    /// A matching event, in ascending position order.
-    Event(pb::SequencedEvent),
-    /// The subscription drained everything up to this watermark and is now tailing live.
-    /// Re-armed: delivered again after each subsequent catch-up burst, watermark
-    /// non-decreasing.
-    CaughtUp(u64),
-}
+// ---------------------------------------------------------------------------
+// Subscription stream
+// ---------------------------------------------------------------------------
 
 /// A `Send` handle that stops a [`SubscribeStream`] from another thread by shutting down the
 /// connection. A subscription otherwise never ends on its own, and the stream borrows the
@@ -311,7 +448,7 @@ impl SubscribeStream<'_> {
                 pb::response::KindOneof::ReadEvents(events) => {
                     for sequenced in events.events().iter() {
                         self.buffered
-                            .push_back(SubEvent::Event(sequenced.to_owned()));
+                            .push_back(SubEvent::Event(sequenced_from_pb(sequenced)?));
                     }
                     if !self.buffered.is_empty() {
                         return Ok(());
@@ -320,7 +457,7 @@ impl SubscribeStream<'_> {
                 }
                 pb::response::KindOneof::CaughtUp(caught_up) => {
                     self.buffered
-                        .push_back(SubEvent::CaughtUp(caught_up.watermark()));
+                        .push_back(SubEvent::CaughtUp(Position::new(caught_up.watermark())));
                     return Ok(());
                 }
                 pb::response::KindOneof::Error(error) => {
@@ -358,6 +495,10 @@ impl Iterator for SubscribeStream<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read stream
+// ---------------------------------------------------------------------------
+
 /// A streaming iterator over the events of one read. Yields events in ascending position
 /// order, then ends; [`watermark`](ReadStream::watermark) is available once the stream has
 /// finished (it is carried on the terminating frame).
@@ -365,14 +506,14 @@ pub struct ReadStream<'a> {
     reader: &'a mut BufReader<TcpStream>,
     max_frame_len: u32,
     request_id: u64,
-    buffered: VecDeque<pb::SequencedEvent>,
-    watermark: Option<u64>,
+    buffered: VecDeque<SequencedEvent>,
+    watermark: Option<Position>,
     done: bool,
 }
 
 impl ReadStream<'_> {
     /// The watermark this read was pinned to, once the stream has reached its end.
-    pub fn watermark(&self) -> Option<u64> {
+    pub fn watermark(&self) -> Option<Position> {
         self.watermark
     }
 
@@ -392,7 +533,7 @@ impl ReadStream<'_> {
             match response.kind() {
                 pb::response::KindOneof::ReadEvents(events) => {
                     for sequenced in events.events().iter() {
-                        self.buffered.push_back(sequenced.to_owned());
+                        self.buffered.push_back(sequenced_from_pb(sequenced)?);
                     }
                     if !self.buffered.is_empty() {
                         return Ok(());
@@ -400,7 +541,7 @@ impl ReadStream<'_> {
                     // An empty batch is unusual but not an error: keep reading.
                 }
                 pb::response::KindOneof::ReadEnd(end) => {
-                    self.watermark = Some(end.watermark());
+                    self.watermark = Some(Position::new(end.watermark()));
                     self.done = true;
                     return Ok(());
                 }
@@ -417,9 +558,7 @@ impl ReadStream<'_> {
             }
         }
     }
-}
 
-impl ReadStream<'_> {
     /// Consumes and discards any remaining response frames through the read's terminator, so
     /// a partially-consumed read does not leave frames in the socket for the next request to
     /// mistake as its own. Best-effort: a transport error simply ends the drain.
@@ -443,7 +582,7 @@ impl ReadStream<'_> {
 }
 
 impl Iterator for ReadStream<'_> {
-    type Item = Result<pb::SequencedEvent, ClientError>;
+    type Item = Result<SequencedEvent, ClientError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(sequenced) = self.buffered.pop_front() {
@@ -472,6 +611,42 @@ impl Drop for ReadStream<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversions and helpers
+// ---------------------------------------------------------------------------
+
+/// Builds a wire [`Event`](pb::Event) from a friendly [`Event`].
+fn event_to_pb(event: &Event) -> pb::Event {
+    let mut out = pb::Event::new();
+    out.set_type(event.event_type.as_str());
+    for tag in event.tags.iter() {
+        out.tags_mut().push(tag.as_str());
+    }
+    out.set_payload(&event.payload);
+    out
+}
+
+/// Builds a friendly [`SequencedEvent`] from a wire view, validating the event through the
+/// shared constructors. A malformed event from the server is a protocol error.
+fn sequenced_from_pb(view: pb::SequencedEventView<'_>) -> Result<SequencedEvent, ClientError> {
+    let position = Position::new(view.position());
+    let ev = view.event();
+    let event_type = EventType::new(wire::as_str(ev.r#type()).map_err(protocol)?)
+        .map_err(|err| ClientError::Protocol(format!("server sent an invalid event type: {err}")))?;
+    let tags = wire::tags_from_pb(ev.tags().iter()).map_err(protocol)?;
+    let event = Event {
+        event_type,
+        tags,
+        payload: ev.payload().to_vec(),
+    };
+    Ok(SequencedEvent { position, event })
+}
+
+/// Maps a wire conversion failure (invalid UTF-8, name, or tags) to a protocol error.
+fn protocol(err: wire::ConvertError) -> ClientError {
+    ClientError::Protocol(format!("server sent a malformed event: {err}"))
+}
+
 /// Verifies a response echoes the request's id, catching a desynced connection loudly rather
 /// than returning another request's data.
 fn check_response_id(response: &pb::Response, expected: u64) -> Result<(), ClientError> {
@@ -486,62 +661,11 @@ fn check_response_id(response: &pb::Response, expected: u64) -> Result<(), Clien
 
 fn server_error(error: pb::ErrorResponseView<'_>) -> ClientError {
     ClientError::Server {
-        code: error.code(),
+        code: ErrorCode::from(error.code()),
         message: error.message().to_str().unwrap_or_default().to_string(),
         retryable: error.retryable(),
         conflict_position: error
             .has_conflict_position()
-            .then(|| error.conflict_position()),
+            .then(|| Position::new(error.conflict_position())),
     }
-}
-
-// --- ergonomic builders ---
-
-/// Builds a wire [`Event`](pb::Event) from primitives.
-pub fn event(ty: &str, tags: &[&str], payload: &[u8]) -> pb::Event {
-    let mut event = pb::Event::new();
-    event.set_type(ty);
-    for tag in tags {
-        event.tags_mut().push(*tag);
-    }
-    event.set_payload(payload);
-    event
-}
-
-/// The catch-all query, matching every event.
-pub fn query_all() -> pb::Query {
-    let mut query = pb::Query::new();
-    query.set_all(true);
-    query
-}
-
-/// A query over a set of items, OR'd together.
-pub fn query_items(items: Vec<pb::QueryItem>) -> pb::Query {
-    let mut query = pb::Query::new();
-    for item in items {
-        query.items_mut().push(item);
-    }
-    query
-}
-
-/// A single query item: an event matches if its type is one of `types` (empty means any)
-/// and its tags contain all of `tags`.
-pub fn query_item(types: &[&str], tags: &[&str]) -> pb::QueryItem {
-    let mut item = pb::QueryItem::new();
-    for ty in types {
-        item.types_mut().push(*ty);
-    }
-    for tag in tags {
-        item.tags_mut().push(*tag);
-    }
-    item
-}
-
-/// An append condition: reject if any event after `after` matches `query` (`after` = 0 means
-/// the whole log).
-pub fn condition(query: pb::Query, after: u64) -> pb::AppendCondition {
-    let mut condition = pb::AppendCondition::new();
-    condition.set_fail_if_events_match(query);
-    condition.set_after(after);
-    condition
 }

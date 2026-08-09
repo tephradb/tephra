@@ -58,7 +58,7 @@ use crate::index::{
     Access, ActiveTail, IndexSegment, SegmentIndex, choose, estimate_matches, search,
 };
 use crate::log::set::{LogError, Record, Scan, Segment, SegmentSet, SegmentSource};
-use crate::query::Query;
+use crate::query::{Matches, Query};
 
 use crate::index::IndexSet;
 

@@ -11,7 +11,7 @@ use dcbdb::Position;
 use dcbdb::event::{Event, EventRef, EventType, Tag, Tags};
 use dcbdb::index::{ActiveTail, IndexSet, search};
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
-use dcbdb::query::{Query, QueryItem};
+use dcbdb::query::{Matches, Query, QueryItem};
 use smallvec::SmallVec;
 use tempfile::TempDir;
 

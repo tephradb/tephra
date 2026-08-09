@@ -1,14 +1,16 @@
 pub mod event;
 pub mod index;
 pub mod log;
-pub mod position;
 pub mod query;
 pub mod read;
 pub mod writer;
 
-pub use event::{Event, EventRef, EventType, Tag, Tags};
+pub use dcbdb_core::{
+    AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
+    TagsError,
+};
+pub use event::{Event, EventRef};
 pub use log::set::PositionRange;
-pub use position::Position;
-pub use query::{AppendCondition, Query, QueryItem};
+pub use query::Matches;
 pub use read::{ReadConfig, ReadError, ReadHandle, Subscription, WaitOutcome};
 pub use writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};

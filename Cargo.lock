@@ -356,6 +356,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "dashmap",
+ "dcbdb-core",
  "flume",
  "fst",
  "seglog",
@@ -371,14 +372,23 @@ dependencies = [
 name = "dcbdb-client"
 version = "0.1.0"
 dependencies = [
+ "dcbdb-core",
  "dcbdb-proto",
- "protobuf",
+]
+
+[[package]]
+name = "dcbdb-core"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]
 name = "dcbdb-proto"
 version = "0.1.0"
 dependencies = [
+ "dcbdb-core",
  "protobuf",
  "protobuf-codegen",
 ]

@@ -1,37 +1,33 @@
 //! Translation between the wire protobuf types ([`dcbdb_proto`]) and the in-process dcbdb
-//! types. This is the only place that touches both sides, so the proto crate stays free of
-//! any dcbdb dependency.
+//! types. The shared vocabulary conversions ([`Query`]/[`AppendCondition`]) are delegated to
+//! [`dcbdb_proto::convert`]; this module adds the engine-specific pieces: building the packed
+//! [`Event`] codec from the wire, projecting an [`EventRef`] back to the wire, and mapping the
+//! engine's [`AppendError`] to a wire error response.
 
 use std::{error, fmt};
 
 use dcbdb::Position;
-use dcbdb::event::{EncodeError, Event, EventRef, EventType, NameError, Tag, Tags, TagsError};
-use dcbdb::query::{AppendCondition, Query, QueryItem};
+use dcbdb::event::{EncodeError, Event, EventRef, EventType};
+use dcbdb::query::{AppendCondition, Query};
 use dcbdb::writer::{AppendError, ConflictSite};
 
+use dcbdb_proto::convert as wire;
 use dcbdb_proto::dcbdb as pb;
 
 /// Why a client's request could not be turned into valid dcbdb input. Every variant is a
 /// client error (mapped to `BAD_REQUEST`), never an internal failure.
 #[derive(Debug)]
 pub enum ConvertError {
-    /// A string field was not valid UTF-8 (possible since the kernel does not validate it
-    /// on parse for every field).
-    InvalidUtf8,
-    /// An event type or tag was empty or too long.
-    Name(NameError),
-    /// A tag set contained a duplicate.
-    Tags(TagsError),
-    /// The event could not be encoded (too many tags, or too large).
+    /// A vocabulary field (query, tag, type, condition) was malformed.
+    Wire(wire::ConvertError),
+    /// The event could not be encoded into the packed codec (too many tags, or too large).
     Encode(EncodeError),
 }
 
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConvertError::InvalidUtf8 => write!(f, "string field is not valid utf-8"),
-            ConvertError::Name(err) => write!(f, "invalid name: {err}"),
-            ConvertError::Tags(err) => write!(f, "invalid tags: {err}"),
+            ConvertError::Wire(err) => write!(f, "{err}"),
             ConvertError::Encode(err) => write!(f, "invalid event: {err}"),
         }
     }
@@ -39,20 +35,18 @@ impl fmt::Display for ConvertError {
 
 impl error::Error for ConvertError {}
 
-/// Reads a protobuf string view as `&str`, rejecting invalid UTF-8.
-fn as_str(view: &protobuf::ProtoStr) -> Result<&str, ConvertError> {
-    view.to_str().map_err(|_| ConvertError::InvalidUtf8)
+impl From<wire::ConvertError> for ConvertError {
+    fn from(err: wire::ConvertError) -> Self {
+        ConvertError::Wire(err)
+    }
 }
 
-/// Builds a dcbdb [`Event`] from a wire event view, validating type, tags, and size through
-/// dcbdb's own constructors (no validation is re-implemented here).
+/// Builds a dcbdb packed [`Event`] from a wire event view, validating type, tags, and size
+/// through dcbdb's own constructors (no validation is re-implemented here).
 pub fn event_from_proto(ev: pb::EventView<'_>) -> Result<Event, ConvertError> {
-    let ty = EventType::new(as_str(ev.r#type())?).map_err(ConvertError::Name)?;
-    let mut tags: Vec<Tag> = Vec::with_capacity(ev.tags().len());
-    for tag in ev.tags().iter() {
-        tags.push(Tag::new(as_str(tag)?).map_err(ConvertError::Name)?);
-    }
-    let tags = Tags::new(tags).map_err(ConvertError::Tags)?;
+    let ty = EventType::new(wire::as_str(ev.r#type())?)
+        .map_err(|err| ConvertError::Wire(wire::ConvertError::Name(err)))?;
+    let tags = wire::tags_from_pb(ev.tags().iter())?;
     Event::new(&ty, &tags, ev.payload()).map_err(ConvertError::Encode)
 }
 
@@ -65,34 +59,16 @@ pub fn events_from_proto(append: pb::AppendRequestView<'_>) -> Result<Vec<Event>
     Ok(events)
 }
 
-/// Builds a dcbdb [`Query`] from a wire query view. `all` maps to [`Query::All`]; otherwise
-/// the items are OR'd (an empty item set matches nothing, per the spec).
+/// Builds a dcbdb [`Query`] from a wire query view.
 pub fn query_from_proto(query: pb::QueryView<'_>) -> Result<Query, ConvertError> {
-    if query.all() {
-        return Ok(Query::All);
-    }
-    let mut items = Vec::with_capacity(query.items().len());
-    for item in query.items().iter() {
-        let mut types: Vec<EventType> = Vec::with_capacity(item.types().len());
-        for ty in item.types().iter() {
-            types.push(EventType::new(as_str(ty)?).map_err(ConvertError::Name)?);
-        }
-        let mut tags: Vec<Tag> = Vec::with_capacity(item.tags().len());
-        for tag in item.tags().iter() {
-            tags.push(Tag::new(as_str(tag)?).map_err(ConvertError::Name)?);
-        }
-        let tags = Tags::new(tags).map_err(ConvertError::Tags)?;
-        items.push(QueryItem::new(types, tags));
-    }
-    Ok(Query::items(items))
+    Ok(wire::query_from_pb(query)?)
 }
 
 /// Builds an [`AppendCondition`] from a wire condition view.
 pub fn condition_from_proto(
     condition: pb::AppendConditionView<'_>,
 ) -> Result<AppendCondition, ConvertError> {
-    let query = query_from_proto(condition.fail_if_events_match())?;
-    Ok(AppendCondition::new(query).after(Position::new(condition.after())))
+    Ok(wire::condition_from_pb(condition)?)
 }
 
 /// Builds a wire [`SequencedEvent`](pb::SequencedEvent) from a dcbdb position and event view.

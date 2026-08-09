@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/seglog",
+    "crates/dcbdb-core",
     "crates/dcbdb-proto",
     "crates/dcbdb-server",
     "crates/dcbdb-client",
@@ -14,11 +15,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dcbdb-core = { path = "crates/dcbdb-core" }
+seglog = { path = "crates/seglog" }
+
 crc32fast = "1.5"
 dashmap = "6.2.1"
 flume = { version = "0.12", default-features = false }
 fst = { version = "0.4.7", default-features = false }
-seglog = { path = "crates/seglog" }
 smallvec = "1"
 thiserror = "2.0"
 tracing = { version = "0.1", optional = true }

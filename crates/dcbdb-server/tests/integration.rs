@@ -1,7 +1,8 @@
 //! End-to-end tests over a real socket: a `dcbdb-server` bound to an ephemeral port, driven
 //! by the blocking `dcbdb-client`.
 
-use std::net::SocketAddr;
+use std::io::{BufReader, BufWriter, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -10,8 +11,10 @@ use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::writer::{WriteCoordinator, WriterConfig};
 
 use dcbdb_client::{
-    Client, ClientError, SubEvent, condition, event, proto, query_all, query_item, query_items,
+    AppendCondition, Client, ClientError, ErrorCode, Event, Position, Query, QueryItem,
+    SequencedEvent, SubEvent, Tag, Tags,
 };
+use dcbdb_proto::{DEFAULT_MAX_FRAME_LEN, dcbdb as pb, read_frame, write_frame};
 use dcbdb_server::{Server, ServerConfig, ShutdownHandle};
 use tempfile::TempDir;
 
@@ -71,16 +74,45 @@ impl Drop for TestServer {
     }
 }
 
+// --- test helpers (build clean-typed values) ---
+
+/// Builds a validated event.
+fn ev(ty: &str, tags: &[&str], payload: &[u8]) -> Event {
+    Event::new(ty, tags, payload).unwrap()
+}
+
+/// A validated tag set.
+fn tag_set(tags: &[&str]) -> Tags {
+    Tags::new(
+        tags.iter()
+            .map(|tag| Tag::new(*tag).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+/// A query matching events that carry all of `tags` (any type).
+fn tag_query(tags: &[&str]) -> Query {
+    Query::item(QueryItem::with_tags(tag_set(tags)))
+}
+
+/// The uniqueness guard over `tags`: fail if any event already carries all of them.
+fn tag_condition(tags: &[&str]) -> AppendCondition {
+    AppendCondition::new(tag_query(tags))
+}
+
+/// The positions of a batch of sequenced events as plain `u64`s.
+fn positions(events: &[SequencedEvent]) -> Vec<u64> {
+    events.iter().map(|e| e.position().get()).collect()
+}
+
 /// Collects a sequenced event's fields into owned, comparable values.
-fn fields(sequenced: &proto::SequencedEvent) -> (u64, String, Vec<String>, Vec<u8>) {
+fn fields(sequenced: &SequencedEvent) -> (u64, String, Vec<String>, Vec<u8>) {
     let ev = sequenced.event();
     (
-        sequenced.position(),
-        ev.r#type().to_str().unwrap().to_string(),
-        ev.tags()
-            .iter()
-            .map(|t| t.to_str().unwrap().to_string())
-            .collect(),
+        sequenced.position().get(),
+        ev.event_type().to_string(),
+        ev.tags().map(str::to_string).collect(),
         ev.payload().to_vec(),
     )
 }
@@ -92,23 +124,19 @@ fn append_then_read_round_trips_events() {
 
     let range = client
         .append(
-            vec![event(
-                "Enrolled",
-                &["course:c1", "student:s1"],
-                b"payload-1",
-            )],
+            [ev("Enrolled", &["course:c1", "student:s1"], b"payload-1")],
             None,
         )
         .unwrap();
-    assert_eq!(range.first(), 1);
-    assert_eq!(range.last(), 1);
+    assert_eq!(range.first.get(), 1);
+    assert_eq!(range.last.get(), 1);
 
     client
-        .append(vec![event("Renamed", &["course:c1"], b"payload-2")], None)
+        .append([ev("Renamed", &["course:c1"], b"payload-2")], None)
         .unwrap();
 
-    let (events, watermark) = client.read_all(query_all(), 0).unwrap();
-    assert_eq!(watermark, 2);
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    assert_eq!(watermark.get(), 2);
     assert_eq!(events.len(), 2);
 
     let (pos, ty, tags, payload) = fields(&events[0]);
@@ -127,21 +155,14 @@ fn append_then_read_round_trips_events() {
 fn tag_query_filters_the_read() {
     let ts = TestServer::start();
     let mut client = ts.client();
-    client
-        .append(vec![event("A", &["course:c1"], b"")], None)
-        .unwrap();
-    client
-        .append(vec![event("B", &["course:c2"], b"")], None)
-        .unwrap();
-    client
-        .append(vec![event("C", &["course:c1"], b"")], None)
-        .unwrap();
+    client.append([ev("A", &["course:c1"], b"")], None).unwrap();
+    client.append([ev("B", &["course:c2"], b"")], None).unwrap();
+    client.append([ev("C", &["course:c1"], b"")], None).unwrap();
 
     let (events, _) = client
-        .read_all(query_items(vec![query_item(&[], &["course:c1"])]), 0)
+        .read_all(tag_query(&["course:c1"]), Position::ZERO)
         .unwrap();
-    let positions: Vec<u64> = events.iter().map(|e| e.position()).collect();
-    assert_eq!(positions, vec![1, 3]);
+    assert_eq!(positions(&events), vec![1, 3]);
 }
 
 #[test]
@@ -150,28 +171,25 @@ fn read_after_skips_the_prefix() {
     let mut client = ts.client();
     for i in 0..5 {
         client
-            .append(vec![event("E", &[&format!("k:{i}")], b"")], None)
+            .append([ev("E", &[&format!("k:{i}")], b"")], None)
             .unwrap();
     }
 
-    let (events, watermark) = client.read_all(query_all(), 2).unwrap();
-    let positions: Vec<u64> = events.iter().map(|e| e.position()).collect();
-    assert_eq!(positions, vec![3, 4, 5]);
-    assert_eq!(watermark, 5);
+    let (events, watermark) = client.read_all(Query::all(), Position::new(2)).unwrap();
+    assert_eq!(positions(&events), vec![3, 4, 5]);
+    assert_eq!(watermark.get(), 5);
 }
 
 #[test]
 fn empty_read_yields_only_a_watermark() {
     let ts = TestServer::start();
     let mut client = ts.client();
-    client
-        .append(vec![event("E", &["k:1"], b"")], None)
-        .unwrap();
+    client.append([ev("E", &["k:1"], b"")], None).unwrap();
 
     // Nothing after the tip.
-    let (events, watermark) = client.read_all(query_all(), 1).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::new(1)).unwrap();
     assert!(events.is_empty());
-    assert_eq!(watermark, 1);
+    assert_eq!(watermark.get(), 1);
 }
 
 #[test]
@@ -180,19 +198,17 @@ fn durable_append_conflict_is_reported_and_not_retryable() {
     let mut client = ts.client();
 
     // Reserve a unique username, guarded so a second identical reservation fails.
-    let guard = condition(query_items(vec![query_item(&[], &["username:alice"])]), 0);
     client
         .append(
-            vec![event("Reserved", &["username:alice"], b"{}")],
-            Some(guard),
+            [ev("Reserved", &["username:alice"], b"{}")],
+            Some(tag_condition(&["username:alice"])),
         )
         .unwrap();
 
-    let guard = condition(query_items(vec![query_item(&[], &["username:alice"])]), 0);
     let err = client
         .append(
-            vec![event("Reserved", &["username:alice"], b"{}")],
-            Some(guard),
+            [ev("Reserved", &["username:alice"], b"{}")],
+            Some(tag_condition(&["username:alice"])),
         )
         .unwrap_err();
     match err {
@@ -202,32 +218,46 @@ fn durable_append_conflict_is_reported_and_not_retryable() {
             conflict_position,
             ..
         } => {
-            assert_eq!(code, proto::ErrorCode::Conflict);
+            assert_eq!(code, ErrorCode::Conflict);
             assert!(!retryable, "a durable conflict is terminal");
-            assert_eq!(conflict_position, Some(1));
+            assert_eq!(conflict_position, Some(Position::new(1)));
         }
         other => panic!("expected a server conflict, got {other:?}"),
     }
 }
 
 #[test]
-fn invalid_request_maps_to_bad_request_and_empty_maps_to_empty() {
+fn malformed_wire_event_maps_to_bad_request() {
+    // The clean client validates before sending, so a malformed event cannot go through
+    // `append`. A hand-built wire frame with an empty event type exercises the server's
+    // BAD_REQUEST path directly (defense in depth for other, non-validating clients).
+    let ts = TestServer::start();
+
+    let mut event = pb::Event::new();
+    event.set_type(""); // empty type: rejected by dcbdb's own constructor server-side.
+    event.tags_mut().push("k:1");
+    let mut append = pb::AppendRequest::new();
+    append.events_mut().push(event);
+    let mut request = pb::Request::new();
+    request.set_request_id(1);
+    request.set_append(append);
+
+    let response = send_raw_request(ts.addr, &request);
+    match response.kind() {
+        pb::response::KindOneof::Error(err) => assert_eq!(err.code(), pb::ErrorCode::BadRequest),
+        other => panic!("expected a bad-request error, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_append_maps_to_empty() {
     let ts = TestServer::start();
     let mut client = ts.client();
 
-    // An empty event type is rejected by dcbdb's constructor -> BAD_REQUEST.
-    let err = client
-        .append(vec![event("", &["k:1"], b"")], None)
-        .unwrap_err();
-    match err {
-        ClientError::Server { code, .. } => assert_eq!(code, proto::ErrorCode::BadRequest),
-        other => panic!("expected bad request, got {other:?}"),
-    }
-
     // An append with no events -> EMPTY.
-    let err = client.append(vec![], None).unwrap_err();
+    let err = client.append(Vec::new(), None).unwrap_err();
     match err {
-        ClientError::Server { code, .. } => assert_eq!(code, proto::ErrorCode::Empty),
+        ClientError::Server { code, .. } => assert_eq!(code, ErrorCode::Empty),
         other => panic!("expected empty, got {other:?}"),
     }
 }
@@ -253,15 +283,14 @@ fn large_streamed_read_returns_every_event_in_order() {
     let total = 200u64;
     for i in 0..total {
         client
-            .append(vec![event("E", &[&format!("n:{i}")], b"x")], None)
+            .append([ev("E", &[&format!("n:{i}")], b"x")], None)
             .unwrap();
     }
 
-    let (events, watermark) = client.read_all(query_all(), 0).unwrap();
-    assert_eq!(watermark, total);
-    let positions: Vec<u64> = events.iter().map(|e| e.position()).collect();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    assert_eq!(watermark.get(), total);
     let expected: Vec<u64> = (1..=total).collect();
-    assert_eq!(positions, expected);
+    assert_eq!(positions(&events), expected);
 }
 
 #[test]
@@ -270,18 +299,18 @@ fn streaming_read_iterator_yields_incrementally() {
     let mut client = ts.client();
     for i in 0..10 {
         client
-            .append(vec![event("E", &[&format!("k:{i}")], b"")], None)
+            .append([ev("E", &[&format!("k:{i}")], b"")], None)
             .unwrap();
     }
 
-    let mut stream = client.read(query_all(), 0).unwrap();
+    let mut stream = client.read(Query::all(), Position::ZERO).unwrap();
     let mut count = 0;
     for item in stream.by_ref() {
         item.unwrap();
         count += 1;
     }
     assert_eq!(count, 10);
-    assert_eq!(stream.watermark(), Some(10));
+    assert_eq!(stream.watermark(), Some(Position::new(10)));
 }
 
 #[test]
@@ -298,22 +327,21 @@ fn dropping_a_read_early_keeps_the_connection_usable() {
     let mut client = ts.client();
     for i in 0..20 {
         client
-            .append(vec![event("E", &[&format!("k:{i}")], b"")], None)
+            .append([ev("E", &[&format!("k:{i}")], b"")], None)
             .unwrap();
     }
 
     {
-        let mut stream = client.read(query_all(), 0).unwrap();
+        let mut stream = client.read(Query::all(), Position::ZERO).unwrap();
         let first = stream.next().unwrap().unwrap();
-        assert_eq!(first.position(), 1);
+        assert_eq!(first.position().get(), 1);
         // `stream` is dropped here, mid-read, with 19 events plus the terminator unread.
     }
 
     // The next read on the same connection returns complete, correct results.
-    let (events, watermark) = client.read_all(query_all(), 0).unwrap();
-    assert_eq!(watermark, 20);
-    let positions: Vec<u64> = events.iter().map(|e| e.position()).collect();
-    assert_eq!(positions, (1..=20).collect::<Vec<_>>());
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    assert_eq!(watermark.get(), 20);
+    assert_eq!(positions(&events), (1..=20).collect::<Vec<_>>());
 }
 
 #[test]
@@ -328,11 +356,9 @@ fn oversized_request_gets_a_too_large_error_not_a_disconnect() {
     let mut client = ts.client();
 
     let big = vec![b'x'; 256];
-    let err = client
-        .append(vec![event("E", &["k:1"], &big)], None)
-        .unwrap_err();
+    let err = client.append([ev("E", &["k:1"], &big)], None).unwrap_err();
     match err {
-        ClientError::Server { code, .. } => assert_eq!(code, proto::ErrorCode::TooLarge),
+        ClientError::Server { code, .. } => assert_eq!(code, ErrorCode::TooLarge),
         other => panic!("expected a TooLarge server error, got {other:?}"),
     }
 }
@@ -351,11 +377,7 @@ fn concurrent_clients_stay_consistent() {
                 for i in 0..per_thread {
                     client
                         .append(
-                            vec![event(
-                                "Appended",
-                                &[&format!("t:{t}"), &format!("i:{i}")],
-                                b"",
-                            )],
+                            [ev("Appended", &[&format!("t:{t}"), &format!("i:{i}")], b"")],
                             None,
                         )
                         .unwrap();
@@ -368,14 +390,14 @@ fn concurrent_clients_stay_consistent() {
     }
 
     let mut client = ts.client();
-    let (events, watermark) = client.read_all(query_all(), 0).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
     let total = threads * per_thread;
-    assert_eq!(watermark, total);
+    assert_eq!(watermark.get(), total);
     assert_eq!(events.len() as u64, total);
     // Positions are dense 1..=total regardless of interleaving.
-    let mut positions: Vec<u64> = events.iter().map(|e| e.position()).collect();
-    positions.sort_unstable();
-    assert_eq!(positions, (1..=total).collect::<Vec<_>>());
+    let mut sorted = positions(&events);
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=total).collect::<Vec<_>>());
 }
 
 #[test]
@@ -383,9 +405,7 @@ fn graceful_shutdown_stops_accepting_and_returns() {
     let ts = TestServer::start();
     let addr = ts.addr;
     let mut client = ts.client();
-    client
-        .append(vec![event("E", &["k:1"], b"")], None)
-        .unwrap();
+    client.append([ev("E", &["k:1"], b"")], None).unwrap();
 
     // Signal shutdown; the accept loop stops and `run` returns (joined by Drop), which drops
     // the listener and closes the port.
@@ -396,9 +416,7 @@ fn graceful_shutdown_stops_accepting_and_returns() {
     // fails: either way the server no longer accepts work.
     let refused = match Client::connect(addr) {
         Err(_) => true,
-        Ok(mut client) => client
-            .append(vec![event("E", &["k:2"], b"")], None)
-            .is_err(),
+        Ok(mut client) => client.append([ev("E", &["k:2"], b"")], None).is_err(),
     };
     assert!(refused, "server should refuse work after shutdown");
 }
@@ -410,8 +428,8 @@ fn graceful_shutdown_stops_accepting_and_returns() {
 /// test can stop it. Returns the join handle carrying nothing (results flow over `items`).
 fn spawn_subscriber(
     mut client: Client,
-    query: proto::Query,
-    after: u64,
+    query: Query,
+    after: Position,
     items: mpsc::Sender<Result<SubEvent, String>>,
     cancel: mpsc::Sender<dcbdb_client::SubscribeCancel>,
 ) -> JoinHandle<()> {
@@ -440,16 +458,12 @@ fn subscribe_streams_catch_up_then_live() {
 
     // Two events already durable before the subscription starts.
     let mut appender = ts.client();
-    appender
-        .append(vec![event("E", &["k:1"], b"a")], None)
-        .unwrap();
-    appender
-        .append(vec![event("E", &["k:1"], b"b")], None)
-        .unwrap();
+    appender.append([ev("E", &["k:1"], b"a")], None).unwrap();
+    appender.append([ev("E", &["k:1"], b"b")], None).unwrap();
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
     let cancel = cancel_rx.recv().unwrap();
 
     let mut positions = Vec::new();
@@ -458,23 +472,19 @@ fn subscribe_streams_catch_up_then_live() {
     // Catch-up phase: the two pre-appended events arrive in order.
     while positions.len() < 2 {
         match item_rx.recv().unwrap() {
-            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position().get()),
             Ok(SubEvent::CaughtUp(w)) => caught_up.push(w),
             Err(err) => panic!("subscription error: {err}"),
         }
     }
 
     // Live phase: two more appended after the subscription is running.
-    appender
-        .append(vec![event("E", &["k:1"], b"c")], None)
-        .unwrap();
-    appender
-        .append(vec![event("E", &["k:1"], b"d")], None)
-        .unwrap();
+    appender.append([ev("E", &["k:1"], b"c")], None).unwrap();
+    appender.append([ev("E", &["k:1"], b"d")], None).unwrap();
 
     while positions.len() < 4 {
         match item_rx.recv().unwrap() {
-            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position().get()),
             Ok(SubEvent::CaughtUp(w)) => caught_up.push(w),
             Err(err) => panic!("subscription error: {err}"),
         }
@@ -504,20 +514,21 @@ fn subscribe_from_mid_position_skips_the_prefix() {
     let mut appender = ts.client();
     for i in 0..4 {
         appender
-            .append(vec![event("E", &[&format!("k:{i}")], b"")], None)
+            .append([ev("E", &[&format!("k:{i}")], b"")], None)
             .unwrap();
     }
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     // Resume after position 2: only 3 and 4 should arrive.
-    let subscriber = spawn_subscriber(ts.client(), query_all(), 2, item_tx, cancel_tx);
+    let subscriber =
+        spawn_subscriber(ts.client(), Query::all(), Position::new(2), item_tx, cancel_tx);
     let cancel = cancel_rx.recv().unwrap();
 
     let mut positions = Vec::new();
     while positions.len() < 2 {
         match item_rx.recv().unwrap() {
-            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position().get()),
             Ok(SubEvent::CaughtUp(_)) => {}
             Err(err) => panic!("subscription error: {err}"),
         }
@@ -532,18 +543,16 @@ fn subscribe_from_mid_position_skips_the_prefix() {
 fn cancel_ends_a_live_subscription() {
     let ts = TestServer::start();
     let mut appender = ts.client();
-    appender
-        .append(vec![event("E", &["k:1"], b"")], None)
-        .unwrap();
+    appender.append([ev("E", &["k:1"], b"")], None).unwrap();
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
     let cancel = cancel_rx.recv().unwrap();
 
     // Receive the one durable event.
     match item_rx.recv().unwrap() {
-        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position(), 1),
+        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position().get(), 1),
         other => panic!("expected the first event, got {other:?}"),
     }
 
@@ -566,11 +575,11 @@ fn idle_subscription_does_not_flood_caught_up_frames() {
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     // Empty store: the subscription is immediately caught up.
-    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
     let cancel = cancel_rx.recv().unwrap();
 
     match item_rx.recv().unwrap() {
-        Ok(SubEvent::CaughtUp(w)) => assert_eq!(w, 0),
+        Ok(SubEvent::CaughtUp(w)) => assert_eq!(w.get(), 0),
         other => panic!("expected a caught-up marker, got {other:?}"),
     }
 
@@ -583,19 +592,17 @@ fn idle_subscription_does_not_flood_caught_up_frames() {
 
     // Still live: an append is delivered, followed by exactly one re-armed caught-up marker.
     let mut appender = ts.client();
-    appender
-        .append(vec![event("E", &["k:1"], b"")], None)
-        .unwrap();
+    appender.append([ev("E", &["k:1"], b"")], None).unwrap();
     let mut saw_event = false;
     let mut saw_caught_up = false;
     for _ in 0..2 {
         match item_rx.recv().unwrap() {
             Ok(SubEvent::Event(ev)) => {
-                assert_eq!(ev.position(), 1);
+                assert_eq!(ev.position().get(), 1);
                 saw_event = true;
             }
             Ok(SubEvent::CaughtUp(w)) => {
-                assert_eq!(w, 1);
+                assert_eq!(w.get(), 1);
                 saw_caught_up = true;
             }
             Err(err) => panic!("subscription error: {err}"),
@@ -614,18 +621,16 @@ fn idle_subscription_does_not_flood_caught_up_frames() {
 fn server_shutdown_ends_an_idle_subscription() {
     let ts = TestServer::start();
     let mut appender = ts.client();
-    appender
-        .append(vec![event("E", &["k:1"], b"")], None)
-        .unwrap();
+    appender.append([ev("E", &["k:1"], b"")], None).unwrap();
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
     let _cancel = cancel_rx.recv().unwrap();
 
     // Drain the one event so the subscription is parked at the live edge (idle).
     match item_rx.recv().unwrap() {
-        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position(), 1),
+        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position().get(), 1),
         other => panic!("expected the first event, got {other:?}"),
     }
 
@@ -633,4 +638,18 @@ fn server_shutdown_ends_an_idle_subscription() {
     // must end promptly rather than hang the connection thread.
     drop(ts);
     subscriber.join().unwrap();
+}
+
+/// Sends one hand-built wire request over a fresh connection and returns the first response,
+/// bypassing the clean client so a test can exercise the server's rejection of malformed input.
+fn send_raw_request(addr: SocketAddr, request: &pb::Request) -> pb::Response {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    write_frame(&mut writer, request, DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("server closed without responding")
 }

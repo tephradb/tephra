@@ -481,7 +481,7 @@ mod tests {
     use super::*;
     use crate::event::{Event, EventType, Tag, Tags};
     use crate::log::set::SegmentConfig;
-    use crate::query::QueryItem;
+    use crate::query::{Matches, QueryItem};
     use smallvec::SmallVec;
     use tempfile::TempDir;
 
