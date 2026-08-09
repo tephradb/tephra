@@ -342,10 +342,51 @@ and none block anything.
       Needed when startup would otherwise read the whole log
 - [ ] Index segment merging (to reduce open-file count, never for correctness)
 - [ ] Retention and archival
-- [ ] Cold-segment recompression on seal
-- [ ] Separate blob region for payloads, so condition checks never decompress
+- [ ] Cold-segment recompression on seal. The one legitimate home for whole-segment (or
+      large-block) compression: reads of cold segments are rare, so paying a full-segment
+      rehydrate per read is acceptable there. Never on the warm read path, where it would
+      destroy decision-model random reads.
+- [ ] Separate blob region for payloads, so condition checks never decompress. This is the
+      real compression story, and the enabler is the payload split, not the compression
+      granularity. Per-event compression (already supported in seglog via the record flag)
+      is correct only for large (KB+) payloads: on the dominant small-event case (a few
+      hundred bytes) it gets almost no ratio (zstd's win is cross-event redundancy, which
+      per-record compression discards) and it fights the lazy-decode layout, since
+      decompressing a record to read its type and tags for filtering forces rehydrating the
+      very payloads the filter is about to discard. Keep the per-event flag for the large-
+      payload case; do not lean on it for small events. The fix is the split this line
+      already names: keep type and tags uncompressed in the main record stream (cheap to
+      scan and filter, small) and move payloads into a separately addressed, block-
+      compressed blob region. Then filtering never decompresses, condition checks never
+      touch the blob, sequential scans decompress blocks in order (amortized), and a random
+      point fetch decompresses one block, with amplification bounded by block size (16-64
+      KiB is the usual sweet spot). Addressing extends the offset sidecar from
+      `position -> byte offset` to `position -> (block, offset-in-block)` plus
+      `block -> compressed byte range`, a two-level index, not a new subsystem. Pair the
+      region with a per-segment trained zstd dictionary: events in a segment are homogeneous,
+      so a dictionary carries the cross-event redundancy and lets even small units compress
+      at near-full-window ratio, which is what keeps small random-access units and a good
+      ratio from being mutually exclusive.
 - [ ] Crypto-shredding for erasure requests
 - [ ] Replication
+- [ ] Verifiable audit log (tamper-evidence against an adversary with file access, not
+      just corruption): a per-batch cryptographic hash chain
+      (`chain_n = H(chain_{n-1} || batch record bytes)`) persisted in a reserved
+      `CHAIN_CHECKPOINT` control-record kind, a `tip() -> (Position, Hash)` accessor, and
+      a `verify(range)` that recomputes and checks. Per-batch, not per-event: the batch is
+      already the atomic durability unit and already writes one commit marker, so the chain
+      finalizes once per fsync and stays under the fsync ceiling. Because the seglog payload
+      is the encoded event verbatim, hashing the record bytes commits type, tags, and
+      payload in one shot, so no per-event metadata channel is needed. The existing CRC32 is
+      a corruption check, not a security control (not collision-resistant), so this needs a
+      real cryptographic hash (BLAKE3), not the CRC. The tamper-evidence comes from external
+      witnessing (publish the tip to OpenTimestamps, an RFC 6962 transparency log, or
+      auditors); that witnessing and its scheduling live in an overlay above the write
+      coordinator, never in the engine. Build only against a concrete requirement, and
+      anchor to a citable design rather than a homegrown scheme: a half-built integrity
+      feature gives false assurance. The near-free enabling step is to reserve the control
+      kind byte now (CLAUDE.md 4.2 already argues for reserving future control kinds), which
+      keeps the door open without committing crypto. Prompted by umadb-io/umadb#18
 - [ ] Benchmarks: fsync-bound throughput, group commit batch-size behaviour under load,
       condition-check latency with and without tips
 
