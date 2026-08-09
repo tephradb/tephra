@@ -47,7 +47,7 @@ pub struct Args {
 ///
 /// Field names double as config-file keys and (upper-cased, `__`-joined) environment
 /// variable names, so `writer.max_batch_bytes` is `TEPHRA__WRITER__MAX_BATCH_BYTES`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Address the TCP listener binds.
@@ -77,7 +77,7 @@ impl Default for Settings {
 }
 
 /// Log-segment sizing options.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SegmentSettings {
     /// Total size of each segment file in bytes, including its header.
@@ -87,13 +87,13 @@ pub struct SegmentSettings {
 impl Default for SegmentSettings {
     fn default() -> Self {
         SegmentSettings {
-            size: 16 * 1024 * 1024,
+            size: 256 * 1024 * 1024,
         }
     }
 }
 
 /// Write-coordinator tuning: backpressure, group-commit sizing, and the tips memory bound.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WriterSettings {
     /// Bounded request-queue depth. When full, an append blocks (backpressure).
@@ -124,7 +124,7 @@ impl Default for WriterSettings {
 }
 
 /// Read-path planner tuning.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReadSettings {
     /// The planner's `K`: the index is chosen only when the post-pruning range is at least
@@ -142,7 +142,7 @@ impl Default for ReadSettings {
 /// TCP server tuning: frame limit, streamed-read flush thresholds, subscription pacing, and
 /// TCP keepalive. Durations are expressed as integers with an explicit unit suffix so they
 /// stay natural TOML/env scalars (there is no bare `Duration` on the wire).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSettings {
     /// Largest single frame accepted or produced, in bytes.
@@ -311,6 +311,22 @@ mod tests {
 
         assert_eq!(settings.bind, "127.0.0.1:9000");
         assert_eq!(settings.data_dir, "tephra-data");
+    }
+
+    #[test]
+    fn example_toml_mirrors_the_defaults() {
+        // `tephra.example.toml` documents itself as "every value shown is the built-in default",
+        // and nothing else pins that promise. Deserialize the file on its own (no env, no CLI) and
+        // assert it round-trips to `Settings::default()`, so any drift between the file and a
+        // changed default fails here. `deny_unknown_fields` also catches a renamed or stray key.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tephra.example.toml");
+        let settings: Settings = Config::builder()
+            .add_source(File::new(path, FileFormat::Toml).required(true))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]

@@ -15,7 +15,7 @@ data_dir = "tephra-data"
 
 [segment]
 # Total size of each segment file in bytes, including its header.
-size = 16777216            # 16 MiB
+size = 268435456           # 256 MiB
 
 [writer]
 # Bounded request-queue depth. When full, an append blocks (backpressure).
