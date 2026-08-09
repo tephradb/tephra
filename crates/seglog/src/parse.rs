@@ -1,13 +1,13 @@
 use crate::{
-    COMPRESSION_FLAG, CONTROL_FLAG, CRC32C_SIZE, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE,
-    calculate_crc32c, has_unknown_flags,
+    CONTROL_FLAG, CRC32C_SIZE, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE, calculate_crc32c,
+    has_unknown_flags,
     read::{ReadError, is_truncation_marker},
 };
 
 /// Parses a record from a byte slice starting at the given offset.
 ///
 /// This function extracts and validates a record from raw bytes without performing any I/O.
-/// It validates the CRC32C checksum and automatically decompresses data if needed.
+/// It validates the CRC32C checksum.
 ///
 /// # Arguments
 ///
@@ -18,7 +18,7 @@ use crate::{
 ///
 /// Returns a tuple of `([u8; H], Vec<u8>, usize)` where:
 /// - The first element is the header portion (H bytes)
-/// - The second element is the decompressed data
+/// - The second element is the record data
 /// - The third element is the total bytes consumed from the buffer
 ///
 /// # Errors
@@ -26,7 +26,6 @@ use crate::{
 /// - `ReadError::OutOfBounds` - If the buffer doesn't contain enough bytes
 /// - `ReadError::TruncationMarker` - If a truncation marker (all zeros) is encountered
 /// - `ReadError::Crc32cMismatch` - If the CRC32C checksum validation fails
-/// - `ReadError::Io` - If decompression fails
 pub fn parse_record<const H: usize>(
     bytes: &[u8],
     offset: usize,
@@ -57,14 +56,8 @@ pub fn parse_record<const H: usize>(
             offset: offset as u64,
         });
     }
-    let is_compressed = length_with_flag & COMPRESSION_FLAG != 0;
     let is_control = length_with_flag & CONTROL_FLAG != 0;
     let payload_len = (length_with_flag & LENGTH_MASK) as usize; // H + data_len
-    if is_control && is_compressed {
-        return Err(ReadError::Corrupt {
-            offset: offset as u64,
-        });
-    }
     let crc = u32::from_le_bytes(
         record_header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
             .try_into()
@@ -98,42 +91,17 @@ pub fn parse_record<const H: usize>(
     }
 
     let header: [u8; H] = payload[..H].try_into().unwrap();
-    let compressed_data = &payload[H..];
+    let data = &payload[H..];
 
-    // Validate CRC over header + compressed data
-    let calculated_crc = calculate_crc32c(&length_bytes, &header, compressed_data);
+    // Validate CRC over header + data
+    let calculated_crc = calculate_crc32c(&length_bytes, &header, data);
     if crc != calculated_crc {
         return Err(ReadError::Crc32cMismatch {
             offset: offset as u64,
         });
     }
 
-    // Decompress if needed
-    let final_data = if is_compressed {
-        cfg_if::cfg_if! {
-            if #[cfg(not(feature = "zstd"))] {
-                return Err(ReadError::ZstdNotEnabled { offset: offset as u64 });
-            } else {
-                if compressed_data.len() < 4 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "compressed data too short to contain original size",
-                    )
-                    .into());
-                }
-                let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-                let _original_size = u32::from_le_bytes(original_size_bytes) as usize;
-
-                let mut decompressed = Vec::new();
-                zstd::stream::copy_decode(&compressed_data[4..], &mut decompressed)?;
-                decompressed
-            }
-        }
-    } else {
-        compressed_data.to_vec()
-    };
-
-    Ok((header, final_data, RECORD_HEAD_SIZE + payload_len))
+    Ok((header, data.to_vec(), RECORD_HEAD_SIZE + payload_len))
 }
 
 #[cfg(test)]

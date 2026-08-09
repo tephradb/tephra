@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::hint;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -9,11 +8,9 @@ use thiserror::Error;
 
 use crate::read::{ReadError, is_truncation_marker};
 use crate::{
-    COMMIT_MARKER_PAYLOAD, COMPRESSION_FLAG, CONTROL_FLAG, FlushedOffset, LEN_SIZE, LENGTH_MASK,
-    MAX_RECORD_LEN, RECORD_HEAD_SIZE, calculate_crc32c, control, has_unknown_flags,
+    COMMIT_MARKER_PAYLOAD, CONTROL_FLAG, FlushedOffset, LEN_SIZE, LENGTH_MASK, MAX_RECORD_LEN,
+    RECORD_HEAD_SIZE, calculate_crc32c, control, has_unknown_flags,
 };
-#[cfg(feature = "zstd")]
-use crate::{MIN_COMPRESSION_SIZE, ZSTD_COMPRESSION_LEVEL};
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
@@ -51,7 +48,6 @@ pub struct Writer<const H: usize> {
     write_offset: u64,
     flushed_offset: FlushedOffset,
     dirty: bool,
-    compression_enabled: bool,
     /// Largest total on-disk record length (header + payload) a single append may write.
     max_record: usize,
     /// Highest position from the last recovered commit marker, if any.
@@ -153,7 +149,6 @@ impl<const H: usize> Writer<H> {
             write_offset,
             flushed_offset,
             dirty: false,
-            compression_enabled: false,
             max_record: default_max_record(size, start_offset),
             last_position: None,
         })
@@ -228,24 +223,9 @@ impl<const H: usize> Writer<H> {
             write_offset,
             flushed_offset,
             dirty: false,
-            compression_enabled: false,
             max_record: default_max_record(size, start_offset),
             last_position: recovered.last_position,
         })
-    }
-
-    /// Enables compression for future append operations.
-    ///
-    /// Once enabled, all data appended via `append()` will be compressed using zstd
-    /// if the data size is >= [`MIN_COMPRESSION_SIZE`].
-    #[cfg(feature = "zstd")]
-    pub fn enable_compression(&mut self) {
-        self.compression_enabled = true;
-    }
-
-    /// Disables compression for future append operations.
-    pub fn disable_compression(&mut self) {
-        self.compression_enabled = false;
     }
 
     /// Returns a reference to the file handle.
@@ -265,20 +245,15 @@ impl<const H: usize> Writer<H> {
     ///
     /// # Arguments
     ///
-    /// * `header` - Fixed-size header metadata (H bytes, never compressed)
-    /// * `data` - Variable-length data payload (optionally compressed based on `compression_enabled`)
+    /// * `header` - Fixed-size header metadata (H bytes)
+    /// * `data` - Variable-length data payload
     ///
     /// Returns the offset where the record was written and the total bytes written (including all headers and data).
     /// Returns an error if the segment does not have enough space remaining.
-    ///
-    /// If compression is enabled and `data.len() >= MIN_COMPRESSION_SIZE`, the data will be compressed
-    /// using zstd. The header is never compressed.
     pub fn append(&mut self, header: &[u8; H], data: &[u8]) -> Result<(u64, usize), WriteError> {
         let offset = self.write_offset;
 
-        let (final_data, length_with_flag) = self.prepare_data(data)?;
-
-        let total_record_len = RECORD_HEAD_SIZE + H + final_data.len();
+        let total_record_len = RECORD_HEAD_SIZE + H + data.len();
         if total_record_len > self.max_record {
             hint::cold_path();
             return Err(WriteError::RecordTooLarge {
@@ -296,13 +271,15 @@ impl<const H: usize> Writer<H> {
 
         self.dirty = true;
 
-        let length_bytes = length_with_flag.to_le_bytes();
-        let crc = calculate_crc32c(&length_bytes, header, &final_data);
+        // The length field is the total payload length (header + data); bit 30 (control) and
+        // bit 31 (reserved) are always zero for a caller data record.
+        let length_bytes = ((H + data.len()) as u32).to_le_bytes();
+        let crc = calculate_crc32c(&length_bytes, header, data);
 
         self.writer.write_all(&length_bytes)?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(header)?;
-        self.writer.write_all(&final_data)?;
+        self.writer.write_all(data)?;
 
         self.write_offset += total_record_len as u64;
 
@@ -478,27 +455,6 @@ impl<const H: usize> Writer<H> {
         Ok(())
     }
 
-    fn prepare_data<'d>(&self, data: &'d [u8]) -> Result<(Cow<'d, [u8]>, u32), WriteError> {
-        #[cfg(feature = "zstd")]
-        if self.compression_enabled && data.len() >= MIN_COMPRESSION_SIZE {
-            let original_size = data.len() as u32;
-            let compressed = zstd::bulk::compress(data, ZSTD_COMPRESSION_LEVEL)?;
-
-            let mut final_data = Vec::with_capacity(4 + compressed.len());
-            final_data.extend_from_slice(&original_size.to_le_bytes());
-            final_data.extend_from_slice(&compressed);
-
-            let total_payload_len = H + final_data.len();
-            let length_with_flag = (total_payload_len as u32) | COMPRESSION_FLAG;
-
-            return Ok((Cow::Owned(final_data), length_with_flag));
-        }
-
-        let total_payload_len = H + data.len();
-        let length_with_flag = total_payload_len as u32;
-
-        Ok((Cow::Borrowed(data), length_with_flag))
-    }
 }
 
 /// Largest total record length that still leaves room for a commit marker after `start_offset`.
@@ -553,10 +509,6 @@ fn recover(file: &File, size: usize, start_offset: u64) -> Result<Recovered, Wri
             break;
         }
         let is_control = raw & CONTROL_FLAG != 0;
-        let is_compressed = raw & COMPRESSION_FLAG != 0;
-        if is_control && is_compressed {
-            break;
-        }
         let payload_len = (raw & LENGTH_MASK) as usize;
         let record_end = payload_offset + payload_len as u64;
         if record_end > size as u64 {

@@ -75,22 +75,18 @@ impl Default for Settings {
     }
 }
 
-/// Log-segment sizing and storage options.
+/// Log-segment sizing options.
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SegmentSettings {
     /// Total size of each segment file in bytes, including its header.
     pub size: usize,
-    /// zstd-compress each record's payload. Requires the store's `zstd` feature; enabling it
-    /// without the feature is rejected at open, not silently ignored.
-    pub compress: bool,
 }
 
 impl Default for SegmentSettings {
     fn default() -> Self {
         SegmentSettings {
             size: 16 * 1024 * 1024,
-            compress: false,
         }
     }
 }
@@ -167,7 +163,7 @@ impl Default for ServerSettings {
 impl Settings {
     /// The segment config for opening the store.
     pub fn segment_config(&self) -> SegmentConfig {
-        SegmentConfig::new(self.segment.size).with_compression(self.segment.compress)
+        SegmentConfig::new(self.segment.size)
     }
 
     /// The write-coordinator config. `verify_tips` is deliberately never operator-settable, so

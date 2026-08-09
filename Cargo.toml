@@ -35,7 +35,6 @@ tempfile = "3"
 [features]
 async = ["flume/async"]
 tracing = ["dep:tracing", "seglog/tracing"]
-zstd = ["seglog/zstd"]
 # Enables the dcbdb-vs-umadb comparison bench (`--bench compare`).
 umadb-compare = ["dep:umadb-core", "dep:umadb-dcb"]
 

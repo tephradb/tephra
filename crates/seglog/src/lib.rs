@@ -26,10 +26,11 @@
 //! └─────────────┴─────────────┴────────────────┴─────────────────────┘
 //! ```
 //!
-//! - **Length**: 32-bit little-endian total payload length (H + N bytes). MSB indicates compression.
+//! - **Length**: 32-bit little-endian total payload length (H + N bytes). Bit 30 flags a
+//!   control record; bit 31 is reserved and must be zero.
 //! - **CRC32C**: 32-bit checksum over length + header + data
-//! - **Header**: Fixed-size metadata (H bytes, never compressed)
-//! - **Data**: Variable-length record payload (optionally compressed)
+//! - **Header**: Fixed-size metadata (H bytes)
+//! - **Data**: Variable-length record payload
 //!
 //! Total record header size is [`RECORD_HEAD_SIZE`] (8 bytes), not including the user header.
 //!
@@ -208,15 +209,14 @@ const CRC32C_SIZE: usize = mem::size_of::<u32>();
 /// Size of the record header in bytes, consisting of length and CRC32C checksum.
 pub const RECORD_HEAD_SIZE: usize = LEN_SIZE + CRC32C_SIZE;
 
-/// Compression flag bit in the length field (bit 31).
-pub const COMPRESSION_FLAG: u32 = 0x8000_0000;
-
 /// Control-record flag bit in the length field (bit 30).
 /// When set, the record is internal framing, not caller data.
 pub const CONTROL_FLAG: u32 = 0x4000_0000;
 
-/// All flag bits. Any bit outside `FLAG_MASK | LENGTH_MASK` is corruption.
-pub const FLAG_MASK: u32 = COMPRESSION_FLAG | CONTROL_FLAG;
+/// Known flag bits (currently just the control flag). Bit 31 is reserved and must be zero:
+/// a record with it set is rejected as corrupt. Any bit outside `FLAG_MASK | LENGTH_MASK`
+/// is corruption.
+pub const FLAG_MASK: u32 = CONTROL_FLAG;
 
 /// Mask to extract actual length from the length field (bits 0..=29).
 pub const LENGTH_MASK: u32 = 0x3FFF_FFFF;
@@ -232,15 +232,6 @@ pub mod control {
 
 /// Payload size of a batch commit record: kind byte + u64.
 pub const COMMIT_MARKER_PAYLOAD: usize = 1 + 8;
-
-/// Minimum data size (in bytes) for compression to be applied.
-/// Records smaller than this threshold will not be compressed to avoid overhead.
-#[cfg(feature = "zstd")]
-pub const MIN_COMPRESSION_SIZE: usize = 128;
-
-/// Default zstd compression level (3 provides good balance of speed and ratio).
-#[cfg(feature = "zstd")]
-pub const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 /// Thread-safe atomic offset tracking for flushed data.
 ///
@@ -265,8 +256,8 @@ impl FlushedOffset {
 }
 
 /// Returns true if `raw` (a record's length field) has any bit set outside the known flags
-/// and length. This is a no-op while the flags and length span all 32 bits, but it preserves
-/// the invariant if a currently unused bit (e.g. bit 29) is ever claimed.
+/// and length. Bit 31 is reserved (formerly the compression flag) and must be zero, so a
+/// record with it set is reported as corrupt here rather than silently accepted.
 #[allow(clippy::bad_bit_mask)]
 #[inline]
 pub(crate) const fn has_unknown_flags(raw: u32) -> bool {
@@ -561,7 +552,6 @@ mod tests {
         assert_eq!(record.offset, 0);
         assert_eq!(record.len, RECORD_HEAD_SIZE + data.len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -584,7 +574,6 @@ mod tests {
         assert_eq!(record.offset, 0);
         assert_eq!(record.len, RECORD_HEAD_SIZE + data.len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -747,7 +736,6 @@ mod tests {
             assert_eq!(record.offset, expected_offset);
             assert_eq!(record.len, RECORD_HEAD_SIZE + expected.len());
             assert_eq!(&*record.header, &[]);
-            assert!(record.compressed_data.is_none());
             expected_offset += record.len as u64;
         }
 
@@ -779,7 +767,6 @@ mod tests {
         assert_eq!(record.offset, second_offset);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"second".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
 
         let third_offset = second_offset + record.len as u64;
         let record = iter
@@ -790,7 +777,6 @@ mod tests {
         assert_eq!(record.offset, third_offset);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"third".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
 
         assert!(iter.next_record().expect("failed to read").is_none());
     }
@@ -830,7 +816,6 @@ mod tests {
         assert_eq!(record.offset, 0);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"only one".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
 
         assert!(iter.next_record().expect("failed to read").is_none());
     }
@@ -1012,7 +997,6 @@ mod tests {
         assert_eq!(record.offset, 0);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"data".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
     }
 
     // Edge Cases Tests
@@ -1052,7 +1036,6 @@ mod tests {
         assert_eq!(record.offset, 0);
         assert_eq!(record.len, RECORD_HEAD_SIZE + large_data.len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -1109,7 +1092,6 @@ mod tests {
             assert_eq!(record.offset, offset);
             assert_eq!(record.len, len);
             assert_eq!(&*record.header, &[]);
-            assert!(record.compressed_data.is_none());
         }
     }
 
@@ -1219,7 +1201,6 @@ mod tests {
         assert_eq!(record.offset, first_offset);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"first".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
 
         let record = reader
             .read_record(second_offset, ReadHint::Random)
@@ -1228,7 +1209,6 @@ mod tests {
         assert_eq!(record.offset, second_offset);
         assert_eq!(record.len, RECORD_HEAD_SIZE + b"second".len());
         assert_eq!(&*record.header, &[]);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -1261,7 +1241,6 @@ mod tests {
             assert_eq!(&*record.data, *expected);
             assert_eq!(record.len, RECORD_HEAD_SIZE + expected.len());
             assert_eq!(&*record.header, &[]);
-            assert!(record.compressed_data.is_none());
             expected_offset += record.len as u64;
         }
 
@@ -1347,7 +1326,6 @@ mod tests {
         assert_eq!(&*record.data, data);
         assert_eq!(record.offset, offset);
         assert_eq!(record.len, len);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -1373,7 +1351,6 @@ mod tests {
         assert_eq!(&*record.data, data);
         assert_eq!(record.offset, offset);
         assert_eq!(record.len, len);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -1399,7 +1376,6 @@ mod tests {
         assert_eq!(&*record.data, data);
         assert_eq!(record.offset, offset);
         assert_eq!(record.len, len);
-        assert!(record.compressed_data.is_none());
     }
 
     #[test]
@@ -1434,7 +1410,6 @@ mod tests {
             assert_eq!(&*record.header, expected_header);
             assert_eq!(&*record.data, *expected_data);
             assert_eq!(record.offset, offsets[i]);
-            assert!(record.compressed_data.is_none());
         }
     }
 
@@ -1498,7 +1473,6 @@ mod tests {
             assert_eq!(&*record.data, *expected_data);
             assert_eq!(record.offset, expected_offset);
             assert_eq!(record.len, RECORD_HEAD_SIZE + 8 + expected_data.len());
-            assert!(record.compressed_data.is_none());
             expected_offset += record.len as u64;
         }
 
@@ -1587,531 +1561,39 @@ mod tests {
         assert_eq!(&*r3.header, &header3);
     }
 
-    // Compression Tests
+    // Reserved-flag Tests
 
     #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_disabled_by_default() {
+    fn reserved_high_bit_in_length_is_rejected() {
+        // Bit 31 of the length field is reserved (formerly the compression flag) and must be
+        // zero. A record with it set is rejected as corrupt, before the CRC is even checked.
+        use std::io::Read as _;
+
         let temp = temp_path();
         let mut writer =
             Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-
-        // Write data >= MIN_COMPRESSION_SIZE but compression is not enabled
-        let data = vec![0x42u8; MIN_COMPRESSION_SIZE];
-        writer.append(&[], &data).expect("failed to append");
-
+        writer.append(&[], b"hello").expect("failed to append");
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
         drop(writer);
+
+        // Flip bit 31 of the length field (the first 4 bytes, little-endian) directly on disk.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp)
+            .unwrap();
+        let mut len_bytes = [0u8; 4];
+        file.read_exact(&mut len_bytes).unwrap();
+        let raw = u32::from_le_bytes(len_bytes) | 0x8000_0000;
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.write_all(&raw.to_le_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
 
         let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Data should not be compressed (compressed_data should be None)
-        assert!(record.compressed_data.is_none());
-        assert_eq!(record.data.len(), MIN_COMPRESSION_SIZE);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_enable_disable_compression() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-
-        let data = vec![0xAAu8; MIN_COMPRESSION_SIZE];
-
-        // Write without compression
-        let (offset1, _) = writer.append(&[], &data).expect("failed to append");
-
-        // Enable compression
-        writer.enable_compression();
-        let (offset2, _) = writer.append(&[], &data).expect("failed to append");
-
-        // Disable compression
-        writer.disable_compression();
-        let (offset3, _) = writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // First record: not compressed
-        let r1 = reader
-            .read_record(offset1, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r1.compressed_data.is_none());
-
-        // Second record: compressed
-        let r2 = reader
-            .read_record(offset2, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r2.compressed_data.is_some());
-        assert_eq!(r2.data.len(), MIN_COMPRESSION_SIZE);
-
-        // Third record: not compressed again
-        let r3 = reader
-            .read_record(offset3, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r3.compressed_data.is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_large_data() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Data >= MIN_COMPRESSION_SIZE should be compressed
-        let data = vec![0x42u8; 200];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should be compressed
-        assert!(record.compressed_data.is_some());
-        // Data should be decompressed correctly
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_no_compression_small_data() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Data < MIN_COMPRESSION_SIZE should not be compressed
-        let data = vec![0x42u8; MIN_COMPRESSION_SIZE - 1];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should NOT be compressed (data too small)
-        assert!(record.compressed_data.is_none());
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    fn test_no_compression_when_disabled() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        // Compression is disabled by default
-
-        // Large data but compression disabled
-        let data = vec![0x42u8; 500];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should NOT be compressed (compression disabled)
-        assert!(record.compressed_data.is_none());
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_read_compressed_record_random() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_data = vec![0x55u8; 300];
-        writer
-            .append(&[], &original_data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read with random hint");
-
-        assert!(record.compressed_data.is_some());
-        assert_eq!(&*record.data, &original_data);
-        assert_eq!(record.offset, 0);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_read_compressed_record_sequential() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_data = vec![0x77u8; 300];
-        writer
-            .append(&[], &original_data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Sequential)
-            .expect("failed to read with sequential hint");
-
-        assert!(record.compressed_data.is_some());
-        assert_eq!(&*record.data, &original_data);
-        assert_eq!(record.offset, 0);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compressed_record_has_compressed_data_field() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_data = vec![0xBBu8; 256];
-        writer
-            .append(&[], &original_data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // compressed_data field should be populated
-        assert!(record.compressed_data.is_some());
-        let compressed_data = record.compressed_data.unwrap();
-
-        // Compressed data should be smaller than original for compressible data
-        // (we're using repeated 0xBB which should compress well)
-        assert!(compressed_data.len() < original_data.len());
-
-        // Decompressed data should match original
-        assert_eq!(&*record.data, &original_data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_iter_compressed_records() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let records = vec![vec![0x11u8; 200], vec![0x22u8; 250], vec![0x33u8; 300]];
-
-        for data in &records {
-            writer.append(&[], data).expect("failed to append");
-        }
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter(0);
-
-        let mut expected_offset = 0u64;
-        for expected_data in &records {
-            let record = iter
-                .next_record()
-                .expect("failed to read")
-                .expect("no record");
-
-            assert!(record.compressed_data.is_some());
-            assert_eq!(&*record.data, expected_data);
-            assert_eq!(record.offset, expected_offset);
-            expected_offset += record.len as u64;
-        }
-
-        assert!(iter.next_record().expect("failed to read").is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_mixed_compressed_uncompressed() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-
-        let small_data = vec![0xAAu8; 50]; // Too small to compress
-        let large_data = vec![0xBBu8; 200]; // Large enough to compress
-
-        // Write small data (no compression)
-        let (offset1, _) = writer.append(&[], &small_data).expect("failed to append");
-
-        // Enable compression and write large data
-        writer.enable_compression();
-        let (offset2, _) = writer.append(&[], &large_data).expect("failed to append");
-
-        // Write small data with compression enabled (still won't compress due to size)
-        let (offset3, _) = writer.append(&[], &small_data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // First record: not compressed
-        let r1 = reader
-            .read_record(offset1, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r1.compressed_data.is_none());
-        assert_eq!(&*r1.data, &small_data);
-
-        // Second record: compressed
-        let r2 = reader
-            .read_record(offset2, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r2.compressed_data.is_some());
-        assert_eq!(&*r2.data, &large_data);
-
-        // Third record: not compressed (too small)
-        let r3 = reader
-            .read_record(offset3, ReadHint::Random)
-            .expect("failed to read");
-        assert!(r3.compressed_data.is_none());
-        assert_eq!(&*r3.data, &small_data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_with_headers_h8() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let header = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let data = vec![0xCCu8; 200];
-        writer.append(&header, &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<8>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should be compressed
-        assert!(record.compressed_data.is_some());
-        // Header should be preserved (never compressed)
-        assert_eq!(&*record.header, &header);
-        // Data should be decompressed correctly
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_header_never_compressed() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Header with distinct pattern
-        let header = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-            0x0F, 0x10,
-        ];
-        let data = vec![0xDDu8; 256];
-        writer.append(&header, &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<16>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Verify header is preserved exactly (never compressed)
-        assert_eq!(&*record.header, &header);
-        assert_eq!(record.header[0], 0x01);
-        assert_eq!(record.header[15], 0x10);
-
-        // Data should be compressed
-        assert!(record.compressed_data.is_some());
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_exactly_128_bytes() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Exactly at MIN_COMPRESSION_SIZE threshold
-        let data = vec![0x99u8; MIN_COMPRESSION_SIZE];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should be compressed (>= threshold)
-        assert!(record.compressed_data.is_some());
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_127_bytes() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // One byte below MIN_COMPRESSION_SIZE threshold
-        let data = vec![0x88u8; MIN_COMPRESSION_SIZE - 1];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should NOT be compressed (< threshold)
-        assert!(record.compressed_data.is_none());
-        assert_eq!(&*record.data, &data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_large_1mb_data() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Very large compressible data (1MB of repeated bytes)
-        let data = vec![0xEEu8; 1024 * 1024];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Should be compressed
-        assert!(record.compressed_data.is_some());
-        // Data should decompress correctly
-        assert_eq!(record.data.len(), 1024 * 1024);
-        assert_eq!(&*record.data, &data);
-
-        // Verify compression actually worked (compressed size should be much smaller)
-        let compressed_len = record.compressed_data.unwrap().len();
-        assert!(compressed_len < data.len() / 10); // Should compress to < 10% of original
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_writer_open_compressed_segment() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let data1 = vec![0xF1u8; 200];
-        let data2 = vec![0xF2u8; 250];
-        writer.append(&[], &data1).expect("failed to append");
-        writer.append(&[], &data2).expect("failed to append");
-        writer.commit(0).expect("failed to commit");
-        let expected_offset = writer.write_offset();
-        drop(writer);
-
-        // Reopen the segment with compressed records
-        let mut writer =
-            Writer::<0>::open(&temp, SEGMENT_SIZE, 0).expect("failed to reopen writer");
-        assert_eq!(writer.write_offset(), expected_offset);
-
-        // Append another compressed record
-        writer.enable_compression();
-        let data3 = vec![0xF3u8; 300];
-        writer.append(&[], &data3).expect("failed to append");
-        writer.commit(1).expect("failed to commit");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        // Verify all three records can be read
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter(0);
-
-        let r1 = iter
-            .next_record()
-            .expect("failed to read")
-            .expect("no record");
-        assert!(r1.compressed_data.is_some());
-        assert_eq!(&*r1.data, &data1);
-
-        let r2 = iter
-            .next_record()
-            .expect("failed to read")
-            .expect("no record");
-        assert!(r2.compressed_data.is_some());
-        assert_eq!(&*r2.data, &data2);
-
-        let r3 = iter
-            .next_record()
-            .expect("failed to read")
-            .expect("no record");
-        assert!(r3.compressed_data.is_some());
-        assert_eq!(&*r3.data, &data3);
+        let err = reader.read_record(0, ReadHint::Random).unwrap_err();
+        assert!(matches!(err, ReadError::Corrupt { .. }), "got {err:?}");
     }
 
     // replace_header Tests
@@ -2276,91 +1758,6 @@ mod tests {
             .expect("failed to read");
         assert_eq!(&*new_record.data, &original_data);
         assert_eq!(&*new_record.data, data);
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_replace_header_on_compressed_record() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_header = [0xAAu8; 8];
-        let data = vec![0x42u8; 256]; // Large enough to compress
-        writer
-            .append(&original_header, &data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<8>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // Verify it's compressed
-        let original_record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        assert!(original_record.compressed_data.is_some());
-
-        // Replace header
-        let new_header = [0xBBu8; 8];
-        reader
-            .replace_header(0, new_header)
-            .expect("failed to replace header on compressed record");
-
-        // Verify replacement worked
-        let new_record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        assert_eq!(&*new_record.header, &new_header);
-        assert_eq!(&*new_record.data, &data);
-        assert!(new_record.compressed_data.is_some()); // Should still be compressed
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_replace_header_preserves_compression() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_header = [1u8; 8];
-        let data = vec![0xCCu8; 300];
-        writer
-            .append(&original_header, &data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<8>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // Get compressed data before replacement
-        let before = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        let compressed_before = before.compressed_data.as_ref().unwrap().to_vec();
-
-        // Replace header
-        let new_header = [2u8; 8];
-        reader
-            .replace_header(0, new_header)
-            .expect("failed to replace header");
-
-        // Get compressed data after replacement
-        let after = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        let compressed_after = after.compressed_data.as_ref().unwrap().to_vec();
-
-        // Compressed data should be identical
-        assert_eq!(compressed_before, compressed_after);
-        // Decompressed data should match original
-        assert_eq!(&*after.data, &data);
     }
 
     #[test]
@@ -2531,118 +1928,6 @@ mod tests {
 
     // Integration Tests
 
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_headers_compression_replace_all_together() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let original_header = [0x11u8; 8];
-        let data = vec![0x99u8; 256]; // Compressible data
-        writer
-            .append(&original_header, &data)
-            .expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<8>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // Verify compression
-        let record1 = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        assert!(record1.compressed_data.is_some());
-        assert_eq!(&*record1.header, &original_header);
-        assert_eq!(&*record1.data, &data);
-
-        // Replace header on compressed record
-        let new_header = [0x22u8; 8];
-        reader
-            .replace_header(0, new_header)
-            .expect("failed to replace header");
-
-        // Verify all three features work together
-        let record2 = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-        assert_eq!(&*record2.header, &new_header); // Header replaced
-        assert_eq!(&*record2.data, &data); // Data unchanged
-        assert!(record2.compressed_data.is_some()); // Still compressed
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_concurrent_read_with_headers_and_compression() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let header = [0xABu8; 8];
-        let data = vec![0xCDu8; 200];
-        writer.append(&header, &data).expect("failed to append");
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-
-        // Create multiple readers
-        let mut reader1 =
-            Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader1");
-        let mut reader2 =
-            Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader2");
-
-        // Both readers should be able to read the compressed record
-        let r1 = reader1
-            .read_record(0, ReadHint::Random)
-            .expect("reader1 failed");
-        let r2 = reader2
-            .read_record(0, ReadHint::Sequential)
-            .expect("reader2 failed");
-
-        assert_eq!(&*r1.header, &header);
-        assert_eq!(&*r1.data, &data);
-        assert!(r1.compressed_data.is_some());
-
-        assert_eq!(&*r2.header, &header);
-        assert_eq!(&*r2.data, &data);
-        assert!(r2.compressed_data.is_some());
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compression_ratio_verification() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        // Highly compressible data (1000 repeated bytes)
-        let data = vec![0xABu8; 1000];
-        writer.append(&[], &data).expect("failed to append");
-
-        writer.sync().expect("failed to sync");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-        let record = reader
-            .read_record(0, ReadHint::Random)
-            .expect("failed to read");
-
-        // Verify compression worked
-        assert!(record.compressed_data.is_some());
-        let compressed_len = record.compressed_data.unwrap().len();
-
-        // Compressed data should be significantly smaller (< 5% of original)
-        assert!(compressed_len < data.len() / 20);
-
-        // Decompressed data should match exactly
-        assert_eq!(&*record.data, &data);
-    }
-
     // Batch Commit & Durability Tests
 
     #[test]
@@ -2778,42 +2063,6 @@ mod tests {
         let mut iter = reader.iter(0);
         let rec = iter.next_record().expect("read").expect("record");
         assert_eq!(&*rec.data, b"x");
-        assert!(iter.next_record().expect("read").is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "zstd")]
-    fn test_compressed_and_control_flags_decode_independently() {
-        let temp = temp_path();
-        let mut writer =
-            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
-        writer.enable_compression();
-
-        let data = vec![0x5Au8; 300]; // compressible, above MIN_COMPRESSION_SIZE
-        let (rec_offset, rec_len) = writer.append(&[], &data).expect("failed to append");
-        writer.commit(9).expect("failed to commit");
-        let flushed = writer.flushed_offset();
-        drop(writer);
-
-        let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
-
-        // The compressed record decodes as compressed, not control.
-        let rec = reader
-            .read_record(rec_offset, ReadHint::Random)
-            .expect("failed to read");
-        assert!(rec.compressed_data.is_some());
-        assert_eq!(&*rec.data, &data);
-
-        // The control record decodes as control, not compressed.
-        let marker_offset = rec_offset + rec_len as u64;
-        let result = reader.read_record(marker_offset, ReadHint::Random);
-        assert!(matches!(result, Err(ReadError::ControlRecord { .. })));
-
-        // Iteration yields only the data record.
-        let mut iter = reader.iter(0);
-        let only = iter.next_record().expect("read").expect("record");
-        assert!(only.compressed_data.is_some());
-        assert_eq!(&*only.data, &data);
         assert!(iter.next_record().expect("read").is_none());
     }
 

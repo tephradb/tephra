@@ -9,11 +9,9 @@ license = "Apache-2.0"
 version = "0.2.2"
 
 [dependencies]
-cfg-if = "1.0"
 crc32fast = "1.5"
 thiserror = "2.0"
 tracing = { version = "0.1", optional = true }
-zstd = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", features = ["fs"] }
@@ -24,7 +22,6 @@ tempfile = "3.27"
 
 [features]
 tracing = ["dep:tracing"]
-zstd = ["dep:zstd"]
 
 [[bench]]
 name = "seglog_bench"

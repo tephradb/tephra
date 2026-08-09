@@ -8,8 +8,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::{
-    COMPRESSION_FLAG, CONTROL_FLAG, CRC32C_SIZE, FlushedOffset, LEN_SIZE, LENGTH_MASK,
-    RECORD_HEAD_SIZE, calculate_crc32c, has_unknown_flags,
+    CONTROL_FLAG, CRC32C_SIZE, FlushedOffset, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE,
+    calculate_crc32c, has_unknown_flags,
 };
 
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -21,17 +21,9 @@ const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
 pub struct Record<'a, const H: usize> {
     pub header: Cow<'a, [u8]>,
     pub data: Cow<'a, [u8]>,
-    pub compressed_data: Option<Cow<'a, [u8]>>,
     pub offset: u64,
     pub len: usize,
 }
-
-// impl<const H: usize> Record<'_, H> {
-//     #[allow(clippy::len_without_is_empty)]
-//     pub fn len(&self) -> usize {
-//         RECORD_HEAD_SIZE + self.header.len() + self.data.len()
-//     }
-// }
 
 /// Errors that can occur during segment reading operations.
 #[derive(Debug, Error)]
@@ -57,8 +49,6 @@ pub enum ReadError {
         existing_length: usize,
         new_length: usize,
     },
-    #[error("zstd compression is not enabled at offset {offset}")]
-    ZstdNotEnabled { offset: u64 },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -99,9 +89,6 @@ pub struct Reader<const H: usize> {
     // Sequential read cache
     read_ahead_buf: ReadAheadBuf,
     flushed_offset: FlushedOffset,
-    // Decompression buffer (reused across reads to avoid allocations)
-    #[cfg(feature = "zstd")]
-    decompress_buf: Vec<u8>,
 }
 
 impl<const H: usize> Reader<H> {
@@ -138,8 +125,6 @@ impl<const H: usize> Reader<H> {
             fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset,
-            #[cfg(feature = "zstd")]
-            decompress_buf: Vec::new(),
         };
 
         Ok(reader)
@@ -155,8 +140,6 @@ impl<const H: usize> Reader<H> {
             fallback_buf: self.fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset: self.flushed_offset.clone(),
-            #[cfg(feature = "zstd")]
-            decompress_buf: Vec::new(),
         })
     }
 
@@ -239,8 +222,6 @@ impl<const H: usize> Reader<H> {
     ///
     /// Returns a tuple of (header, data) after validating the CRC32C checksum.
     /// The hint parameter can optimize performance for sequential vs random access patterns.
-    ///
-    /// If the data is compressed, it will be automatically decompressed.
     pub fn read_record(&mut self, offset: u64, hint: ReadHint) -> Result<Record<'_, H>, ReadError> {
         let flushed_offset = self.flushed_offset.load();
         if offset + RECORD_HEAD_SIZE as u64 > flushed_offset {
@@ -277,14 +258,8 @@ impl<const H: usize> Reader<H> {
             hint::cold_path();
             return Err(ReadError::Corrupt { offset });
         }
-        let is_compressed = length_with_flag & COMPRESSION_FLAG != 0;
         let is_control = length_with_flag & CONTROL_FLAG != 0;
         let payload_len = (length_with_flag & LENGTH_MASK) as usize; // H + data_len
-        // Control records are never compressed.
-        if is_control && is_compressed {
-            hint::cold_path();
-            return Err(ReadError::Corrupt { offset });
-        }
 
         let crc = u32::from_le_bytes(
             record_header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
@@ -306,7 +281,7 @@ impl<const H: usize> Reader<H> {
         let header_len = if is_control { 0 } else { H };
 
         // Read header + data payload
-        let (header, compressed_data) = if payload_len <= OPTIMISTIC_DATA_SIZE
+        let (header, data) = if payload_len <= OPTIMISTIC_DATA_SIZE
             && optimistic_read_len >= RECORD_HEAD_SIZE + payload_len
         {
             // Payload fits in the optimistic buffer - we got it all in one read!
@@ -314,7 +289,7 @@ impl<const H: usize> Reader<H> {
             let header = &payload[..header_len];
             let data = &payload[header_len..];
 
-            // Validate CRC over header + compressed data
+            // Validate CRC over header + data
             let new_crc = calculate_crc32c(&length_bytes, header, data);
             if crc != new_crc {
                 hint::cold_path();
@@ -363,42 +338,9 @@ impl<const H: usize> Reader<H> {
             });
         }
 
-        // Decompress if needed
-        let (final_data, compressed_data) = if is_compressed {
-            cfg_if::cfg_if! {
-                if #[cfg(not(feature = "zstd"))] {
-                    return Err(ReadError::ZstdNotEnabled { offset });
-                } else {
-                    // First 4 bytes are the original size
-                    if compressed_data.len() < 4 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "compressed data too short to contain original size",
-                        )
-                        .into());
-                    }
-                    let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-                    let original_size = u32::from_le_bytes(original_size_bytes) as usize;
-
-                    // Decompress into reusable buffer
-                    self.decompress_buf.clear();
-                    self.decompress_buf.reserve(original_size);
-                    zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
-
-                    (
-                        Cow::Borrowed(self.decompress_buf.as_slice()),
-                        Some(compressed_data),
-                    )
-                }
-            }
-        } else {
-            (compressed_data, None)
-        };
-
         Ok(Record {
             header,
-            data: final_data,
-            compressed_data,
+            data,
             offset,
             len: RECORD_HEAD_SIZE + payload_len,
         })
@@ -424,14 +366,8 @@ impl<const H: usize> Reader<H> {
             hint::cold_path();
             return Err(ReadError::Corrupt { offset });
         }
-        let is_compressed = length_with_flag & COMPRESSION_FLAG != 0;
         let is_control = length_with_flag & CONTROL_FLAG != 0;
         let payload_len = (length_with_flag & LENGTH_MASK) as usize;
-        // Control records are never compressed.
-        if is_control && is_compressed {
-            hint::cold_path();
-            return Err(ReadError::Corrupt { offset });
-        }
         let crc = u32::from_le_bytes(
             record_header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
                 .try_into()
@@ -455,9 +391,9 @@ impl<const H: usize> Reader<H> {
         // Control records carry no caller header.
         let header_len = if is_control { 0 } else { H };
         let header = &payload[..header_len];
-        let compressed_data = &payload[header_len..];
+        let data = &payload[header_len..];
 
-        let new_crc = calculate_crc32c(&length_bytes, header, compressed_data);
+        let new_crc = calculate_crc32c(&length_bytes, header, data);
         if crc != new_crc {
             hint::cold_path();
             return Err(ReadError::Crc32cMismatch { offset });
@@ -471,40 +407,9 @@ impl<const H: usize> Reader<H> {
             });
         }
 
-        // Decompress if needed
-        let (final_data, compressed_data) = if is_compressed {
-            cfg_if::cfg_if! {
-                if #[cfg(not(feature = "zstd"))] {
-                    return Err(ReadError::ZstdNotEnabled { offset });
-                } else {
-                    if compressed_data.len() < 4 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "compressed data too short to contain original size",
-                        )
-                        .into());
-                    }
-                    let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
-                    let original_size = u32::from_le_bytes(original_size_bytes) as usize;
-
-                    self.decompress_buf.clear();
-                    self.decompress_buf.reserve(original_size);
-                    zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
-
-                    (
-                        Cow::Borrowed(self.decompress_buf.as_slice()),
-                        Some(Cow::Borrowed(compressed_data)),
-                    )
-                }
-            }
-        } else {
-            (Cow::Borrowed(compressed_data), None)
-        };
-
         Ok(Record {
             header: Cow::Borrowed(header),
-            data: final_data,
-            compressed_data,
+            data: Cow::Borrowed(data),
             offset,
             len: RECORD_HEAD_SIZE + payload_len,
         })
@@ -555,8 +460,6 @@ impl<const H: usize> Reader<H> {
     /// This method reads the full record to get the data portion, calculates a new CRC
     /// with the new header, and writes back only the CRC and header bytes. The data
     /// portion on disk is left untouched.
-    ///
-    /// This is safe to use even with compressed records since the data is not modified.
     pub fn replace_header(&mut self, offset: u64, new_header: [u8; H]) -> Result<(), ReadError> {
         self.replace_header_with(offset, |_| Some(new_header))?;
         Ok(())
@@ -565,15 +468,13 @@ impl<const H: usize> Reader<H> {
     /// Conditionally replaces the header portion of a record at the given offset.
     ///
     /// This method reads the full record and passes it to the closure `f`. The closure
-    /// can inspect the current record state (header, data, compression status, etc.) and
-    /// decide whether to replace the header by returning `Some([u8; H])` or skip the
-    /// replacement by returning `None`.
+    /// can inspect the current record state (header, data, offset, etc.) and decide whether
+    /// to replace the header by returning `Some([u8; H])` or skip the replacement by
+    /// returning `None`.
     ///
     /// If the closure returns `Some(new_header)`, this method calculates a new CRC with
     /// the new header and writes back only the CRC and header bytes. The data portion on
     /// disk is left untouched.
-    ///
-    /// This is safe to use even with compressed records since the data is not modified.
     ///
     /// # Examples
     ///
@@ -612,19 +513,11 @@ impl<const H: usize> Reader<H> {
         // Calculate payload_len from the record's len field
         let payload_len = record.len - RECORD_HEAD_SIZE;
 
-        // Reconstruct the length_with_flag for CRC calculation
-        let length_with_flag = if record.compressed_data.is_some() {
-            (payload_len as u32) | COMPRESSION_FLAG
-        } else {
-            payload_len as u32
-        };
-        let length_bytes = length_with_flag.to_le_bytes();
+        // Reconstruct the length field for CRC calculation
+        let length_bytes = (payload_len as u32).to_le_bytes();
 
-        // Get the data as it exists on disk (compressed or not)
-        let data_on_disk = record.compressed_data.as_ref().unwrap_or(&record.data);
-
-        // Calculate new CRC over new_header + data_on_disk
-        let new_crc = calculate_crc32c(&length_bytes, &new_header, data_on_disk);
+        // Calculate new CRC over new_header + the record's data (left untouched on disk)
+        let new_crc = calculate_crc32c(&length_bytes, &new_header, &record.data);
 
         // Write CRC + header (leave data untouched)
         let mut write_buf = Vec::with_capacity(CRC32C_SIZE + H);

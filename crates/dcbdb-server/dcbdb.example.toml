@@ -16,9 +16,6 @@ data_dir = "dcbdb-data"
 [segment]
 # Total size of each segment file in bytes, including its header.
 size = 16777216            # 16 MiB
-# zstd-compress each record's payload. Requires the store's `zstd` feature; enabling it
-# without the feature is rejected at open rather than silently ignored.
-compress = false
 
 [writer]
 # Bounded request-queue depth. When full, an append blocks (backpressure).

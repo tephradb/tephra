@@ -118,26 +118,37 @@ section 12 remain future work.
 +-------------+-------------+----------------+
 ```
 
-The 4-byte length field carries two flags in its high bits:
+The 4-byte length field carries one flag in its high bits:
 
 ```rust
-const COMPRESSION_FLAG: u32 = 0x8000_0000;  // bit 31
-const CONTROL_FLAG:     u32 = 0x4000_0000;  // bit 30
-const FLAG_MASK:        u32 = COMPRESSION_FLAG | CONTROL_FLAG;
-const LENGTH_MASK:      u32 = 0x3FFF_FFFF;  // bits 0..=29, 1 GiB ceiling
+const CONTROL_FLAG: u32 = 0x4000_0000;  // bit 30
+const FLAG_MASK:    u32 = CONTROL_FLAG;
+const LENGTH_MASK:  u32 = 0x3FFF_FFFF;  // bits 0..=29, 1 GiB ceiling
 ```
 
-Any bit outside `FLAG_MASK | LENGTH_MASK` is a hard corruption error, never ignored.
-Every length extraction uses `raw & LENGTH_MASK`. Never `raw & !COMPRESSION_FLAG`.
+Bit 31 is **reserved and must be zero** (it was formerly a per-record compression flag,
+removed with per-record compression). Any bit outside `FLAG_MASK | LENGTH_MASK` is a hard
+corruption error, never ignored, so a record with bit 31 set is rejected before its CRC is
+even checked. The 1 GiB ceiling is deliberate (records are events, and section 4.4 caps a
+record at `segment_size / 4`), so bit 31 is not reclaimed to widen the length: doing so
+would be non-contiguous (it would straddle the control bit) and solve a non-problem.
+Re-adding compression later is a version bump, not a format fight. Every length extraction
+uses `raw & LENGTH_MASK`.
 
 **Checksums use CRC-32 (IEEE 802.3 polynomial), via `crc32fast`.** One algorithm across
 the record format and the segment header. CRC32C was considered and is marginally
 better on small buffers on x86-64, but `crc32fast` won on ubiquity and maintenance;
 the difference is negligible against fsync.
 
-**Compression is off by default for the event log.** It costs nothing on small events
-and puts a decompress on the path of every random-access fetch after an index lookup.
-It earns its keep only on cold archival segments.
+**There is no per-record compression.** It was removed rather than left off-by-default:
+compressing individual few-hundred-byte events wins almost nothing (zstd's ratio comes
+from cross-event redundancy, which per-record compression discards), it forces a decompress
+onto every random-access fetch, and it fights the zero-copy scan (a decompressed record
+cannot be borrowed from the read-ahead buffer, so it forces an allocation on the hottest
+read path). The real compression story is the separately-addressed, block-compressed
+payload region in section 7 (deferred), which keeps type and tags scannable and uncompressed
+while a per-segment dictionary gets the ratio; whole-segment compression is reserved for the
+cold archival tier.
 
 ### 4.2 Batch commit markers
 
