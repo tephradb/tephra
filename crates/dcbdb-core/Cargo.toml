@@ -10,5 +10,5 @@ name = "dcbdb_core"
 path = "src/lib.rs"
 
 [dependencies]
-smallvec = "1"
-thiserror = "2.0"
+smallvec.workspace = true
+thiserror.workspace = true

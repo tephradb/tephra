@@ -6,9 +6,9 @@ license = "Apache-2.0"
 version = "0.1.0"
 
 [dependencies]
-dcbdb-core = { path = "../dcbdb-core" }
+dcbdb-core.workspace = true
 
-protobuf = "=4.35.1-release"
+protobuf.workspace = true
 
 [build-dependencies]
-protobuf-codegen = "=4.35.1-release"
+protobuf-codegen.workspace = true

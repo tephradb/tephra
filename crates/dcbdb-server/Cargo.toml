@@ -6,22 +6,22 @@ license = "Apache-2.0"
 version = "0.1.0"
 
 [dependencies]
-dcbdb = { path = "../.." }
-dcbdb-proto = { path = "../dcbdb-proto" }
+dcbdb.workspace = true
+dcbdb-proto.workspace = true
 
-argh = "0.1"
-config = { version = "0.15", default-features = false, features = ["toml"] }
-ctrlc = "3"
-protobuf = "=4.35.1-release"
-serde = { version = "1", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-socket2 = "0.6.5"
+argh.workspace = true
+config = { workspace = true, features = ["toml"] }
+ctrlc.workspace = true
+protobuf.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+socket2.workspace = true
 
 [dev-dependencies]
-dcbdb-client = { path = "../dcbdb-client" }
+dcbdb-client.workspace = true
 
-tempfile = "3"
+tempfile.workspace = true
 
 [[bin]]
 name = "dcbdb-server"

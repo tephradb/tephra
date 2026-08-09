@@ -9,16 +9,16 @@ license = "Apache-2.0"
 version = "0.2.2"
 
 [dependencies]
-crc32fast = "1.5"
-thiserror = "2.0"
-tracing = { version = "0.1", optional = true }
+crc32fast.workspace = true
+thiserror.workspace = true
+tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", features = ["fs"] }
+nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-criterion = "0.8"
-tempfile = "3.27"
+criterion.workspace = true
+tempfile.workspace = true
 
 [features]
 tracing = ["dep:tracing"]
