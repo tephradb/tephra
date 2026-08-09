@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::{error, fmt};
 
 use dcbdb_proto::dcbdb as pb;
@@ -205,8 +205,156 @@ impl Client {
         Ok((events, watermark))
     }
 
+    /// Opens a live subscription over `query`, resuming strictly after `after`: it streams all
+    /// matching events already durable, then tails new ones as they are committed, with no gap
+    /// and no duplicate at the boundary. A [`SubEvent::CaughtUp`] marker is delivered each time
+    /// the stream reaches the live edge.
+    ///
+    /// Returns the [`SubscribeStream`] and a [`SubscribeCancel`]. The stream borrows the client
+    /// for its lifetime, so this connection is dedicated to the subscription (it cannot serve
+    /// other requests while subscribed). To stop from another thread, hold the `Send`
+    /// [`SubscribeCancel`] and call [`cancel`](SubscribeCancel::cancel): it shuts the socket
+    /// down, ending the stream.
+    pub fn subscribe(
+        &mut self,
+        query: pb::Query,
+        after: u64,
+    ) -> Result<(SubscribeStream<'_>, SubscribeCancel), ClientError> {
+        let id = self.next_id();
+        let mut subscribe = pb::SubscribeRequest::new();
+        subscribe.set_query(query);
+        subscribe.set_after(after);
+        let mut request = pb::Request::new();
+        request.set_request_id(id);
+        request.set_subscribe(subscribe);
+        self.send(&request)?;
+
+        // A clone of the socket for out-of-band cancellation: shutting it down unblocks the
+        // stream's in-flight `read_frame`. Taken before borrowing the reader for the stream.
+        let cancel = SubscribeCancel {
+            stream: self.reader.get_ref().try_clone()?,
+        };
+        let stream = SubscribeStream {
+            reader: &mut self.reader,
+            max_frame_len: self.max_frame_len,
+            request_id: id,
+            buffered: VecDeque::new(),
+            done: false,
+        };
+        Ok((stream, cancel))
+    }
+
     fn recv(&mut self) -> Result<pb::Response, ClientError> {
         read_frame(&mut self.reader, self.max_frame_len)?.ok_or(ClientError::UnexpectedEof)
+    }
+}
+
+/// One item from a [`SubscribeStream`]: a matching event, or a live-edge marker.
+#[derive(Clone, Debug)]
+pub enum SubEvent {
+    /// A matching event, in ascending position order.
+    Event(pb::SequencedEvent),
+    /// The subscription drained everything up to this watermark and is now tailing live.
+    /// Re-armed: delivered again after each subsequent catch-up burst, watermark
+    /// non-decreasing.
+    CaughtUp(u64),
+}
+
+/// A `Send` handle that stops a [`SubscribeStream`] from another thread by shutting down the
+/// connection. A subscription otherwise never ends on its own, and the stream borrows the
+/// client, so this is the way to cancel a long-lived subscriber cleanly.
+pub struct SubscribeCancel {
+    stream: TcpStream,
+}
+
+impl SubscribeCancel {
+    /// Shuts the subscription's connection down, unblocking the stream and ending it. The
+    /// stream then yields a terminating error or `None`.
+    pub fn cancel(self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// A streaming iterator over a subscription. Yields [`SubEvent`]s indefinitely (events and
+/// re-armed caught-up markers) until the connection closes, the store shuts down, an error
+/// frame arrives, or a [`SubscribeCancel`] stops it.
+pub struct SubscribeStream<'a> {
+    reader: &'a mut BufReader<TcpStream>,
+    max_frame_len: u32,
+    request_id: u64,
+    buffered: VecDeque<SubEvent>,
+    done: bool,
+}
+
+impl SubscribeStream<'_> {
+    /// Reads response frames until the next event batch or caught-up marker arrives, or the
+    /// stream ends (clean close sets `done` with nothing buffered).
+    fn fill(&mut self) -> Result<(), ClientError> {
+        loop {
+            let response = match read_frame::<pb::Response, _>(self.reader, self.max_frame_len)? {
+                Some(response) => response,
+                // A clean close at a frame boundary (for example after a cancel): end quietly.
+                None => {
+                    self.done = true;
+                    return Ok(());
+                }
+            };
+            let got = response.request_id();
+            if got != self.request_id && got != UNATTRIBUTED_REQUEST_ID {
+                self.done = true;
+                return Err(ClientError::Protocol(format!(
+                    "response for request {got} does not match subscribe request {}",
+                    self.request_id
+                )));
+            }
+            match response.kind() {
+                pb::response::KindOneof::ReadEvents(events) => {
+                    for sequenced in events.events().iter() {
+                        self.buffered
+                            .push_back(SubEvent::Event(sequenced.to_owned()));
+                    }
+                    if !self.buffered.is_empty() {
+                        return Ok(());
+                    }
+                    // An empty batch is unusual but not an error: keep reading.
+                }
+                pb::response::KindOneof::CaughtUp(caught_up) => {
+                    self.buffered
+                        .push_back(SubEvent::CaughtUp(caught_up.watermark()));
+                    return Ok(());
+                }
+                pb::response::KindOneof::Error(error) => {
+                    self.done = true;
+                    return Err(server_error(error));
+                }
+                other => {
+                    self.done = true;
+                    return Err(ClientError::Protocol(format!(
+                        "unexpected response during subscribe: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for SubscribeStream<'_> {
+    type Item = Result<SubEvent, ClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(event) = self.buffered.pop_front() {
+            return Some(Ok(event));
+        }
+        if self.done {
+            return None;
+        }
+        match self.fill() {
+            Ok(()) => self.buffered.pop_front().map(Ok),
+            Err(err) => {
+                self.done = true;
+                Some(Err(err))
+            }
+        }
     }
 }
 

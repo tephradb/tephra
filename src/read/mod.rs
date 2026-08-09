@@ -13,10 +13,14 @@
 //!
 //! A [`Reads`] is pinned to the watermark read at call time ([`Reads::watermark`]): it
 //! returns a consistent *prefix* of the log, not a live view, and a caller cannot tell "no
-//! more events" from "no more events yet". That distinction belongs to subscriptions
-//! (not yet implemented); exposing the pinned watermark is the seam a later
-//! read/subscription resumes from with no
-//! gap.
+//! more events" from "no more events yet". That distinction is what a [`Subscription`]
+//! adds: it holds a `cursor` (the last-delivered position, an exclusive lower bound), reads
+//! `(cursor, watermark]` through this same path, advances the cursor to the pinned
+//! watermark, and *blocks* until the watermark advances again. Catch-up and live-tail are
+//! the one operation repeated, so the handoff has no gap (reads are `after`-exclusive) and
+//! no duplicate (the cursor advances to the pinned watermark). The blocking is a condvar in
+//! [`ReadCore`] the writer signals at each commit; the atomic watermark keeps the hot read
+//! path lock-free.
 //!
 //! ## Snapshot / watermark ordering
 //!
@@ -40,9 +44,9 @@
 //! that latched unindexable, falls back to scanning its own range regardless of the verdict.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -57,6 +61,10 @@ use crate::log::set::{LogError, Record, Scan, Segment, SegmentSet, SegmentSource
 use crate::query::Query;
 
 use crate::index::IndexSet;
+
+mod subscribe;
+
+pub use subscribe::Subscription;
 
 /// Configuration for the read paths: the index-vs-scan cost model's tuning.
 #[derive(Clone, Copy, Debug)]
@@ -148,6 +156,20 @@ impl SegmentSource for Snapshot {
     }
 }
 
+/// The parking side of the wakeup: a condvar subscribers block on until the watermark
+/// advances, used **only** by [`Subscription`]. The hot read path never touches it; it reads
+/// the atomic [`ReadCore::watermark`] directly. `subscribers` gates the writer's `wake` so a
+/// commit with no subscribers pays one atomic load instead of a mutex acquire.
+struct Notify {
+    /// Guards nothing but the condvar wait/notify handshake (the state lives in the atomics).
+    lock: Mutex<()>,
+    cv: Condvar,
+    /// Set once at coordinator shutdown; a parked subscriber wakes and reports `Closed`.
+    closed: AtomicBool,
+    /// Live subscriber count, so `wake` can skip the lock when there are none.
+    subscribers: AtomicUsize,
+}
+
 /// The shared read state, held by both the writer thread (to publish) and every
 /// [`ReadHandle`] (to read). Cheap to share: an `Arc<ReadCore>`.
 pub struct ReadCore {
@@ -157,6 +179,20 @@ pub struct ReadCore {
     segments: RwLock<Arc<Snapshot>>,
     /// Last durable (and index-fed) position. Stored on every commit.
     watermark: AtomicU64,
+    /// Subscriber parking, separate from the lock-free watermark (see [`Notify`]).
+    notify: Notify,
+}
+
+/// The outcome of a bounded [`Subscription::wait_timeout`]: the watermark advanced, the wait
+/// timed out (retry, or check an external shutdown flag), or the store closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The watermark advanced past the cursor; new events are available.
+    Advanced,
+    /// The timeout elapsed with no advance and no close.
+    TimedOut,
+    /// The write coordinator shut down; no further events will ever arrive.
+    Closed,
 }
 
 impl ReadCore {
@@ -166,6 +202,12 @@ impl ReadCore {
         Arc::new(ReadCore {
             segments: RwLock::new(Arc::new(Snapshot::capture(set, index))),
             watermark: AtomicU64::new(set.last_position().get()),
+            notify: Notify {
+                lock: Mutex::new(()),
+                cv: Condvar::new(),
+                closed: AtomicBool::new(false),
+                subscribers: AtomicUsize::new(0),
+            },
         })
     }
 
@@ -176,10 +218,14 @@ impl ReadCore {
         *self.segments.write().unwrap() = Arc::new(snapshot);
     }
 
-    /// Publishes the durable tip (writer thread, every commit). Release-ordered so a reader
-    /// acquiring it sees all segment/offset writes ordered before it.
+    /// Publishes the durable tip (writer thread, every commit). `SeqCst` (which is also a
+    /// release, preserving the snapshot-before-watermark ordering readers rely on): the
+    /// stronger order is load-bearing for the subscriber-wakeup gate in [`wake`](Self::wake),
+    /// where this store, the count increment, and the count load form a store-buffer pattern
+    /// that only a single total order rules out. One `mfence`-class barrier per commit,
+    /// negligible against the fsync on the same path.
     pub(crate) fn publish_watermark(&self, tip: Position) {
-        self.watermark.store(tip.get(), AtomicOrdering::Release);
+        self.watermark.store(tip.get(), AtomicOrdering::SeqCst);
     }
 
     /// Loads a consistent `(watermark, snapshot)` pair: watermark first (acquire), then the
@@ -188,6 +234,105 @@ impl ReadCore {
         let watermark = Position::new(self.watermark.load(AtomicOrdering::Acquire));
         let snapshot = Arc::clone(&self.segments.read().unwrap());
         (watermark, snapshot)
+    }
+
+    /// The watermark for the parked-subscriber gate decision in [`wait_past`](Self::wait_past),
+    /// loaded `SeqCst`. This is the **fourth** operation of the store-buffer pattern in
+    /// [`wake`](Self::wake): an `Acquire` load here would not be ordered against the writer's
+    /// `SeqCst` watermark store and count load in the single total order, so on a weakly-ordered
+    /// target it could be satisfied before the count increment is globally visible, letting a
+    /// `wake` read count `0`, skip the notify, and leave this subscriber parked below a newer
+    /// tip. `SeqCst` closes that hole.
+    fn watermark_gate(&self) -> Position {
+        Position::new(self.watermark.load(AtomicOrdering::SeqCst))
+    }
+
+    /// Wakes every parked subscriber (writer thread, after [`publish_watermark`] on every
+    /// commit). Gated on the subscriber count so a commit with no subscribers pays a single
+    /// atomic load, not a mutex acquire.
+    ///
+    /// The gate is a store-buffer (Dekker) pattern, forbidden only when **all four** of its
+    /// accesses are `SeqCst`: this store's preceding `publish_watermark` (watermark store), the
+    /// count `load` here, the count `fetch_add` in
+    /// [`register_subscriber`](Self::register_subscriber), and the parked subscriber's watermark
+    /// load ([`watermark_gate`](Self::watermark_gate) in [`wait_past`](Self::wait_past)).
+    /// Register runs (in program order) before a subscriber first reads the watermark. In the
+    /// single `SeqCst` total order, a `wake` that reads count `0` is ordered before that
+    /// increment, hence its watermark store is ordered before the subscriber's gate read, so the
+    /// subscriber observes this commit's tip and never parks below it. A `wake` that instead
+    /// sees the increment takes the lock, and the lock-guarded re-read of the watermark in
+    /// `wait_past` is the ordinary condvar handshake. Either way no wakeup is lost. (The count
+    /// only rises to 1 once per subscription and stays until drop, so the same argument covers
+    /// every later park, not just the first.) An `Acquire` gate read would leave the fourth
+    /// access unordered and reintroduce the lost wakeup on a weakly-ordered target.
+    pub(crate) fn wake(&self) {
+        if self.notify.subscribers.load(AtomicOrdering::SeqCst) == 0 {
+            return;
+        }
+        let _guard = self.notify.lock.lock().unwrap();
+        self.notify.cv.notify_all();
+    }
+
+    /// Marks the store closed and wakes every parked subscriber (writer thread, at shutdown).
+    /// `closed` is set (release) **before** taking the lock, so a waiter that evaluates
+    /// `closed` under the lock and decides to park cannot miss a close whose `notify_all` is
+    /// still pending (that notify also needs the lock).
+    pub(crate) fn close(&self) {
+        self.notify.closed.store(true, AtomicOrdering::Release);
+        let _guard = self.notify.lock.lock().unwrap();
+        self.notify.cv.notify_all();
+    }
+
+    /// Registers a new subscriber. Called from `Subscription::new` **before** the subscription
+    /// first reads the watermark (via `poll_batch`/`wait`), which is the ordering [`wake`] and
+    /// the `SeqCst` increment depend on: the increment must precede the first watermark read,
+    /// not merely the first `wait`.
+    fn register_subscriber(&self) {
+        self.notify.subscribers.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+
+    /// Balances [`register_subscriber`](Self::register_subscriber) on [`Subscription`] drop.
+    /// `Relaxed` is fine: an over-count only costs a spurious `wake` lock, never a lost wakeup.
+    fn deregister_subscriber(&self) {
+        self.notify
+            .subscribers
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Blocks until the watermark advances past `cursor` or the store closes. With
+    /// `timeout = None` it waits indefinitely (returning only `Advanced` or `Closed`); with a
+    /// timeout it may also return `TimedOut`. The watermark is re-read (`SeqCst`, see
+    /// [`watermark_gate`](Self::watermark_gate)) under `lock` on each pass, which is what makes
+    /// the wakeup lossless against the writer's watermark store + count-gated notify (see
+    /// [`wake`](Self::wake)).
+    fn wait_past(&self, cursor: Position, timeout: Option<Duration>) -> WaitOutcome {
+        let mut guard = self.notify.lock.lock().unwrap();
+        loop {
+            if self.notify.closed.load(AtomicOrdering::Acquire) {
+                return WaitOutcome::Closed;
+            }
+            if self.watermark_gate() > cursor {
+                return WaitOutcome::Advanced;
+            }
+            match timeout {
+                None => guard = self.notify.cv.wait(guard).unwrap(),
+                Some(dur) => {
+                    let (g, res) = self.notify.cv.wait_timeout(guard, dur).unwrap();
+                    guard = g;
+                    if res.timed_out() {
+                        // Re-check the predicate once more before reporting a timeout: an
+                        // advance or close may have landed as the timeout fired.
+                        if self.notify.closed.load(AtomicOrdering::Acquire) {
+                            return WaitOutcome::Closed;
+                        }
+                        if self.watermark_gate() > cursor {
+                            return WaitOutcome::Advanced;
+                        }
+                        return WaitOutcome::TimedOut;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -209,7 +354,14 @@ impl ReadHandle {
     /// buffer per item), so consume it with `while let Some(item) = reads.next()`.
     pub fn read(&self, query: Query, after: Position) -> Reads {
         let (watermark, snapshot) = self.core.load();
-        Reads::plan(snapshot, query, after, watermark, &self.config)
+        Reads::plan(snapshot, &query, after, watermark, &self.config)
+    }
+
+    /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up
+    /// on everything already durable, then tails live events with no gap and no duplicate at
+    /// the boundary. See [`Subscription`].
+    pub fn subscribe(&self, query: Query, after: Position) -> Subscription {
+        Subscription::new(Arc::clone(&self.core), self.config, query, after)
     }
 }
 
@@ -306,7 +458,7 @@ impl Reads {
     /// runs: both return the identical positions.
     fn plan(
         snapshot: Arc<Snapshot>,
-        query: Query,
+        query: &Query,
         after: Position,
         watermark: Position,
         config: &ReadConfig,
@@ -319,7 +471,7 @@ impl Reads {
             };
         }
 
-        let (estimate, width) = estimate_read(&snapshot, &query, after, watermark);
+        let (estimate, width) = estimate_read(&snapshot, query, after, watermark);
         let access = choose(estimate, width, config.scan_bias);
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -338,14 +490,18 @@ impl Reads {
             // routed the query here.
             Access::Scan => {
                 let scan = Scan::start(Arc::clone(&snapshot), after.next(), watermark);
-                let mode = if matches!(query, Query::All) {
+                // Only the filtered-scan mode retains the query, so it is the one path that
+                // clones; the zero-copy full-log scan and the indexed path borrow it and drop
+                // the borrow here. This keeps a repeated caller (a subscription polling every
+                // round) from re-allocating the query on the index and full-scan paths.
+                let mode = if matches!(*query, Query::All) {
                     Mode::Scan {
                         scan: Box::new(scan),
                     }
                 } else {
                     Mode::ScanFiltered(Box::new(ScanFilteredState {
                         scan,
-                        query,
+                        query: query.clone(),
                         buf: None,
                     }))
                 };
@@ -356,7 +512,7 @@ impl Reads {
                 }
             }
             // Selective: plan the ascending positions from the index, fetch on demand.
-            Access::Index => match plan_positions(&snapshot, &query, after, watermark) {
+            Access::Index => match plan_positions(&snapshot, query, after, watermark) {
                 Ok(positions) => Reads {
                     watermark,
                     pending_err: None,

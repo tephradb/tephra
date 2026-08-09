@@ -2,13 +2,15 @@
 //! by the blocking `dcbdb-client`.
 
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use dcbdb::log::set::{SegmentConfig, SegmentSet};
 use dcbdb::writer::{WriteCoordinator, WriterConfig};
 
 use dcbdb_client::{
-    Client, ClientError, condition, event, proto, query_all, query_item, query_items,
+    Client, ClientError, SubEvent, condition, event, proto, query_all, query_item, query_items,
 };
 use dcbdb_server::{Server, ServerConfig, ShutdownHandle};
 use tempfile::TempDir;
@@ -399,4 +401,236 @@ fn graceful_shutdown_stops_accepting_and_returns() {
             .is_err(),
     };
     assert!(refused, "server should refuse work after shutdown");
+}
+
+// ------------------------------- subscriptions -------------------------------
+
+/// Spawns a subscriber on its own thread (the stream borrows its client, so both live there).
+/// It forwards every item over `items` and hands back a `SubscribeCancel` on `cancel` so the
+/// test can stop it. Returns the join handle carrying nothing (results flow over `items`).
+fn spawn_subscriber(
+    mut client: Client,
+    query: proto::Query,
+    after: u64,
+    items: mpsc::Sender<Result<SubEvent, String>>,
+    cancel: mpsc::Sender<dcbdb_client::SubscribeCancel>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let (stream, canceller) = client.subscribe(query, after).unwrap();
+        cancel.send(canceller).unwrap();
+        for item in stream {
+            match item {
+                Ok(event) => {
+                    if items.send(Ok(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = items.send(Err(err.to_string()));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[test]
+fn subscribe_streams_catch_up_then_live() {
+    let ts = TestServer::start();
+
+    // Two events already durable before the subscription starts.
+    let mut appender = ts.client();
+    appender
+        .append(vec![event("E", &["k:1"], b"a")], None)
+        .unwrap();
+    appender
+        .append(vec![event("E", &["k:1"], b"b")], None)
+        .unwrap();
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let cancel = cancel_rx.recv().unwrap();
+
+    let mut positions = Vec::new();
+    let mut caught_up = Vec::new();
+
+    // Catch-up phase: the two pre-appended events arrive in order.
+    while positions.len() < 2 {
+        match item_rx.recv().unwrap() {
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::CaughtUp(w)) => caught_up.push(w),
+            Err(err) => panic!("subscription error: {err}"),
+        }
+    }
+
+    // Live phase: two more appended after the subscription is running.
+    appender
+        .append(vec![event("E", &["k:1"], b"c")], None)
+        .unwrap();
+    appender
+        .append(vec![event("E", &["k:1"], b"d")], None)
+        .unwrap();
+
+    while positions.len() < 4 {
+        match item_rx.recv().unwrap() {
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::CaughtUp(w)) => caught_up.push(w),
+            Err(err) => panic!("subscription error: {err}"),
+        }
+    }
+
+    assert_eq!(
+        positions,
+        vec![1, 2, 3, 4],
+        "no gap or duplicate across the catch-up/live boundary"
+    );
+    assert!(
+        !caught_up.is_empty(),
+        "expected at least one caught-up marker at the live edge"
+    );
+    assert!(
+        caught_up.windows(2).all(|w| w[0] <= w[1]),
+        "caught-up watermarks are non-decreasing"
+    );
+
+    cancel.cancel();
+    subscriber.join().unwrap();
+}
+
+#[test]
+fn subscribe_from_mid_position_skips_the_prefix() {
+    let ts = TestServer::start();
+    let mut appender = ts.client();
+    for i in 0..4 {
+        appender
+            .append(vec![event("E", &[&format!("k:{i}")], b"")], None)
+            .unwrap();
+    }
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    // Resume after position 2: only 3 and 4 should arrive.
+    let subscriber = spawn_subscriber(ts.client(), query_all(), 2, item_tx, cancel_tx);
+    let cancel = cancel_rx.recv().unwrap();
+
+    let mut positions = Vec::new();
+    while positions.len() < 2 {
+        match item_rx.recv().unwrap() {
+            Ok(SubEvent::Event(ev)) => positions.push(ev.position()),
+            Ok(SubEvent::CaughtUp(_)) => {}
+            Err(err) => panic!("subscription error: {err}"),
+        }
+    }
+    assert_eq!(positions, vec![3, 4]);
+
+    cancel.cancel();
+    subscriber.join().unwrap();
+}
+
+#[test]
+fn cancel_ends_a_live_subscription() {
+    let ts = TestServer::start();
+    let mut appender = ts.client();
+    appender
+        .append(vec![event("E", &["k:1"], b"")], None)
+        .unwrap();
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let cancel = cancel_rx.recv().unwrap();
+
+    // Receive the one durable event.
+    match item_rx.recv().unwrap() {
+        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position(), 1),
+        other => panic!("expected the first event, got {other:?}"),
+    }
+
+    // Cancel from this (other) thread: the subscriber, blocked at the live edge, unblocks and
+    // the stream ends. The thread must join without hanging.
+    cancel.cancel();
+    subscriber.join().unwrap();
+}
+
+#[test]
+fn idle_subscription_does_not_flood_caught_up_frames() {
+    // A short wait tick so several ticks elapse within the sleep below. A per-tick (rather than
+    // per-live-edge) caught-up would turn the bounded wait into a heartbeat and be caught here.
+    let server_config = ServerConfig {
+        subscribe_wait_tick: Duration::from_millis(20),
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    // Empty store: the subscription is immediately caught up.
+    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let cancel = cancel_rx.recv().unwrap();
+
+    match item_rx.recv().unwrap() {
+        Ok(SubEvent::CaughtUp(w)) => assert_eq!(w, 0),
+        other => panic!("expected a caught-up marker, got {other:?}"),
+    }
+
+    // Let many wait ticks elapse with no writes: exactly one caught-up should have been sent.
+    thread::sleep(Duration::from_millis(200));
+    match item_rx.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => {}
+        other => panic!("idle subscription sent an unexpected extra frame: {other:?}"),
+    }
+
+    // Still live: an append is delivered, followed by exactly one re-armed caught-up marker.
+    let mut appender = ts.client();
+    appender
+        .append(vec![event("E", &["k:1"], b"")], None)
+        .unwrap();
+    let mut saw_event = false;
+    let mut saw_caught_up = false;
+    for _ in 0..2 {
+        match item_rx.recv().unwrap() {
+            Ok(SubEvent::Event(ev)) => {
+                assert_eq!(ev.position(), 1);
+                saw_event = true;
+            }
+            Ok(SubEvent::CaughtUp(w)) => {
+                assert_eq!(w, 1);
+                saw_caught_up = true;
+            }
+            Err(err) => panic!("subscription error: {err}"),
+        }
+    }
+    assert!(
+        saw_event && saw_caught_up,
+        "expected the event and one re-armed caught-up marker"
+    );
+
+    cancel.cancel();
+    subscriber.join().unwrap();
+}
+
+#[test]
+fn server_shutdown_ends_an_idle_subscription() {
+    let ts = TestServer::start();
+    let mut appender = ts.client();
+    appender
+        .append(vec![event("E", &["k:1"], b"")], None)
+        .unwrap();
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let subscriber = spawn_subscriber(ts.client(), query_all(), 0, item_tx, cancel_tx);
+    let _cancel = cancel_rx.recv().unwrap();
+
+    // Drain the one event so the subscription is parked at the live edge (idle).
+    match item_rx.recv().unwrap() {
+        Ok(SubEvent::Event(ev)) => assert_eq!(ev.position(), 1),
+        other => panic!("expected the first event, got {other:?}"),
+    }
+
+    // Tear the server down (drop runs shutdown + coordinator shutdown). The idle subscription
+    // must end promptly rather than hang the connection thread.
+    drop(ts);
+    subscriber.join().unwrap();
 }

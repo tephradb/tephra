@@ -103,7 +103,7 @@ count, never for correctness. This is the thing LSM compaction can never be.
 | 4. Query planner | Chooses index vs scan per query item using exact posting lengths. |
 | 5. Read paths | Condition check, decision-model read, projection catch-up / subscriptions. |
 
-All five layers are implemented. Subscriptions (live-tail handoff) and the items in
+All five layers are implemented, subscriptions included (section 9). The items in
 section 12 remain future work.
 
 ---
@@ -748,7 +748,31 @@ Three distinct shapes, deliberately not unified:
    the sequential read hint. Highest volume by far.
 
 Subscriptions need catch-up followed by live-tail handoff with no gap and no duplicate at
-the boundary. This is subtle and is where event stores usually have bugs.
+the boundary. This is subtle and is where event stores usually have bugs, so the design
+**collapses the handoff out of existence**: catch-up and live-tail are the one operation
+repeated. A `Subscription` (`src/read/subscribe.rs`) holds a `cursor` (last-delivered
+position, an exclusive lower bound), reads `(cursor, watermark]` through the ordinary
+`Reads` path, advances the cursor to the *pinned* watermark, and blocks until the watermark
+advances. Every read is `after`-exclusive and the cursor lands on the pinned watermark, so
+nothing is skipped (gap) or re-delivered (duplicate), and there is no second "live" code
+path to keep consistent with the catch-up one. The cursor advances to the watermark only on
+genuine exhaustion (the `Reads` yields `None`, not because a batch cap was hit), so a
+selective query skips a non-matching tail without re-scanning it and a capped batch never
+loses the remainder.
+
+The one new primitive is blocking until the watermark advances. Reads stay lock-free on the
+atomic watermark; a condvar in `ReadCore` (`Notify`) parks subscribers only. The writer
+signals it at each commit seam (after publishing the watermark), gated on a live-subscriber
+count so a commit with no subscribers pays one atomic load, not a mutex acquire. That gate
+is a store-buffer pattern (writer stores watermark then loads the count; a registering
+subscriber stores the count then loads the watermark), so its three ops are `SeqCst`: the
+single total order rules out the interleaving that would lose a wakeup. `wait_past` re-reads
+the watermark under the condvar lock, which is the ordinary lossless condvar handshake for
+the non-skipped path. Shutdown sets a `closed` flag (before locking) and wakes everyone, so
+a parked subscriber ends rather than hangs. The server drives `poll_batch` + a bounded
+`wait_timeout` so an idle subscription still notices shutdown; the client exposes a
+`SubscribeCancel` (shuts the socket down) since a subscription otherwise never ends on its
+own. A re-armed `caught-up` marker is emitted each time the stream reaches the live edge.
 
 Readers are lock-free over immutable segments plus an atomically published watermark.
 Immutability means readers never block the writer.
@@ -758,8 +782,9 @@ at each commit seam. There is no reader pool and no channel hop, and the writer 
 never touched: sealed segments are shared as immutable `Arc`s (lock-free), and how far a
 read may see is an atomically published watermark. A read is pinned to the watermark it
 loads at call time: it returns a consistent *prefix*, not a live view, and cannot tell "no
-more events" from "no more events yet" (that distinction is phase 7's). `Reads` exposes its
-pinned watermark, the seam a later read or subscription resumes from with no gap.
+more events" from "no more events yet" (that distinction is the subscription's, above).
+`Reads` exposes its pinned watermark, the seam a later read or subscription resumes from
+with no gap.
 
 **The governing concurrency rule: no lock may be held across query evaluation.** A lock
 held for a single hash probe (or one `Arc` clone) is acceptable; a lock held while
@@ -799,7 +824,9 @@ the one current when `W` was stored, and segment sets only grow.
 Phase 6a landed the caller-thread reader, the published snapshot, and the streaming `read`,
 with the active *range* answered by a bounded log scan. Phase 6b converts the active tail to
 the append-only, watermark-published form above and lets readers evaluate it lock-free, so
-the active range is now index-driven like the sealed ranges.
+the active range is now index-driven like the sealed ranges. Phase 7 adds the `Subscription`
+and the `Notify` wakeup on top of exactly this machinery: a subscription is repeated `read`s
+off an advancing watermark, nothing more.
 
 ---
 
@@ -873,7 +900,9 @@ src/
     tips.rs         // TagTips (durable, lossy) + StagedTips (batch, complete)
 
   read/
-    mod.rs          // layer-5 off-thread read paths: ReadCore, ReadHandle, Snapshot, Reads
+    mod.rs          // layer-5 off-thread read paths: ReadCore, ReadHandle, Snapshot, Reads,
+                    // Notify (subscriber wakeup), WaitOutcome
+    subscribe.rs    // Subscription: cursor + watermark loop over Reads (catch-up == live-tail)
 
   index/
     mod.rs          // TermId, TypeId, SegmentIndex trait; re-exports

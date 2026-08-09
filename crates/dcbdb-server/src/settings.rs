@@ -12,6 +12,7 @@
 //! are not exposed at any tier.
 
 use std::error::Error;
+use std::time::Duration;
 
 use argh::FromArgs;
 use config::{Config, Environment, File, FileFormat};
@@ -138,16 +139,29 @@ impl Default for ReadSettings {
     }
 }
 
-/// TCP server tuning: frame limit and streamed-read flush thresholds.
+/// TCP server tuning: frame limit, streamed-read flush thresholds, subscription pacing, and
+/// TCP keepalive. Durations are expressed as integers with an explicit unit suffix so they
+/// stay natural TOML/env scalars (there is no bare `Duration` on the wire).
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSettings {
     /// Largest single frame accepted or produced, in bytes.
     pub max_frame_len: u32,
-    /// A streamed read is flushed as a frame once it holds this many events.
+    /// A streamed read (or subscription) is flushed as a frame once it holds this many events.
     pub read_batch_events: usize,
-    /// A streamed read is flushed as a frame once its buffered events reach this many bytes.
+    /// A streamed read (or subscription) is flushed as a frame once its buffered events reach
+    /// this many bytes.
     pub read_batch_bytes: usize,
+    /// How often an idle subscription's blocking wait wakes to re-check server shutdown, in
+    /// milliseconds. Keeps a subscription with no events flowing responsive to shutdown
+    /// without a heartbeat frame.
+    pub subscribe_wait_tick_ms: u64,
+    /// TCP keepalive idle time before the first probe on an accepted connection, in seconds.
+    /// The OS default (~2h on Linux) is too long to reap a silently-dead subscription
+    /// promptly.
+    pub keepalive_idle_secs: u64,
+    /// Interval between TCP keepalive probes once they start, in seconds.
+    pub keepalive_interval_secs: u64,
 }
 
 impl Default for ServerSettings {
@@ -156,6 +170,9 @@ impl Default for ServerSettings {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             read_batch_events: 1024,
             read_batch_bytes: 512 * 1024,
+            subscribe_wait_tick_ms: 250,
+            keepalive_idle_secs: 60,
+            keepalive_interval_secs: 15,
         }
     }
 }
@@ -188,6 +205,9 @@ impl Settings {
             max_frame_len: self.server.max_frame_len,
             read_batch_events: self.server.read_batch_events,
             read_batch_bytes: self.server.read_batch_bytes,
+            subscribe_wait_tick: Duration::from_millis(self.server.subscribe_wait_tick_ms),
+            keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
+            keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
         }
     }
 
@@ -201,6 +221,18 @@ impl Settings {
         }
         if self.writer.max_batch_records == 0 {
             return Err("writer.max_batch_records must be at least 1".to_string());
+        }
+        // A zero wait tick would make the subscription's bounded wait return immediately and
+        // busy-spin; zero keepalive timers are meaningless. Reject rather than let either
+        // degrade silently.
+        if self.server.subscribe_wait_tick_ms == 0 {
+            return Err("server.subscribe_wait_tick_ms must be at least 1".to_string());
+        }
+        if self.server.keepalive_idle_secs == 0 {
+            return Err("server.keepalive_idle_secs must be at least 1".to_string());
+        }
+        if self.server.keepalive_interval_secs == 0 {
+            return Err("server.keepalive_interval_secs must be at least 1".to_string());
         }
         Ok(())
     }
@@ -270,6 +302,12 @@ mod tests {
         assert_eq!(server.max_frame_len, server_default.max_frame_len);
         assert_eq!(server.read_batch_events, server_default.read_batch_events);
         assert_eq!(server.read_batch_bytes, server_default.read_batch_bytes);
+        assert_eq!(
+            server.subscribe_wait_tick,
+            server_default.subscribe_wait_tick
+        );
+        assert_eq!(server.keepalive_idle, server_default.keepalive_idle);
+        assert_eq!(server.keepalive_interval, server_default.keepalive_interval);
 
         assert_eq!(settings.bind, "127.0.0.1:9000");
         assert_eq!(settings.data_dir, "dcbdb-data");
@@ -299,6 +337,23 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.writer.max_batch_records = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn zero_server_durations_are_rejected() {
+        // A zero wait tick would busy-spin the subscription loop; zero keepalive timers are
+        // meaningless. Each must be rejected at load time.
+        let mut settings = Settings::default();
+        settings.server.subscribe_wait_tick_ms = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.server.keepalive_idle_secs = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.server.keepalive_interval_secs = 0;
         assert!(settings.validate().is_err());
     }
 }

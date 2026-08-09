@@ -39,6 +39,15 @@ message ReadRequest {
   uint64 after = 2;
 }
 
+// Opens a live subscription: catch up on all events matching `query` after `after`, then
+// tail new ones as they are committed. The server streams `ReadEvents` batches and a
+// `SubscribeCaughtUp` marker each time the stream reaches the live edge. A subscription never
+// ends with a `ReadEnd`; it terminates only when the connection closes or errors.
+message SubscribeRequest {
+  Query query = 1;
+  uint64 after = 2;
+}
+
 message AppendResponse {
   uint64 first = 1;
   uint64 last = 2;
@@ -56,6 +65,12 @@ message ReadEvents {
 
 // Terminates a successful read, carrying the watermark the read was pinned to.
 message ReadEnd {
+  uint64 watermark = 1;
+}
+
+// Sent on a subscription each time it drains all events up to the current watermark and is
+// about to tail live. Re-armed: emitted once per live-edge, with non-decreasing watermarks.
+message SubscribeCaughtUp {
   uint64 watermark = 1;
 }
 
@@ -84,6 +99,7 @@ message Request {
   oneof kind {
     AppendRequest append = 2;
     ReadRequest read = 3;
+    SubscribeRequest subscribe = 4;
   }
 }
 
@@ -94,5 +110,6 @@ message Response {
     ReadEvents read_events = 3;
     ReadEnd read_end = 4;
     ErrorResponse error = 5;
+    SubscribeCaughtUp caught_up = 6;
   }
 }

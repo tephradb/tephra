@@ -323,11 +323,29 @@ index). See the phase-6 plan for the confirmed decisions behind each.
 
 ## Phase 7: Subscriptions
 
-- [ ] Catch-up from a position
-- [ ] Live tailing off the published watermark
-- [ ] Handoff with no gap and no duplicate at the boundary
-- [ ] Tests that hammer the boundary specifically: append during catch-up, subscriber
-      slower than the writer, subscriber starting exactly at the watermark
+- [x] Catch-up from a position, then live tailing off the published watermark, unified as
+      one loop: a `Subscription` (`src/read/subscribe.rs`) reads `(cursor, watermark]`
+      through the ordinary `Reads` path and advances the cursor to the pinned watermark, so
+      catch-up and live-tail are the same operation repeated and the handoff has no separate
+      code path to get wrong
+- [x] Handoff with no gap and no duplicate: reads are `after`-exclusive and the cursor lands
+      on the pinned watermark; it advances past a non-matching tail only on genuine `Reads`
+      exhaustion (not a batch cap), so a selective query never re-scans and a capped batch
+      never drops the remainder
+- [x] Blocking-until-advance primitive: a condvar in `ReadCore` (`Notify`) the writer signals
+      at each commit seam, gated on a live-subscriber count. The gate is a store-buffer pattern
+      whose three ops (watermark store, count increment, count load) are `SeqCst` so no wakeup
+      is lost; `wait_past` re-reads the watermark under the lock for the non-skipped path;
+      shutdown sets `closed` before locking and wakes everyone
+- [x] Wired through the server and client: a `SubscribeRequest`/`SubscribeCaughtUp` protocol
+      (re-armed caught-up marker), `handle_subscribe` driving `poll_batch` + a bounded
+      `wait_timeout` so an idle subscription stays shutdown-responsive, explicit TCP keepalive
+      (`socket2`) to reap dead connections, and a client `SubscribeStream` + `Send`
+      `SubscribeCancel`
+- [x] Tests that hammer the boundary: append during catch-up, subscriber slower than the
+      writer, subscriber starting exactly at the watermark, shutdown waking a blocked
+      subscriber, a contention/lost-wakeup stress, plus server/client integration over a real
+      socket (catch-up-then-live, mid-position resume, cancel, server-shutdown teardown)
 
 This is subtle and is where event stores usually have bugs. Budget accordingly.
 

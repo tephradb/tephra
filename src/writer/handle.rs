@@ -6,7 +6,7 @@ use crate::Position;
 use crate::event::Event;
 use crate::log::set::PositionRange;
 use crate::query::{AppendCondition, Query};
-use crate::read::{ReadHandle, Reads};
+use crate::read::{ReadHandle, Reads, Subscription};
 
 use super::{AppendError, Message, Request};
 
@@ -66,6 +66,15 @@ impl WriteHandle {
     /// [`ReadHandle::read`] and [`Reads`].
     pub fn read(&self, query: Query, after: Position) -> Reads {
         self.reader.read(query, after)
+    }
+
+    /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up
+    /// on all durable events, then tails live ones with no gap and no duplicate at the
+    /// boundary. Runs on the caller's thread over the published read state, like
+    /// [`read`](Self::read); it blocks (on a condvar the writer signals at each commit) only
+    /// while waiting for new events. See [`Subscription`].
+    pub fn subscribe(&self, query: Query, after: Position) -> Subscription {
+        self.reader.subscribe(query, after)
     }
 
     /// A standalone [`ReadHandle`] for pure readers, sharing this handle's published read

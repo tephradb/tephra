@@ -33,6 +33,9 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use socket2::{SockRef, TcpKeepalive};
 
 use dcbdb::writer::WriteHandle;
 use dcbdb_proto::DEFAULT_MAX_FRAME_LEN;
@@ -45,10 +48,21 @@ pub struct ServerConfig {
     /// Largest single frame accepted or produced, in bytes. Bounds per-frame memory and
     /// rejects a hostile length before allocating for it.
     pub max_frame_len: u32,
-    /// A streamed read is flushed as a frame once it holds this many events.
+    /// A streamed read (or subscription) is flushed as a frame once it holds this many events.
     pub read_batch_events: usize,
-    /// A streamed read is flushed as a frame once its buffered events reach this many bytes.
+    /// A streamed read (or subscription) is flushed as a frame once its buffered events reach
+    /// this many bytes.
     pub read_batch_bytes: usize,
+    /// How often an idle subscription's blocking wait wakes to re-check server shutdown. Keeps
+    /// a subscription with no events flowing responsive to `shutdown` without a heartbeat
+    /// frame.
+    pub subscribe_wait_tick: Duration,
+    /// TCP keepalive idle time before the first probe on an accepted connection. The OS
+    /// default (~2h on Linux) is too long to reap a silently-dead subscription promptly, so it
+    /// is set explicitly.
+    pub keepalive_idle: Duration,
+    /// Interval between TCP keepalive probes once they start.
+    pub keepalive_interval: Duration,
 }
 
 impl Default for ServerConfig {
@@ -57,6 +71,9 @@ impl Default for ServerConfig {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             read_batch_events: 1024,
             read_batch_bytes: 512 * 1024,
+            subscribe_wait_tick: Duration::from_millis(250),
+            keepalive_idle: Duration::from_secs(60),
+            keepalive_interval: Duration::from_secs(15),
         }
     }
 }
@@ -173,6 +190,16 @@ impl Server {
                 }
             };
 
+            // Explicit TCP keepalive so a silently-dead connection (for example a subscriber
+            // whose client vanished) is eventually reaped by the OS, rather than after the
+            // multi-hour default idle. Best-effort: a failure only forgoes early reaping.
+            let keepalive = TcpKeepalive::new()
+                .with_time(self.config.keepalive_idle)
+                .with_interval(self.config.keepalive_interval);
+            if let Err(err) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+                tracing::warn!(%err, "failed to set TCP keepalive");
+            }
+
             // A registry clone lets shutdown wake this connection if it parks on a read. If we
             // cannot clone it, we cannot guarantee that, so refuse the connection rather than
             // risk a thread that shutdown can never reach.
@@ -194,10 +221,14 @@ impl Server {
             let handle = self.handle.clone();
             let config = self.config;
             let connections = self.connections.clone();
+            // The accept-loop flag doubles as the subscription shutdown signal: an idle
+            // subscription's bounded wait re-checks it each tick, so shutdown ends the stream
+            // even when no events flow and the socket is idle.
+            let running = Arc::clone(&self.running);
             let thread = thread::Builder::new()
                 .name("dcbdb-conn".to_string())
                 .spawn(move || {
-                    conn::serve_connection(stream, handle, config);
+                    conn::serve_connection(stream, handle, config, running);
                     connections.remove(id);
                 })?;
             threads.push(thread);

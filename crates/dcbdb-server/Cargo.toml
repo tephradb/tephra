@@ -16,6 +16,7 @@ protobuf = "=4.35.1-release"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+socket2 = "0.6.5"
 
 [dev-dependencies]
 dcbdb-client = { path = "../dcbdb-client" }

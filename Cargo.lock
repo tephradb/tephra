@@ -395,6 +395,7 @@ dependencies = [
  "dcbdb-proto",
  "protobuf",
  "serde",
+ "socket2 0.6.5",
  "tempfile",
  "tracing",
  "tracing-subscriber",

@@ -139,6 +139,10 @@ impl Worker {
                 break;
             }
         }
+        // Wake every parked subscriber so it observes the close and ends (covers both the
+        // explicit `Shutdown` message and channel disconnect). No commit follows, so this is
+        // the last signal a subscription will ever get.
+        self.read_core.close();
         self.set
     }
 
@@ -283,6 +287,9 @@ impl Worker {
                         .publish_segments(Snapshot::capture(&self.set, &self.index));
                 }
                 self.read_core.publish_watermark(self.set.last_position());
+                // Wake any subscribers parked below the new tip. Gated on the subscriber
+                // count, so a commit with no subscribers pays a single atomic load.
+                self.read_core.wake();
 
                 let next = self.set.next_position();
                 batch.commit_ok(range, &mut self.tips, next);
