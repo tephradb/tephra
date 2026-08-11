@@ -1,11 +1,11 @@
 # Roadmap
 
-Companion to `CLAUDE.md`. That document says *what* the system is and *why*; this one
+Companion to `ARCHITECTURE.md`. That document says *what* the system is and *why*; this one
 tracks *what is done and what is next*.
 
 Ordered by dependency. Do not skip ahead: each phase exists because the next one needs
 it. Check items off as they land, and when a decision gets made that contradicts
-`CLAUDE.md`, update `CLAUDE.md` in the same commit.
+`ARCHITECTURE.md`, update `ARCHITECTURE.md` in the same commit.
 
 Status key: `[x]` done, `[~]` in progress, `[ ]` not started.
 
@@ -86,15 +86,15 @@ Pure logic, no I/O. Blocks everything in phase 3.
 - [x] `Tags(SmallVec<[Tag; 4]>)`: sorted, duplicates **rejected** not deduped
 - [x] ~~`Tags::from_sorted_unchecked` for the decode path~~ **Removed.** The zero-copy
       `EventRef` decode never rebuilds a `Tags` (it yields borrowed `&str`), so the
-      unsafe constructor had no caller. Reconciled in CLAUDE.md 5.3
+      unsafe constructor had no caller. Reconciled in ARCHITECTURE.md 5.3
 - [x] `Event { buf: Box<[u8]>, data_offset }` (dropped the cached `type_len` / `tag_lens`:
       derivable from `buf`'s header, so `EventRef` is a `Copy` allocation-free view;
-      CLAUDE.md 5.1 updated)
+      ARCHITECTURE.md 5.1 updated)
 - [x] `EventRef<'a>` borrowing a `&[u8]` (joined to `RecordRef::data` at the call site)
 - [x] All accessors return borrows: `&str` (type), `&[u8]` (payload), and `TagsRef`, a
-      borrowed iterator of `&str`, for tags. **Deviation from CLAUDE.md 5.1**: tags
+      borrowed iterator of `&str`, for tags. **Deviation from ARCHITECTURE.md 5.1**: tags
       cannot be `&[Tag]` zero-copy (variable-length strings packed contiguously have no
-      fixed stride); CLAUDE.md 5.1 updated to match
+      fixed stride); ARCHITECTURE.md 5.1 updated to match
 - [x] `Event::to_owned()` from `EventRef`; borrowed is the primitive, owned is the
       convenience
 - [x] Codec: type, then sorted tags, then payload, contiguous, length-prefixed
@@ -140,14 +140,14 @@ Pure logic, no I/O.
       `may_match() -> Verdict{DefinitelyNoMatch, Unknown}`, plus `StagedTips` (batch,
       complete). **Two types, not one**: they disagree on what an absent tag means
       (`Unknown` vs "definitely not staged"), which is load-bearing. Keys are tag strings
-      (`Box<str>`), not a hash, for diagnosability (CLAUDE.md 6). Floor is monotonic
+      (`Box<str>`), not a hash, for diagnosability (ARCHITECTURE.md 6). Floor is monotonic
       non-decreasing so an event predating the floor never yields a false negative
 - [x] Tested the window boundary, the `after < window_floor` fallthrough, the
       `after == tip` with staged-at-`tip + 1` boundary, and floor monotonicity. A
       randomized `verify_tips` property test (600 iters) asserts tips agree with the scan
 - [x] ~~Fixed-size hashed array fallback~~ **Not built.** String keys do not collide;
       the collision-safety property is documented as a constraint on any future hashed
-      variant rather than tested here (CLAUDE.md 6)
+      variant rather than tested here (ARCHITECTURE.md 6)
 - [x] `writer/condition.rs`: two arms. Staged arm (`StagedTips`) settles intra-batch
       conflicts (conservative, tag-only, `ConflictSite::SameBatch`, advisory/retryable);
       durable arm is tips fast-reject then a scan from `after` (`ConflictSite::Durable`)
@@ -218,7 +218,7 @@ isolation, before any serialization rigor or coordinator change.
       decode of it is a named hard error, never a silent skip)
 - [x] Persist the dense `u16` type column per segment (plus a type dictionary for
       name-to-id), read back through the shared `Arc<[u8]>`. Loaded into memory, not mmap'd
-      (SIGBUS on truncation, writer-thread page-fault stalls, cache control); CLAUDE.md 7
+      (SIGBUS on truncation, writer-thread page-fault stalls, cache control); ARCHITECTURE.md 7
       updated
 - [x] Inline feeding at the commit seam (`commit_ok`), **before the reply** for
       read-your-writes; seal one index segment per sealed log segment on rollover, publishing
@@ -233,7 +233,7 @@ isolation, before any serialization rigor or coordinator change.
       and live feed-and-seal
 - [x] Segment pruning by header comparison for `after: p` (`max = base + count - 1 <= after`
       skips a segment). A degraded (unindexable) touched segment errors with its range rather
-      than answering short (CLAUDE.md 7)
+      than answering short (ARCHITECTURE.md 7)
 
 ## Phase 6: Query planner and read paths (layers 4 and 5)
 
@@ -294,7 +294,7 @@ index). See the phase-6 plan for the confirmed decisions behind each.
       upper bound on the active tail) vs the post-pruning range width, biased toward scanning
       at the margin, `K` the `ReadConfig::scan_bias` knob, every decision trace-logged (the
       aggregate verdict at `debug`, per-item estimates at `trace`). The decision is
-      whole-query for now; the per-item planner is deferred (CLAUDE.md 8), with the per-item
+      whole-query for now; the per-item planner is deferred (ARCHITECTURE.md 8), with the per-item
       logs as the data that would justify building it
 - [x] Broad-projection bypass: a query whose estimated result is a large fraction of the
       range streams a filtered log scan rather than the index (`Query::all` stays the
@@ -403,7 +403,7 @@ and none block anything.
       coordinator, never in the engine. Build only against a concrete requirement, and
       anchor to a citable design rather than a homegrown scheme: a half-built integrity
       feature gives false assurance. The near-free enabling step is to reserve the control
-      kind byte now (CLAUDE.md 4.2 already argues for reserving future control kinds), which
+      kind byte now (ARCHITECTURE.md 4.2 already argues for reserving future control kinds), which
       keeps the door open without committing crypto. Prompted by umadb-io/umadb#18
 - [ ] Benchmarks: fsync-bound throughput, group commit batch-size behaviour under load,
       condition-check latency with and without tips
@@ -412,7 +412,7 @@ and none block anything.
 
 ## Standing rules
 
-- Any decision that contradicts `CLAUDE.md` updates `CLAUDE.md` in the same commit.
+- Any decision that contradicts `ARCHITECTURE.md` updates `ARCHITECTURE.md` in the same commit.
 - Recovery logic stays pure over byte slices, testable without file handles.
 - Nothing outside the write coordinator assigns a position.
 - Golden byte arrays are layout locks: bump the version, never regenerate.

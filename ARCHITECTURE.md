@@ -813,7 +813,7 @@ one evaluator serves the sealed and active halves alike. If the active segment l
 unindexable (section 7.1), feeding stops while positions keep arriving, so the columns go
 short of the watermark; the tail carries that latch as a live `AtomicBool` (it fires
 mid-segment, with no snapshot republish), and a reader that observes it scans the log for the
-active range rather than trust the short columns, never a short answer (CLAUDE.md 7, 4.7).
+active range rather than trust the short columns, never a short answer (ARCHITECTURE.md 7, 4.7).
 
 **Snapshot / watermark ordering.** The writer publishes the segment set (on rollover)
 before the watermark (every commit); a reader loads the watermark before the segment set.

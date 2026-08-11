@@ -972,13 +972,13 @@ hardware is named anywhere, because no results are recorded.
 
 - `Position` arithmetic is unusual by design: `Position + Position` and `Position - Position`
   both yield `u64`, not `Position`. Subtraction returning a `u64` count is intentional
-  (documented in CLAUDE.md), but `Add<Position> for Position -> u64` is a surprising shape
+  (documented in ARCHITECTURE.md), but `Add<Position> for Position -> u64` is a surprising shape
   worth flagging in prose.
 
 - `ConflictSite::SameBatch` is advisory and retryable; `ConflictSite::Durable(pos)` is
   terminal. The client surfaces this split as `ClientError::Server { retryable,
   conflict_position, .. }`. A caller that collapses the two into a bare position loses the
-  retry contract (CLAUDE.md section 6 calls this out explicitly).
+  retry contract (ARCHITECTURE.md section 6 calls this out explicitly).
 
 - `WriteHandle::append_async` exists only under the `async` cargo feature
   (`async = ["flume/async"]` in `crates/tephra/Cargo.toml`). Document it as feature-gated

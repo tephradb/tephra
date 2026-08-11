@@ -11,7 +11,7 @@ modify engine source except to add doc examples that are compiled and tested.
 
 ## 1. Ground truth
 
-`CLAUDE.md` is the architecture document and `ROADMAP.md` is the status document. Read both
+`ARCHITECTURE.md` is the architecture document and `ROADMAP.md` is the status document. Read both
 in full before writing a line of copy. Then read the actual source: `src/`,
 `crates/tephra-types`, `crates/tephra-client`, `crates/tephra-proto`, the integration tests
 in `tests/`, and the benches in `benches/`.
@@ -27,11 +27,11 @@ Three rules follow from that:
   on the site must be copied from the source. If you want to show something the API does not
   currently expose cleanly, say so in your final report rather than papering over it.
 - **Do not soften the constraints.** Single logical writer per bounded context, no sharding,
-  fsync as the throughput ceiling, single node. These are stated plainly in `CLAUDE.md`
+  fsync as the throughput ceiling, single node. These are stated plainly in `ARCHITECTURE.md`
   section 10 and they belong on the site with the same directness. An engineer who hits them
   after adopting the database is a worse outcome than one who reads them and walks away.
 
-Where `CLAUDE.md` gives a rationale, the site can carry the rationale. That reasoning is the
+Where `ARCHITECTURE.md` gives a rationale, the site can carry the rationale. That reasoning is the
 most valuable thing the project has to publish and most databases never write it down.
 
 ---
@@ -69,7 +69,7 @@ with the hardware and the caveat (the condition-path bench numbers are on tmpfs,
 **Docs, in this order:**
 
 1. *Introduction*: what a Dynamic Consistency Boundary is and the problem it removes. Work
-   from `CLAUDE.md` section 1. Use the course-and-student example, since it is the canonical
+   from `ARCHITECTURE.md` section 1. Use the course-and-student example, since it is the canonical
    one in DCB material and readers arriving from Sara Pellegrini's work will recognise it.
    Show the aggregate-plus-saga version of the same decision alongside the DCB version.
 2. *Getting started*: install, run the server, connect with `tephra-client`, append, read,
@@ -86,7 +86,7 @@ with the hardware and the caveat (the condition-path bench numbers are on tmpfs,
    real fields), durability semantics, what happens on crash and what recovery does, startup
    outcomes (clean, recovered with rollback, corrupt and refusing to open), what a corrupt
    index does versus a corrupt log, backpressure behaviour, shutdown.
-6. *Architecture*: the layer map and the design rationale, adapted from `CLAUDE.md`. This is a
+6. *Architecture*: the layer map and the design rationale, adapted from `ARCHITECTURE.md`. This is a
    public-facing rewrite, not a copy and paste. Keep the rejected alternatives and why they
    were rejected, since that is the part readers cannot get anywhere else. Cover the log
    format, batch commit markers and the recovery rule, the split of high-cardinality tags into
@@ -94,7 +94,7 @@ with the hardware and the caveat (the condition-path bench numbers are on tmpfs,
    segments and why merging is concatenation, the two-arm condition check, the append-only
    active tail and the published watermark, and the planner's invariant that it can change the
    speed but never the answer.
-7. *Comparison*: UmaDB first, using `CLAUDE.md` section 15. Be fair to it. It reaches the same
+7. *Comparison*: UmaDB first, using `ARCHITECTURE.md` section 15. Be fair to it. It reaches the same
    single-writer conclusion by a different route and its dual-header COW gives cleaner
    recovery than a scan. State where Tephra diverges and the workload assumption behind each
    divergence. Then a shorter section on why this is not EventStoreDB, Kafka, or Postgres, in
@@ -109,7 +109,7 @@ docs describe.
 
 ## 4. Writing style
 
-The house style is the one already in `CLAUDE.md`: declarative, dense, technically specific,
+The house style is the one already in `ARCHITECTURE.md`: declarative, dense, technically specific,
 willing to state a tradeoff without hedging it into mush. Match it. The site should read like
 one engineer explaining a system to another, not like marketing copy and not like a model
 imitating marketing copy.
@@ -219,6 +219,6 @@ end. Context will compact several times over a job this size and that file is wh
 - Confirm against `ROADMAP.md` that nothing described as working is actually in Phase 8.
 
 Report back with: the stack decision and its reasoning, the file tree, anything in
-`CLAUDE.md` or `ROADMAP.md` that was ambiguous or that you think is now stale, any API that
+`ARCHITECTURE.md` or `ROADMAP.md` that was ambiguous or that you think is now stale, any API that
 was awkward to document (that is usually a signal about the API, not the docs), and a list of
 claims you were unsure you could support so they can be checked.

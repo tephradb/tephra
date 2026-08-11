@@ -76,7 +76,7 @@ an append returns.
 
 ## Documentation
 
-- `CLAUDE.md` is the architecture document: what the system is, why each structural choice
+- `ARCHITECTURE.md` is the architecture document: what the system is, why each structural choice
   was made, and which alternatives were rejected.
 - `ROADMAP.md` tracks what is done and what is next.
 
