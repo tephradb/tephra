@@ -85,8 +85,12 @@ would need to be true before it starts.
 ## Install
 
 ```sh
-# Run the server, then talk to it with the client:
-cargo run -p tephra-server
+# Run the server, whichever way suits you (Docker, Nix, or Cargo):
+docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
+nix run github:tqwewe/tephra
+cargo install tephra-server
+
+# Then talk to it with the client:
 cargo add tephra-client
 
 # Or embed the engine directly in a Rust process:

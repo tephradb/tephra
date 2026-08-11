@@ -3,7 +3,7 @@ title: Getting started
 description: Run the Tephra server, connect with the client, and append, read, and subscribe.
 ---
 
-import { Code } from '@astrojs/starlight/components';
+import { Code, Tabs, TabItem } from '@astrojs/starlight/components';
 import { anchor } from '../../lib/snippet';
 import gsRaw from '../../../tephra-site-examples/tests/getting_started.rs?raw';
 
@@ -12,17 +12,34 @@ This page runs start to finish against a real server. Everything after "Run the 
 
 ## Run the server
 
-The server is a synchronous, thread-per-connection TCP server. Start it from a checkout of the
-workspace:
+The server is a synchronous, thread-per-connection TCP server. There are three ways to start it,
+none needing a checkout of the workspace. Pick whichever fits how you already run things.
 
-```sh
-cargo run -p tephra-server
-```
+<Tabs>
+  <TabItem label="Docker">
+    ```sh
+    docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
+    ```
+  </TabItem>
+  <TabItem label="Nix">
+    ```sh
+    nix run github:tqwewe/tephra
+    ```
+  </TabItem>
+  <TabItem label="Cargo">
+    ```sh
+    cargo install tephra-server
+    tephra-server
+    ```
+  </TabItem>
+</Tabs>
 
-It binds `127.0.0.1:9000` and writes its log and index segments under `tephra-data` in the
-working directory. Both are configurable by flag, environment variable, or a TOML file: see
-[Operations](../operations/) for the full surface. The defaults, including the 256 MiB segment
-size, are the server's, not the library's.
+Run through Nix or Cargo, the server binds `127.0.0.1:9000` and writes its log and index segments
+under `tephra-data` in the working directory. The Docker image publishes on `0.0.0.0:9000` and
+keeps its data in the `/data` volume, mapped above to a named `tephra-data` volume. Bind address,
+data directory, and everything else are configurable by flag, environment variable, or a TOML
+file: see [Operations](../operations/) for the full surface. The defaults, including the 256 MiB
+segment size, are the server's, not the library's.
 
 ## Add the client
 
