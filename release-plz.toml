@@ -3,13 +3,11 @@
 # Changelogs, git tags, and GitHub releases are enabled by default, so only the per-package
 # overrides are listed here. Versions and changelogs are derived from conventional commits.
 
+# The private examples crate (site/tephra-site-examples) has `publish = false` in its
+# Cargo.toml, so release-plz skips it automatically; it needs no entry here.
+
 [[package]]
 name = "tephra-server"
 # Tag the server release as v{version} (not tephra-server-v{version}), so the docker workflow's
 # `v*.*.*` trigger fires on each server release.
 git_tag_name = "v{{ version }}"
-
-[[package]]
-name = "tephra-site-examples"
-# Private examples crate: never version, tag, publish, or release it.
-release = false
