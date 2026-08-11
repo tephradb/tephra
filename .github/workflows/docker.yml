@@ -2,9 +2,10 @@ name: docker
 
 # Build the tephra-server images and publish them to GHCR on a version tag.
 #
-# Two variants are built from one bake definition (docker-bake.hcl): the distroless image gets
-# the plain tags (0.1.0, 0.1, latest), and the debian-slim image gets the same tags with a
-# -debug suffix. Pull requests build both (no push) so a broken Dockerfile fails the PR.
+# Three variants are built from one bake definition (docker-bake.hcl): the distroless image
+# gets the plain tags (0.1.0, 0.1, latest), the debian-slim image gets the same tags with a
+# -debug suffix, and the fully static scratch image gets them with a -static suffix. Pull
+# requests build all three (no push) so a broken Dockerfile fails the PR.
 on:
   push:
     tags: ["v*.*.*"]
@@ -63,6 +64,19 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # Same tags for the static (scratch) image, suffixed with -static (including latest-static).
+      - name: Metadata (static)
+        id: meta-static
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          bake-target: docker-metadata-action-static
+          flavor: |
+            suffix=-static,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
       - name: Build and push
         uses: docker/bake-action@v5
         with:
@@ -70,9 +84,11 @@ jobs:
             docker-bake.hcl
             ${{ steps.meta-distroless.outputs.bake-file }}
             ${{ steps.meta-slim.outputs.bake-file }}
+            ${{ steps.meta-static.outputs.bake-file }}
           targets: |
             distroless
             debug
+            static
           push: ${{ github.event_name != 'pull_request' }}
           set: |
             *.platform=linux/amd64,linux/arm64
@@ -80,3 +96,5 @@ jobs:
             distroless.cache-to=type=gha,mode=max,scope=tephra-distroless
             debug.cache-from=type=gha,scope=tephra-debug
             debug.cache-to=type=gha,mode=max,scope=tephra-debug
+            static.cache-from=type=gha,scope=tephra-static
+            static.cache-to=type=gha,mode=max,scope=tephra-static

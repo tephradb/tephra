@@ -44,6 +44,10 @@ Docker (listens on `0.0.0.0:9000`, data in the `/data` volume):
 docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
 ```
 
+Each release publishes three image variants: the plain tags (`latest`, `0.1.0`) are a
+distroless glibc image, `*-debug` adds a shell for inspection, and `*-static` is a `FROM
+scratch` image built around a fully static musl binary (no libc, no loader).
+
 Nix:
 
 ```sh
