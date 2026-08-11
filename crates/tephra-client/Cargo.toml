@@ -3,7 +3,7 @@ name = "tephra-client"
 description = "Synchronous, blocking TCP client for a tephra event store, speaking the length-prefixed protobuf protocol"
 edition = "2024"
 license = "Apache-2.0"
-version = "0.1.0"
+version = "0.1.1"
 rust-version = "1.85.0"
 repository.workspace = true
 
