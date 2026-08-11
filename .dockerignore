@@ -1,0 +1,17 @@
+# Keep the build context small: everything the image build does not need.
+.git
+.github
+.claude
+**/.devenv
+devenv.nix
+devenv.yaml
+devenv.lock
+**/target
+**/node_modules
+site/dist
+site/.astro
+docs
+**/*.md
+Dockerfile
+docker-bake.hcl
+.dockerignore

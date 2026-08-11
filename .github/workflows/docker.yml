@@ -1,0 +1,83 @@
+name: docker
+
+# Build the tephra-server images and publish them to GHCR on a version tag.
+#
+# Two variants are built from one bake definition (docker-bake.hcl): the distroless image gets
+# the plain tags (0.1.0, 0.1, latest), and the debian-slim image gets the same tags with a
+# -debug suffix. Pull requests build both (no push) so a broken Dockerfile fails the PR.
+on:
+  push:
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.distroless"
+      - "docker-bake.hcl"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU provides the arm64 emulation for the multi-platform build.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # Only authenticate when we intend to push (never on a pull request).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags/labels for the distroless (primary) image: 0.1.0, 0.1, latest.
+      - name: Metadata (distroless)
+        id: meta-distroless
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          bake-target: docker-metadata-action-distroless
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # Same tags for the slim image, suffixed with -debug (including latest-debug).
+      - name: Metadata (slim/debug)
+        id: meta-slim
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          bake-target: docker-metadata-action-slim
+          flavor: |
+            suffix=-debug,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/bake-action@v5
+        with:
+          files: |
+            docker-bake.hcl
+            ${{ steps.meta-distroless.outputs.bake-file }}
+            ${{ steps.meta-slim.outputs.bake-file }}
+          targets: |
+            distroless
+            debug
+          push: ${{ github.event_name != 'pull_request' }}
+          set: |
+            *.platform=linux/amd64,linux/arm64
+            distroless.cache-from=type=gha,scope=tephra-distroless
+            distroless.cache-to=type=gha,mode=max,scope=tephra-distroless
+            debug.cache-from=type=gha,scope=tephra-debug
+            debug.cache-to=type=gha,mode=max,scope=tephra-debug
