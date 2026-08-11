@@ -36,6 +36,26 @@ All crates live under `crates/`:
 | `tephra-proto` | The wire protocol: protobuf message types plus length-prefixed framing. No dependency on the engine. |
 | `seglog` | The low-level segmented record log (framing, CRCs, batch commit markers, recovery). |
 
+## Running the server
+
+Docker (listens on `0.0.0.0:9000`, data in the `/data` volume):
+
+```sh
+docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
+```
+
+Nix:
+
+```sh
+nix run github:tqwewe/tephra
+```
+
+Cargo:
+
+```sh
+cargo install tephra-server
+```
+
 ## Usage
 
 ```rust
