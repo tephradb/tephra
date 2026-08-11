@@ -1359,7 +1359,10 @@ mod tests {
             .iter()
             .map(|r| r.position)
             .collect();
-        assert_eq!(positions, vec![Position::new(1), Position::new(2), Position::new(3)]);
+        assert_eq!(
+            positions,
+            vec![Position::new(1), Position::new(2), Position::new(3)]
+        );
 
         // Past the end is a normal caught-up state: empty, not an error.
         assert!(set.scan_from(Position::new(5)).next().is_none());
@@ -1378,7 +1381,10 @@ mod tests {
             .iter()
             .map(|r| r.position)
             .collect();
-        assert_eq!(all, vec![Position::new(1), Position::new(2), Position::new(3)]);
+        assert_eq!(
+            all,
+            vec![Position::new(1), Position::new(2), Position::new(3)]
+        );
 
         // scan_after(pos) is exclusive: it resumes strictly after `pos`.
         let resumed: Vec<Position> = drain(set.scan_after(Position::new(1)))
@@ -1601,7 +1607,9 @@ mod tests {
             for byte in corrupt.iter_mut().skip(cutoff) {
                 *byte = 0xFF;
             }
-            let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
+            let path = dir
+                .path()
+                .join(segment_file_name(Position::new(FIRST_POSITION)));
             fs::write(&path, &corrupt).unwrap();
 
             let set = open(dir.path(), segment_size);
@@ -1646,7 +1654,9 @@ mod tests {
         let batch_a = REC_OVERHEAD + 4 + MARKER;
         let rec_stride = REC_OVERHEAD + rec_len;
         let rec2_data = HEADER + batch_a + rec_stride + REC_OVERHEAD;
-        let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
+        let path = dir
+            .path()
+            .join(segment_file_name(Position::new(FIRST_POSITION)));
         let file = File::options().read(true).write(true).open(&path).unwrap();
         let mut byte = [0u8; 1];
         file.read_exact_at(&mut byte, rec2_data as u64).unwrap();
@@ -1687,7 +1697,9 @@ mod tests {
         let survive = 3usize;
         let cut = HEADER + survive * batch_size + 5; // partway into batch index 3
 
-        let path = dir.path().join(segment_file_name(Position::new(FIRST_POSITION)));
+        let path = dir
+            .path()
+            .join(segment_file_name(Position::new(FIRST_POSITION)));
         let file = File::options().write(true).open(&path).unwrap();
         file.set_len(cut as u64).unwrap();
         file.sync_all().unwrap();

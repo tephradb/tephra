@@ -9,13 +9,13 @@
 use std::thread;
 use std::time::Duration;
 
+use smallvec::SmallVec;
+use tempfile::TempDir;
 use tephra::Position;
 use tephra::event::{Event, EventType, Tag, Tags};
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::query::{Query, QueryItem};
 use tephra::writer::{WriteCoordinator, WriteHandle, WriterConfig};
-use smallvec::SmallVec;
-use tempfile::TempDir;
 
 // ------------------------------- helpers -------------------------------
 

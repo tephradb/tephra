@@ -51,14 +51,19 @@ fn query_semantics() -> Result<(), Box<dyn Error>> {
     // AND. The c2 enrolment matches the first item; the c1 enrolment matches the second.
     let or = Query::items([
         QueryItem::with_tags(Tags::new([Tag::new("course:c2")?])?),
-        QueryItem::with_tags(Tags::new([Tag::new("course:c1")?, Tag::new("student:s1")?])?),
+        QueryItem::with_tags(Tags::new([
+            Tag::new("course:c1")?,
+            Tag::new("student:s1")?,
+        ])?),
     ]);
     // ANCHOR_END: or
     assert_eq!(count(&mut client, or)?, 2);
 
     // ANCHOR: types
     // A type filter with no tags: matches on event type alone (empty type list means any type).
-    let by_type = Query::item(QueryItem::of_types(vec![EventType::new("StudentEnrolled")?]));
+    let by_type = Query::item(QueryItem::of_types(vec![EventType::new(
+        "StudentEnrolled",
+    )?]));
     // ANCHOR_END: types
     assert_eq!(count(&mut client, by_type)?, 2);
 

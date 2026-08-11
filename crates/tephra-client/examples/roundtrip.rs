@@ -27,7 +27,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("appended Enrolled at position {}", range.first);
 
     // A uniqueness guard: reserve a username, failing if one already exists.
-    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["username:alice"])?)));
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&[
+        "username:alice",
+    ])?)));
     let range = client.append(
         [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
         Some(guard),
@@ -35,7 +37,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("reserved username:alice at position {}", range.first);
 
     // The same guard now conflicts with the event just written.
-    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["username:alice"])?)));
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&[
+        "username:alice",
+    ])?)));
     match client.append(
         [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
         Some(guard),

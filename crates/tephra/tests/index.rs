@@ -7,13 +7,13 @@
 //! `after` bounds, `index::search` must return the exact same ascending positions the
 //! scan does. A disagreement is a bug in the index, since the oracle is authoritative.
 
+use smallvec::SmallVec;
+use tempfile::TempDir;
 use tephra::Position;
 use tephra::event::{Event, EventRef, EventType, Tag, Tags};
 use tephra::index::{ActiveTail, IndexSet, search};
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::query::{Matches, Query, QueryItem};
-use smallvec::SmallVec;
-use tempfile::TempDir;
 
 /// The same small LCG used in the coordinator tests: deterministic, dependency-free.
 struct Rng(u64);

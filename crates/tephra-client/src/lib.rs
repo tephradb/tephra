@@ -33,11 +33,11 @@ use tephra_proto::convert as wire;
 use tephra_proto::tephra as pb;
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame, write_frame};
 
+pub use tephra_proto::convert::ErrorCode;
 /// The shared vocabulary types, re-exported so the client's public API is one coherent set.
 pub use tephra_types::{
     AppendCondition, EventType, NameError, Position, Query, QueryItem, Tag, Tags, TagsError,
 };
-pub use tephra_proto::convert::ErrorCode;
 
 /// The raw wire protobuf types, re-exported for low-level use. This is an escape hatch, not
 /// the primary API: prefer the clean types above ([`Event`], [`Query`], and friends).
@@ -631,8 +631,10 @@ fn event_to_pb(event: &Event) -> pb::Event {
 fn sequenced_from_pb(view: pb::SequencedEventView<'_>) -> Result<SequencedEvent, ClientError> {
     let position = Position::new(view.position());
     let ev = view.event();
-    let event_type = EventType::new(wire::as_str(ev.r#type()).map_err(protocol)?)
-        .map_err(|err| ClientError::Protocol(format!("server sent an invalid event type: {err}")))?;
+    let event_type =
+        EventType::new(wire::as_str(ev.r#type()).map_err(protocol)?).map_err(|err| {
+            ClientError::Protocol(format!("server sent an invalid event type: {err}"))
+        })?;
     let tags = wire::tags_from_pb(ev.tags().iter()).map_err(protocol)?;
     let event = Event {
         event_type,

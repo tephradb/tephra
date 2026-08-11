@@ -16,12 +16,12 @@ use std::time::Duration;
 
 use argh::FromArgs;
 use config::{Config, Environment, File, FileFormat};
+use serde::Deserialize;
 use tephra::log::set::SegmentConfig;
 use tephra::read::ReadConfig;
 use tephra::writer::WriterConfig;
 use tephra_proto::DEFAULT_MAX_FRAME_LEN;
 use tephra_server::ServerConfig;
-use serde::Deserialize;
 
 /// tephra event store server: opens a store on disk and serves it over TCP.
 #[derive(Debug, FromArgs)]

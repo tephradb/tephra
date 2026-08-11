@@ -74,7 +74,9 @@ fn enrol(
         match client.append([event], Some(guard)) {
             Ok(_) => return Ok(Outcome::Enrolled),
             // Same-batch conflict: advisory and retryable, so rebuild the model and try again.
-            Err(ClientError::Server { retryable: true, .. }) => continue,
+            Err(ClientError::Server {
+                retryable: true, ..
+            }) => continue,
             // Durable conflict, or any other server error: terminal for this attempt.
             Err(err) => return Err(Box::new(err)),
         }
@@ -87,10 +89,19 @@ fn enrolment_respects_the_seat_limit() {
     let server = TestServer::start();
     let mut client = Client::connect(server.addr()).expect("connect");
 
-    assert_eq!(enrol(&mut client, "c1", "s1", 2).unwrap(), Outcome::Enrolled);
-    assert_eq!(enrol(&mut client, "c1", "s2", 2).unwrap(), Outcome::Enrolled);
+    assert_eq!(
+        enrol(&mut client, "c1", "s1", 2).unwrap(),
+        Outcome::Enrolled
+    );
+    assert_eq!(
+        enrol(&mut client, "c1", "s2", 2).unwrap(),
+        Outcome::Enrolled
+    );
     // A third enrolment exceeds the two-seat limit.
-    assert_eq!(enrol(&mut client, "c1", "s3", 2).unwrap(), Outcome::CourseFull);
+    assert_eq!(
+        enrol(&mut client, "c1", "s3", 2).unwrap(),
+        Outcome::CourseFull
+    );
     // Re-enrolling an existing student is idempotent, not a new seat.
     assert_eq!(
         enrol(&mut client, "c1", "s1", 2).unwrap(),

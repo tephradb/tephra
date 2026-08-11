@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use smallvec::SmallVec;
+use tempfile::TempDir;
 use tephra::Position;
 use tephra::event::{Event, EventRef, EventType, Tag, Tags};
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::query::{Matches, Query, QueryItem};
 use tephra::read::{ReadConfig, ReadError};
 use tephra::writer::{WriteCoordinator, WriteHandle, WriterConfig};
-use smallvec::SmallVec;
-use tempfile::TempDir;
 
 // ------------------------- deterministic random workload -------------------------
 

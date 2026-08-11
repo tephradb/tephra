@@ -139,7 +139,10 @@ mod tests {
     fn item_constructors() {
         assert!(QueryItem::of_types(Vec::new()).tags.is_empty());
         assert!(QueryItem::with_tags(Tags::empty()).types.is_empty());
-        assert_eq!(QueryItem::default(), QueryItem::new(Vec::new(), Tags::empty()));
+        assert_eq!(
+            QueryItem::default(),
+            QueryItem::new(Vec::new(), Tags::empty())
+        );
     }
 
     #[test]

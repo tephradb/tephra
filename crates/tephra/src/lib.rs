@@ -63,14 +63,14 @@ pub mod query;
 pub mod read;
 pub mod writer;
 
-pub use tephra_types::{
-    AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
-    TagsError,
-};
 pub use event::{Event, EventRef};
 pub use log::set::{PositionRange, SegmentConfig, SegmentSet};
 pub use query::Matches;
 pub use read::{
     DEFAULT_MAX_BATCH_EVENTS, ReadConfig, ReadError, ReadHandle, Subscription, WaitOutcome,
+};
+pub use tephra_types::{
+    AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
+    TagsError,
 };
 pub use writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};

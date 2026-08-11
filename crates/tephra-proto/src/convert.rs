@@ -196,7 +196,10 @@ mod tests {
         // An empty items set matches nothing; it must not collapse to `all`.
         let pb = query_to_pb(&Query::items(Vec::new()));
         assert!(!pb.all());
-        assert_eq!(query_from_pb(pb.as_view()).unwrap(), Query::items(Vec::new()));
+        assert_eq!(
+            query_from_pb(pb.as_view()).unwrap(),
+            Query::items(Vec::new())
+        );
     }
 
     #[test]
@@ -238,6 +241,9 @@ mod tests {
             assert_eq!(ErrorCode::from(code.to_pb()), code);
         }
         // The unspecified wire value decodes to Unknown.
-        assert_eq!(ErrorCode::from(pb::ErrorCode::Unspecified), ErrorCode::Unknown);
+        assert_eq!(
+            ErrorCode::from(pb::ErrorCode::Unspecified),
+            ErrorCode::Unknown
+        );
     }
 }

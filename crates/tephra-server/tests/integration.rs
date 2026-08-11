@@ -10,13 +10,13 @@ use std::time::Duration;
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::writer::{WriteCoordinator, WriterConfig};
 
+use tempfile::TempDir;
 use tephra_client::{
     AppendCondition, Client, ClientError, ErrorCode, Event, Position, Query, QueryItem,
     SequencedEvent, SubEvent, Tag, Tags,
 };
-use tephra_proto::{DEFAULT_MAX_FRAME_LEN, tephra as pb, read_frame, write_frame};
+use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame, tephra as pb, write_frame};
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
-use tempfile::TempDir;
 
 /// A server running on its own thread over a temp-dir store, torn down on drop.
 struct TestServer {
@@ -463,7 +463,13 @@ fn subscribe_streams_catch_up_then_live() {
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
     let cancel = cancel_rx.recv().unwrap();
 
     let mut positions = Vec::new();
@@ -521,8 +527,13 @@ fn subscribe_from_mid_position_skips_the_prefix() {
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     // Resume after position 2: only 3 and 4 should arrive.
-    let subscriber =
-        spawn_subscriber(ts.client(), Query::all(), Position::new(2), item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::new(2),
+        item_tx,
+        cancel_tx,
+    );
     let cancel = cancel_rx.recv().unwrap();
 
     let mut positions = Vec::new();
@@ -547,7 +558,13 @@ fn cancel_ends_a_live_subscription() {
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
     let cancel = cancel_rx.recv().unwrap();
 
     // Receive the one durable event.
@@ -575,7 +592,13 @@ fn idle_subscription_does_not_flood_caught_up_frames() {
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     // Empty store: the subscription is immediately caught up.
-    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
     let cancel = cancel_rx.recv().unwrap();
 
     match item_rx.recv().unwrap() {
@@ -625,7 +648,13 @@ fn server_shutdown_ends_an_idle_subscription() {
 
     let (item_tx, item_rx) = mpsc::channel();
     let (cancel_tx, cancel_rx) = mpsc::channel();
-    let subscriber = spawn_subscriber(ts.client(), Query::all(), Position::ZERO, item_tx, cancel_tx);
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
     let _cancel = cancel_rx.recv().unwrap();
 
     // Drain the one event so the subscription is parked at the live edge (idle).

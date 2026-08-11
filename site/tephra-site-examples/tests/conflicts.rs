@@ -21,7 +21,11 @@ enum Reserve {
     Conflicted(Option<Position>),
 }
 
-fn reserve_seat(client: &mut Client, course: &str, student: &str) -> Result<Reserve, Box<dyn Error>> {
+fn reserve_seat(
+    client: &mut Client,
+    course: &str,
+    student: &str,
+) -> Result<Reserve, Box<dyn Error>> {
     let course_tag = format!("course:{course}");
     let student_tag = format!("student:{student}");
 
@@ -56,7 +60,9 @@ fn reserve_seat(client: &mut Client, course: &str, student: &str) -> Result<Rese
             Ok(result) => return Ok(Reserve::Ok(result.first)),
             // Same-batch: advisory. The tag-only staged check cannot see event type, so this may
             // be a false alarm. Retry immediately with a fresh read.
-            Err(ClientError::Server { retryable: true, .. }) => continue,
+            Err(ClientError::Server {
+                retryable: true, ..
+            }) => continue,
             // Durable: a real conflicting event landed since we read. Terminal for this attempt;
             // the caller (or the next loop turn) must decide again against the changed tail.
             Err(ClientError::Server {
