@@ -8,18 +8,18 @@
 
 ## Docs
 
-- [Introduction](https://tqwewe.github.io/tephra/introduction/): what a Dynamic Consistency Boundary is and the problem it removes, with the course-and-student example.
-- [Getting started](https://tqwewe.github.io/tephra/getting-started/): run the server, connect with tephra-client, append, read, subscribe.
-- [Embedded](https://tqwewe.github.io/tephra/embedded/): embed the engine directly instead of running the server, and the tradeoffs.
-- [Core concepts](https://tqwewe.github.io/tephra/core-concepts/): events, types and tags, positions, queries, append conditions.
-- [Decision models](https://tqwewe.github.io/tephra/guides/decision-models/): read, fold, decide, append guarded by the same query.
-- [The uniqueness guard](https://tqwewe.github.io/tephra/guides/uniqueness-guard/): omit after to guard that something happens at most once.
-- [Subscriptions](https://tqwewe.github.io/tephra/guides/subscriptions/): catch-up and live-tail as one loop, and resuming from a cursor.
-- [Handling conflicts](https://tqwewe.github.io/tephra/guides/conflicts/): SameBatch is advisory and retryable; Durable is terminal until you rebuild.
-- [Operations](https://tqwewe.github.io/tephra/operations/): configuration, durability, recovery, backpressure, shutdown.
-- [Architecture](https://tqwewe.github.io/tephra/architecture/): the layer map and the design rationale, including rejected alternatives.
-- [Comparison](https://tqwewe.github.io/tephra/comparison/): measured write and read comparisons against UmaDB, Axon Server, KurrentDB, and Postgres, including where Tephra loses (cold reads).
-- [Status](https://tqwewe.github.io/tephra/status/): what is built and what is deliberately deferred.
+- [Introduction](https://tephra.tqwewe.com/introduction/): what a Dynamic Consistency Boundary is and the problem it removes, with the course-and-student example.
+- [Getting started](https://tephra.tqwewe.com/getting-started/): run the server, connect with tephra-client, append, read, subscribe.
+- [Embedded](https://tephra.tqwewe.com/embedded/): embed the engine directly instead of running the server, and the tradeoffs.
+- [Core concepts](https://tephra.tqwewe.com/core-concepts/): events, types and tags, positions, queries, append conditions.
+- [Decision models](https://tephra.tqwewe.com/guides/decision-models/): read, fold, decide, append guarded by the same query.
+- [The uniqueness guard](https://tephra.tqwewe.com/guides/uniqueness-guard/): omit after to guard that something happens at most once.
+- [Subscriptions](https://tephra.tqwewe.com/guides/subscriptions/): catch-up and live-tail as one loop, and resuming from a cursor.
+- [Handling conflicts](https://tephra.tqwewe.com/guides/conflicts/): SameBatch is advisory and retryable; Durable is terminal until you rebuild.
+- [Operations](https://tephra.tqwewe.com/operations/): configuration, durability, recovery, backpressure, shutdown.
+- [Architecture](https://tephra.tqwewe.com/architecture/): the layer map and the design rationale, including rejected alternatives.
+- [Comparison](https://tephra.tqwewe.com/comparison/): measured write and read comparisons against UmaDB, Axon Server, KurrentDB, and Postgres, including where Tephra loses (cold reads).
+- [Status](https://tephra.tqwewe.com/status/): what is built and what is deliberately deferred.
 
 ## Source
 

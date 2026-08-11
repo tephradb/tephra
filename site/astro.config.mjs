@@ -7,8 +7,7 @@ import starlight from "@astrojs/starlight";
 // highlighting is Expressive Code / Shiki (bundled). Dark and light themes with a persisted
 // toggle are Starlight defaults.
 export default defineConfig({
-  site: "https://tqwewe.github.io/tephra/",
-  base: "/tephra/",
+  site: "https://tephra.tqwewe.com",
   trailingSlash: "always",
   integrations: [
     starlight({
