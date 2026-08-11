@@ -1,7 +1,7 @@
 //! A simple, high-performance segment log implementation.
 //!
 //! `seglog` provides low-level read and write operations for fixed-size segment files
-//! with built-in CRC32C validation. It's designed for use in event sourcing systems,
+//! with built-in CRC-32 validation. It's designed for use in event sourcing systems,
 //! write-ahead logs, and other append-only storage use cases.
 //!
 //! # Architecture
@@ -22,13 +22,13 @@
 //! Each record consists of:
 //! ```text
 //! ┌─────────────┬─────────────┬────────────────┬─────────────────────┐
-//! │ Length (4B) │ CRC32C (4B) │ Header (H B)   │ Data (N bytes)      │
+//! │ Length (4B) │ CRC-32 (4B) │ Header (H B)   │ Data (N bytes)      │
 //! └─────────────┴─────────────┴────────────────┴─────────────────────┘
 //! ```
 //!
 //! - **Length**: 32-bit little-endian total payload length (H + N bytes). Bit 30 flags a
 //!   control record; bit 31 is reserved and must be zero.
-//! - **CRC32C**: 32-bit checksum over length + header + data
+//! - **CRC-32**: 32-bit checksum over length + header + data
 //! - **Header**: Fixed-size metadata (H bytes)
 //! - **Data**: Variable-length record payload
 //!
@@ -206,7 +206,7 @@ pub mod write;
 const LEN_SIZE: usize = mem::size_of::<u32>();
 const CRC32C_SIZE: usize = mem::size_of::<u32>();
 
-/// Size of the record header in bytes, consisting of length and CRC32C checksum.
+/// Size of the record header in bytes, consisting of length and CRC-32 checksum.
 pub const RECORD_HEAD_SIZE: usize = LEN_SIZE + CRC32C_SIZE;
 
 /// Control-record flag bit in the length field (bit 30).

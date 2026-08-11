@@ -2,7 +2,7 @@
 name = "seglog"
 authors = ["Ari Seyhun <dev@tqwewe.com>"]
 categories = ["database-implementations", "development-tools"]
-description = "High-performance segment log with CRC32C validation - optimized for event sourcing and append-only storage"
+description = "High-performance segment log with CRC-32 validation - optimized for event sourcing and append-only storage"
 edition = "2024"
 keywords = ["database", "event-sourcing", "event-store", "storage"]
 license = "Apache-2.0"

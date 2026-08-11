@@ -25,13 +25,16 @@ aggregate), DCB derives the boundary per decision from a query.
 
 ## Workspace crates
 
+All crates live under `crates/`:
+
 | Crate | Purpose |
 |---|---|
-| `tephra` (root) | The core embedded event store: log, write coordinator, index, read paths. |
-| `crates/seglog` | The low-level segmented record log (framing, CRCs, batch commit markers, recovery). |
-| `crates/tephra-proto` | The wire protocol: protobuf message types plus length-prefixed framing. No dependency on the engine. |
-| `crates/tephra-server` | A synchronous, thread-per-connection TCP server exposing the store over the wire protocol. |
-| `crates/tephra-client` | A synchronous TCP client for the server. |
+| `tephra` | The core embedded event store: log, write coordinator, index, read paths. |
+| `tephra-client` | A synchronous TCP client for the server. |
+| `tephra-server` | A synchronous, thread-per-connection TCP server exposing the store over the wire protocol. |
+| `tephra-types` | The shared vocabulary: positions, event type/tag names, and the query model. Pure data, no I/O. |
+| `tephra-proto` | The wire protocol: protobuf message types plus length-prefixed framing. No dependency on the engine. |
+| `seglog` | The low-level segmented record log (framing, CRCs, batch commit markers, recovery). |
 
 ## Usage
 

@@ -2,12 +2,12 @@
 
 A simple, high-performance segment log implementation for Rust.
 
-`seglog` provides low-level read and write operations for fixed-size segment files with built-in CRC32C validation. It's designed for event sourcing systems, write-ahead logs, and other append-only storage use cases.
+`seglog` provides low-level read and write operations for fixed-size segment files with built-in CRC-32 validation. It's designed for event sourcing systems, write-ahead logs, and other append-only storage use cases.
 
 ## Features
 
 - **Single writer, multiple concurrent readers** - Lock-free reads with atomic offset coordination
-- **CRC32C validation** - Automatic data integrity checking on every read
+- **CRC-32 validation** - Automatic data integrity checking on every read
 - **Optimized I/O** - Reduces syscalls with optimistic reads (~40% faster for small records)
 - **Fixed-size segments** - Pre-allocated files with configurable headers
 - **Corruption recovery** - Detects and recovers from partial writes
@@ -40,7 +40,7 @@ Each record consists of an 8-byte header followed by variable-length data:
 
 ```
 ┌─────────────┬─────────────┬────────────────┐
-│ Length (4B) │ CRC32C (4B) │ Data (N bytes) │
+│ Length (4B) │ CRC-32 (4B) │ Data (N bytes) │
 └─────────────┴─────────────┴────────────────┘
 ```
 
@@ -89,9 +89,4 @@ This ensures readers never see partial writes or corrupted data.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
