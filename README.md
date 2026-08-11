@@ -79,3 +79,7 @@ an append returns.
 - `CLAUDE.md` is the architecture document: what the system is, why each structural choice
   was made, and which alternatives were rejected.
 - `ROADMAP.md` tracks what is done and what is next.
+
+## AI Use
+
+AI was used **heavily** in tephra's development, with careful code reviews. The underlying [seglog](https://crates.io/crates/seglog) crate was authored by [@tqwewe](https://github.com/tqwewe).
