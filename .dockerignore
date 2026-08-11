@@ -10,7 +10,6 @@ devenv.lock
 **/node_modules
 site/dist
 site/.astro
-docs
 **/*.md
 Dockerfile
 docker-bake.hcl
