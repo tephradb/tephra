@@ -4,6 +4,7 @@ description = "Synchronous, blocking TCP client for a tephra event store, speaki
 edition = "2024"
 license = "Apache-2.0"
 version = "0.1.0"
+rust-version = "1.85.0"
 
 [dependencies]
 tephra-proto.workspace = true
