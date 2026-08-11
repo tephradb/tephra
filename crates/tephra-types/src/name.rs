@@ -138,8 +138,13 @@ pub struct Tags(SmallVec<[Tag; 4]>);
 
 impl Tags {
     /// Constructs a tag set, sorting the input and rejecting any duplicate.
-    pub fn new(tags: impl Into<SmallVec<[Tag; 4]>>) -> Result<Self, TagsError> {
-        let mut tags = tags.into();
+    ///
+    /// Accepts anything iterable over [`Tag`]: an array literal (`[a, b]`), a `Vec`, or another
+    /// iterator. The `impl IntoIterator` bound is what lets an array of any length be passed
+    /// directly (unlike `Into<SmallVec<..>>`, which only converts an array of the exact inline
+    /// size); collection into the backing `SmallVec` uses its `FromIterator` impl.
+    pub fn new(tags: impl IntoIterator<Item = Tag>) -> Result<Self, TagsError> {
+        let mut tags: SmallVec<[Tag; 4]> = tags.into_iter().collect();
         tags.sort_unstable();
         // Scan for the first adjacent duplicate. `find` short-circuits, and on the
         // error path the vec is discarded, so move the offender out with an O(1)
