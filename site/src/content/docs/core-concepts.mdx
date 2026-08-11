@@ -1,0 +1,93 @@
+---
+title: Core concepts
+description: Events, types and tags, positions, queries, and append conditions.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../lib/snippet';
+import SegmentLayout from '../../components/diagrams/SegmentLayout.astro';
+import queriesRaw from '../../../tephra-site-examples/tests/queries.rs?raw';
+
+Five ideas carry the whole model: events, types and tags, positions, queries, and append
+conditions. Everything else is built from them.
+
+## Events
+
+An event is a type, a set of tags, and an opaque payload. The store never parses the payload; it
+is bytes you round-trip. The type and the tags are what queries match on.
+
+Types and tags are arbitrary strings. The store treats `course:c1` as one string, not a key and
+a value, so the colon convention is yours, not the store's. Both are validated on construction:
+non-empty, and under `MAX_NAME_LEN` (which is `u16::MAX`, since the length is stored in a
+fixed-width field and tags later become keys in a term dictionary).
+
+## Types and tags
+
+The type is a single string per event. The tags are a set: sorted and deduplicated at
+construction, with a duplicate tag rejected rather than silently dropped, because an event that
+round-trips to something different from what you submitted is a bug waiting to happen.
+
+The split between them is not cosmetic. Types are low cardinality (tens to hundreds of distinct
+values, each shared by many events); tags are high cardinality (one per entity, mostly unique).
+The store indexes them with different structures for exactly that reason, which is the subject of
+[Architecture](../architecture/). One event can carry several tags and so belong to several
+entities at once: `StudentEnrolled` tagged `course:c1` and `student:s1` is part of both.
+
+## Positions
+
+The writer assigns every event a position: a dense, monotonic `u64`. Positions are the global
+order, and they are the only key the store has. There is no separate primary key and no B-tree
+over positions, because a dense monotonic key needs neither.
+
+Positions are 1-based. `Position::ZERO` is the "before everything" sentinel, which is what an
+`after` bound of "I have read nothing" means, so a read from the start passes `Position::ZERO`.
+
+The log is stored as a chain of segments, each covering a contiguous, non-overlapping range of
+positions. That disjointness is what lets an `after: p` bound discard whole segments by comparing
+a header, with no per-event probing.
+
+<SegmentLayout />
+
+## Queries
+
+A query selects events. It is a set of items combined with OR, and within an item the listed
+types are combined with OR while the listed tags are combined with AND. So: OR across items, OR
+across an item's types, AND across an item's tags. An empty type list matches any type; an empty
+tag list constrains on type alone.
+
+AND within an item: an event must carry every listed tag.
+
+<Code code={anchor(queriesRaw, 'and')} lang="rust" />
+
+OR across items: an event matching any item is returned, and an item can itself be an AND over
+tags.
+
+<Code code={anchor(queriesRaw, 'or')} lang="rust" />
+
+A type filter with no tags matches on type alone.
+
+<Code code={anchor(queriesRaw, 'types')} lang="rust" />
+
+`Query::all` matches every event and bypasses the index for a straight log scan, which is what
+projection rebuilds want. An empty item list, by contrast, matches nothing (it is an OR over zero
+items).
+
+<Code code={anchor(queriesRaw, 'all')} lang="rust" />
+
+## Append conditions
+
+An append condition is a query plus an `after` position. The store rejects the append if any
+event matching the query landed after `after`. `after` is exclusive: it means "ignore everything
+at or before this position". You set it to the highest position you observed while building the
+decision, which may be higher than the last matching event.
+
+Omit `after` (leave it at `Position::ZERO`) and the condition becomes "fail if any event matches
+at all". That is the uniqueness guard, covered in its own [guide](../guides/uniqueness-guard/).
+
+## Decision models
+
+A decision model is small projections composed over one read: each projection has its own
+type-and-tag filter, and folding them over a single pass builds the state the decision needs. The
+union of those filters is the query, and the same query goes into the append condition. That is
+what makes the boundary dynamic: it covers exactly the events the decision depended on, and
+nothing wider. The full cycle is the subject of the [decision models guide](../guides/decision-models/).

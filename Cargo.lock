@@ -1242,6 +1242,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tephra-site-examples"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+ "tephra",
+ "tephra-client",
+ "tephra-server",
+]
+
+[[package]]
 name = "tephra-types"
 version = "0.1.0"
 dependencies = [

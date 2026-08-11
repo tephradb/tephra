@@ -1,0 +1,121 @@
+---
+title: Operations
+description: Configuration, durability, recovery, startup outcomes, backpressure, and shutdown.
+---
+
+This page is for running the store: what you can configure, what durability you get, and what
+happens on a crash.
+
+## Configuring the server
+
+The server resolves its settings from, in increasing precedence, built-in defaults, a TOML file
+passed with `--config`, `TEPHRA__*` environment variables, and the command-line flags. The flags
+carry only `--bind`, `--data-dir`, and `--log`; everything else lives in the file or the
+environment. A key like `writer.max_batch_bytes` is the environment variable
+`TEPHRA__WRITER__MAX_BATCH_BYTES`.
+
+Every value below is the built-in default, so an empty config behaves exactly like no config. The
+full annotated file ships as `tephra.example.toml`.
+
+```toml
+bind = "127.0.0.1:9000"
+data_dir = "tephra-data"
+
+[segment]
+size = 268435456           # 256 MiB, the segment file size including its header
+
+[writer]
+queue_capacity = 1024      # bounded request queue; a full queue blocks the caller
+max_batch_records = 1024   # most requests folded into one group commit
+max_batch_bytes = 8388608  # 8 MiB byte budget per batch
+tips_window = 1000000      # recent-position window for the durable tips (memory bound only)
+condition_force_scan = false
+
+[read]
+scan_bias = 4              # index only when the range is >= 4x the estimated result
+
+[server]
+max_frame_len = 16777216   # 16 MiB
+read_batch_events = 1024
+read_batch_bytes = 524288  # 512 KiB
+subscribe_wait_tick_ms = 250
+keepalive_idle_secs = 60
+keepalive_interval_secs = 15
+```
+
+The 256 MiB segment size is the server's default. There is no library-level default: an embedded
+caller passes a size to `SegmentConfig::new`, which sets `max_record_len` to a quarter of it and
+reserves 64 bytes for the segment header.
+
+## Configuring the embedded engine
+
+Embedding uses three config structs directly. `SegmentConfig` (segment size, max record length,
+header size) has no `Default`. `WriterConfig` carries the same writer fields as the TOML above,
+plus `verify_tips`, a paranoid cross-check that is never operator-settable and stays off.
+`ReadConfig` is the single `scan_bias` dial. The planner only ever changes which correct path
+runs, so `scan_bias` cannot change a result, only its speed.
+
+## Durability
+
+A batch of appends is made durable in one `fsync`. The writer appends every data record, then a
+control record marking the end of the batch, then syncs once. One fsync per batch, not per event,
+which is why batching is the throughput dial (see the table below).
+
+A batch is committed if, and only if, every record from the previous commit point onward passes
+its CRC and the run ends in a valid commit marker. A trailing marker alone is not enough: fsync
+gives no ordering guarantee within a flush, so recovery validates the whole run, not just its
+terminator.
+
+## Crash recovery and startup
+
+The log is the source of truth; the indexes are derived. That asymmetry decides what recovery
+does.
+
+On startup the store scans the last log segment forward from the last known-good point. A clean
+log opens as is. A log whose tail is a torn, uncommitted batch opens with that tail rolled back,
+and the discarded byte and position range are logged: the store tells you it recovered, and by how
+much. A log with corruption it cannot explain as a torn tail refuses to open rather than serve a
+wrong prefix. These three outcomes are kept distinct on purpose.
+
+A corrupt index is not fatal. Because an index is derived, a corrupt or missing index segment is
+rebuilt by replaying its log segment, never a refusal to open. A corrupt log is the opposite: it
+is the source of truth, so the store refuses rather than guess. The active segment's in-memory
+index is always rebuilt by a scan on startup, so a durable-but-unindexed tail after a crash is
+covered.
+
+## Backpressure
+
+The writer's request queue is bounded (`queue_capacity`). When it is full, `append` blocks the
+calling thread until there is room. Backpressure is not an error and not a dropped write: it is the
+caller slowing to the rate the store can make durable. Batch size grows automatically as fsync
+latency rises, because a slower disk lets more requests accumulate between syncs.
+
+## Shutdown
+
+Shutting the server down stops the accept loop and unblocks connections parked on a read. Shutting
+the coordinator down (or dropping it) signals the writer thread and joins it, so no committed batch
+is left unflushed. Shutdown is deterministic: it returns once the writer thread has joined.
+
+## Group commit, measured
+
+The one dial that moves write throughput is batch size, because it sets how many events share a
+single fsync. These are Tephra's own numbers on one machine, not a comparison, and every append
+carries a Dynamic Consistency Boundary condition (one tag, one type), so this is the guarded
+write path rather than a raw insert.
+
+| Batch size | Throughput | p50 latency | p99 latency |
+|---|---|---|---|
+| 1 | 6,464 events/s | 2.4 ms | 4.9 ms |
+| 64 | 192,794 events/s | 5.2 ms | 8.2 ms |
+| 512 | 796,724 events/s | 9.7 ms | 19.7 ms |
+
+That table is at 16 concurrent writers. Concurrency is a second dial: at 64 writers the batch-512
+figure rises to 984,881 events/s, and unbatched conditional appends scale from about 1,000 at a
+single writer to 32,738 at 128 writers with p50 latency holding near 3.8 ms, because each writer
+adds requests to the same group commit rather than contending for a lock.
+
+Conditions: Hetzner CCX, AMD EPYC-Milan, 4 cores / 8 threads, 32 GB RAM, Ubuntu 26.04, ext4 on an
+SSD, measured fsync latency about 1.15 ms average. Tephra built from source at the 256 MiB
+default segment size, in a container with a 4 GB memory limit. 256-byte events, 15-second runs.
+These come from the benchmark harness, not from memory. Run it yourself on the storage you will
+deploy on: a tmpfs makes fsync almost free and these numbers meaningless.

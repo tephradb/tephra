@@ -1,0 +1,70 @@
+---
+// Position-disjoint, contiguous segments on the position axis, and how an `after: p` bound
+// prunes whole segments by a header comparison.
+---
+
+<svg
+  class="tephra-diagram"
+  viewBox="0 0 640 240"
+  role="img"
+  aria-labelledby="seg-title seg-desc"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <title id="seg-title">Position-disjoint segments and after-pruning</title>
+  <desc id="seg-desc">
+    The log is a chain of segments covering contiguous, non-overlapping position ranges. An after
+    bound at position p discards every segment whose highest position is at or below p by comparing
+    its header, with no probing.
+  </desc>
+
+  <!-- position axis -->
+  <line x1="20" y1="70" x2="620" y2="70" stroke="var(--diagram-stroke)" stroke-width="1.5"></line>
+
+  <g fill="var(--diagram-fill)" stroke="var(--diagram-stroke)" stroke-width="1.5">
+    <rect x="20" y="44" width="180" height="52" rx="4" opacity="0.5"></rect>
+    <rect x="200" y="44" width="180" height="52" rx="4" opacity="0.5"></rect>
+    <rect x="380" y="44" width="130" height="52" rx="4"></rect>
+    <rect x="510" y="44" width="110" height="52" rx="4"></rect>
+  </g>
+  <g text-anchor="middle" font-size="13" fill="var(--diagram-text)">
+    <text x="110" y="75">1 .. 64k</text>
+    <text x="290" y="75">64k .. 128k</text>
+    <text x="445" y="75">128k .. 190k</text>
+    <text x="565" y="75">190k ..</text>
+  </g>
+  <g text-anchor="middle" font-size="12" fill="var(--diagram-muted)">
+    <text x="110" y="34">sealed</text>
+    <text x="290" y="34">sealed</text>
+    <text x="445" y="34">sealed</text>
+    <text x="565" y="34">active</text>
+  </g>
+
+  <!-- after: p marker -->
+  <line
+    x1="380"
+    y1="20"
+    x2="380"
+    y2="150"
+    stroke="var(--diagram-accent)"
+    stroke-width="2"
+    stroke-dasharray="5 4"></line>
+  <text x="380" y="168" text-anchor="middle" font-size="14" fill="var(--diagram-accent)"
+    >after: p</text
+  >
+
+  <text x="110" y="200" text-anchor="middle" font-size="13" fill="var(--diagram-muted)"
+    >pruned by header comparison</text
+  >
+  <text x="497" y="200" text-anchor="middle" font-size="13" fill="var(--diagram-text)"
+    >scanned</text
+  >
+  <line
+    x1="20"
+    y1="210"
+    x2="380"
+    y2="210"
+    stroke="var(--diagram-muted)"
+    stroke-width="1"
+    stroke-dasharray="3 3"></line>
+  <line x1="380" y1="210" x2="620" y2="210" stroke="var(--diagram-accent)" stroke-width="2"></line>
+</svg>

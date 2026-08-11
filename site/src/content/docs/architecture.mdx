@@ -1,0 +1,144 @@
+---
+title: Architecture
+description: The layer map and the design rationale, including the alternatives that were rejected and why.
+---
+
+import RecordFormat from '../../components/diagrams/RecordFormat.astro';
+import SegmentLayout from '../../components/diagrams/SegmentLayout.astro';
+import ConditionCheck from '../../components/diagrams/ConditionCheck.astro';
+import SubscriptionCursor from '../../components/diagrams/SubscriptionCursor.astro';
+
+The design follows from two principles. The log is the source of truth, and everything else is
+derived from it. Data is written once, never updated and never deleted. Most of what a
+general-purpose database spends its complexity on exists to reconcile mutation with sorted order,
+and neither principle leaves any mutation to reconcile, so that machinery is simply absent. The
+interesting part is what each choice let us delete, and which tempting alternatives we turned down.
+
+## The layers
+
+Storage is a durable, position-addressed log. A single write coordinator assigns positions and
+evaluates append conditions. Immutable index segments sit beside the log, one per sealed log
+segment. A query planner chooses between the index and a scan. Read paths run on the caller's own
+thread over an immutable snapshot. Each layer is described below with the alternative it rejects.
+
+## The log
+
+A record is a length, a CRC32 of the data, and the data. One bit of the length field flags a
+control record; the rest is the length, capped so a record cannot exceed a quarter of a segment.
+The data is the encoded event, verbatim, with no intermediate framing, which is what lets a read
+borrow bytes straight out of the read-ahead buffer instead of copying them.
+
+<RecordFormat />
+
+A per-record CRC catches a torn record. It does not catch a torn batch: if two records of a
+three-record batch land and the third does not, each of the two validates on its own, and recovery
+would expose half a transaction as committed. The fix is a commit marker, a control record written
+at the end of each batch, followed by exactly one fsync. One fsync, not two: a write-then-flip
+scheme would double the latency of the operation that dominates throughput.
+
+The recovery rule follows: a batch is committed if, and only if, every record from the previous
+commit point onward validates by CRC and the run ends in a valid commit marker. A trailing marker
+alone is insufficient, because fsync gives no ordering guarantee within a flush, so an earlier page
+of the same batch can be torn while the marker is durable. Recovery validates the whole run.
+
+## Segments, disjoint by position
+
+The log is a chain of segments, each covering a contiguous, non-overlapping range of positions.
+Exactly one is active and writable; the rest are sealed and immutable. A batch never spans a
+segment boundary, and segment files are never recycled.
+
+<SegmentLayout />
+
+Disjointness is the structural advantage. An `after: p` restriction discards every segment whose
+range ends at or before `p` by comparing a header, with no probing. And because two adjacent index
+segments cover disjoint, ordered ranges, merging them is per-term concatenation, not a k-way merge:
+there is nothing to compare, because every position in the earlier segment precedes every position
+in the later one. Merging is only ever done to reduce open-file count, never for correctness. This
+is the property an LSM compaction can never have, because compaction produces tables that span the
+whole key range and so destroys exactly this pruning.
+
+## Tags and types, split by cardinality
+
+Tags are high cardinality, roughly one per entity and mostly unique. They get an inverted index: a
+term dictionary (an FST, which compresses the shared `course:` style prefixes) over posting lists
+tiered by frequency, so a rare tag costs a single inlined position and a common one a compact
+delta-encoded list. AND is list intersection, OR is union, both ascending by construction.
+
+Types are low cardinality, tens to hundreds of values each shared by millions of events. They get
+a dense column: a two-byte type id per event, indexed by position, scanned sequentially. There are
+no type posting lists, because a per-type list would be nearly dense and buy nothing over a scan
+while costing random I/O. Using one structure for both fields is the mistake the split avoids.
+
+Index segments are loaded into memory, not memory-mapped. A truncated file under a live mapping is
+a SIGBUS and process death rather than a `Result`, a page fault would stall the single writer
+thread, and mmap hands cache policy to the operating system when we want the term dictionary kept
+hotter than the postings. The index is disposable, so a corrupt index segment is rebuilt from its
+log segment rather than refused.
+
+## The two-arm condition check
+
+The append condition is the correctness core, and its evaluation must never produce a false
+negative: it must never silently accept a conflicting write. It has two arms.
+
+<ConditionCheck />
+
+The staged arm settles conflicts within one group-commit window. Several independent decisions
+drain into one batch, and two can conflict with each other, so each accepted request is staged
+before the next is evaluated. This check is deliberately conservative and tag-only, so it can
+reject a write a precise check would allow; the loser is told `SameBatch`, which is advisory and
+retryable.
+
+The durable arm checks against everything already committed. A bounded map of the highest position
+per tag gives a fast reject with no I/O: if a tag's highest position is at or before `after`, the
+item cannot match. On anything the map cannot answer, an early-terminating index existence check
+finds the first matching position. A log scan remains the oracle: it is what the index is
+differentially tested against, and the fallback when a segment is unindexable. The two maps are
+separate types on purpose, because they disagree on what an absent tag means, and one type carrying
+both meanings is exactly the subtlety that reads as correct and is not.
+
+## The append-only active tail and the watermark
+
+Reads run on the caller's own thread, never on the writer's, over an immutable snapshot the writer
+publishes at each commit. How far a read may see is an atomically published watermark. A read is
+pinned to the watermark it loads: it returns a consistent prefix, and it cannot tell "no more
+events" from "no more events yet".
+
+The active segment's index is the hard case, because the writer is appending to it while readers
+query it. It is an append-only structure: chunked vectors of atomic slots whose chunks never move,
+so a reader's reference to an element stays valid while the writer adds more. Slot contents are
+published by a release/acquire edge (the watermark for the type column, a per-slot length for the
+postings), and the governing rule is that no lock is ever held across query evaluation, because a
+query-duration lock on the writer's path would make one slow reader the throughput ceiling. This
+is why the tail is append-only and atomically published rather than a lock around a mutable
+structure.
+
+## The planner changes the speed, never the answer
+
+The planner chooses between fetching from the index and streaming a filtered scan, by comparing an
+estimated result size (from exact posting lengths, which the term dictionary gives for free) against
+the width of the position range after pruning. It has no statistics to be wrong about.
+
+Both execution paths return the identical positions the scan oracle returns, so a crude estimate
+can only pick a slower correct path, never a wrong one. This is enforced by a test that runs every
+read three ways, forcing the index, forcing the scan, and using the default, and asserts the
+results are identical. That invariant is what lets the estimate be a rough upper bound and carry no
+correctness risk.
+
+## Subscriptions, without a handoff
+
+A subscription is catch-up followed by live tailing, which is where event stores usually have a
+bug: the seam between replaying history and following the tail. The design removes the seam by
+making the two the same operation. A subscription reads the range after its cursor up to the
+watermark, advances the cursor to that watermark, and blocks until the watermark moves.
+
+<SubscriptionCursor />
+
+Every read is exclusive of the cursor and the cursor lands exactly on the watermark, so nothing is
+skipped and nothing is redelivered, and there is no second code path for a live tail to keep
+consistent with catch-up.
+
+## Where this leads
+
+The comparison with [UmaDB and others](../comparison/) is where these choices are weighed against
+the alternatives that make different workload bets. [Status](../status/) is what is built and what
+is deliberately deferred.

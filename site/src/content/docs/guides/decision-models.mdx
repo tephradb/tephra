@@ -1,0 +1,55 @@
+---
+title: Decision models
+description: Compose small projections into one read, decide, and guard the append with the same query.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import dmRaw from '../../../../tephra-site-examples/tests/decision_model.rs?raw';
+
+A decision model is the working pattern of the Dynamic Consistency Boundary. You have a decision
+to make, it depends on some events, and you want to record its result without another writer
+having invalidated it in between. The shape is always the same: read, fold, decide, append with
+the same query.
+
+## The four steps
+
+Build the query from the projections the decision needs. Each projection filters on its own types
+and tags; the union of those filters is the query. Here the decision needs two counts, seats used
+on a course and enrolments held by a student, so the query is two items OR'd together.
+
+Read once, at a position you remember. `read_all` returns the matching events and the watermark it
+read up to. Fold every projection over that single pass.
+
+Decide from the folded state. If the decision is "no", there is no write, and nothing was locked,
+so nothing needs releasing.
+
+Append the result guarded by the same query, with `after` set to the watermark you read at. The
+store accepts the write only if nothing matching the query landed since. If it did, your model is
+stale and the append is rejected.
+
+## The whole cycle
+
+The retry handles a same-batch conflict, which is advisory: rebuild the model and try again. A
+durable conflict is different, and [Handling conflicts](../conflicts/) covers the distinction in
+full.
+
+<Code code={anchor(dmRaw, 'cycle')} lang="rust" />
+
+## Why this is the boundary
+
+The query that guards the append is the same query the decision read under, so the append fails
+on exactly the events the decision depended on, and on nothing else. Two students enrolling in the
+same last seat conflict, because both read the same seat count and both guard on the course's
+tag. Two students enrolling in different courses do not, because their queries share no tags. No
+one configured that in advance; it fell out of what each decision read.
+
+This is the payoff over a static aggregate boundary. You did not have to decide, when you designed
+the course and the student, that enrolment would need both. The decision declared its own boundary
+by reading what it needed.
+
+## Next
+
+[Handling conflicts](../conflicts/) is the retry contract in detail. [The uniqueness guard](../uniqueness-guard/)
+is the special case where `after` is omitted. [Core concepts](../../core-concepts/) has the exact
+query and append-condition semantics.

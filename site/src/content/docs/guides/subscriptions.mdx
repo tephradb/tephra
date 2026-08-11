@@ -1,0 +1,50 @@
+---
+title: Subscriptions
+description: Build a read model that catches up on history and tails the live edge, and resumes from a cursor.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import SubscriptionCursor from '../../../components/diagrams/SubscriptionCursor.astro';
+import subRaw from '../../../../tephra-site-examples/tests/subscriptions.rs?raw';
+
+A subscription is how a read model stays current. It delivers events in position order, from
+wherever you start, through all of history, and then keeps delivering as new events arrive. There
+is no separate "catch-up" and "live" mode to switch between.
+
+## Catch-up and live-tail are one loop
+
+A subscription holds a cursor: the last position it delivered. It reads the events after the
+cursor up to the published watermark, advances the cursor to that watermark, and blocks until the
+watermark moves. Then it repeats. Catch-up is just the first few turns of that loop, when the
+watermark is far ahead; live-tail is the same loop once the cursor has reached the edge.
+
+<SubscriptionCursor />
+
+Because every read is exclusive of the cursor and the cursor lands exactly on the watermark,
+nothing is skipped and nothing is delivered twice. The handoff that read-model code usually gets
+wrong, the seam between replaying history and following the live tail, does not exist here,
+because there is no seam.
+
+## Resuming from a cursor
+
+The `after` you subscribe from is the cursor, and it is exclusive, so persisting the last position
+you processed and passing it back on restart resumes exactly where you left off. Advance the cursor
+only after an event is handled, so a crash mid-event reprocesses that event rather than skipping
+it.
+
+<Code code={anchor(subRaw, 'resume')} lang="rust" />
+
+A subscription runs on its own connection: subscribing takes over the connection it runs on, so a
+read model keeps a connection separate from whatever issues writes. The `CaughtUp` marker is
+re-armed, so it fires each time the stream reaches the live edge, which is where a read model can
+report that it is current.
+
+## Ending a subscription
+
+A subscription does not end on its own. Drop the stream, or call `cancel` on the paired
+`SubscribeCancel`, to close it. `cancel` shuts the connection down, so it is the clean way to stop
+a long-running consumer from another thread.
+
+For how the watermark is published and why readers never block the writer, see
+[Architecture](../../architecture/).

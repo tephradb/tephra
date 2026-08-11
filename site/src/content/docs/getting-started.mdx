@@ -1,0 +1,80 @@
+---
+title: Getting started
+description: Run the Tephra server, connect with the client, and append, read, and subscribe.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../lib/snippet';
+import gsRaw from '../../../tephra-site-examples/tests/getting_started.rs?raw';
+
+This page runs start to finish against a real server. Everything after "Run the server" uses the
+`tephra-client` crate.
+
+## Run the server
+
+The server is a synchronous, thread-per-connection TCP server. Start it from a checkout of the
+workspace:
+
+```sh
+cargo run -p tephra-server
+```
+
+It binds `127.0.0.1:9000` and writes its log and index segments under `tephra-data` in the
+working directory. Both are configurable by flag, environment variable, or a TOML file: see
+[Operations](../operations/) for the full surface. The defaults, including the 256 MiB segment
+size, are the server's, not the library's.
+
+## Add the client
+
+In the project that will talk to the server:
+
+```sh
+cargo add tephra-client
+```
+
+## Connect
+
+`Client::connect` takes anything that resolves to a socket address and opens one TCP connection.
+A `Client` is not shared between threads: give each thread its own.
+
+<Code code={anchor(gsRaw, 'connect')} lang="rust" />
+
+## Append
+
+An event is a type, a set of tags, and an opaque payload. `append` takes an iterator of events
+and an optional condition; here the condition is `None`, so the write is unconditional. It
+returns the position range the batch landed at.
+
+<Code code={anchor(gsRaw, 'append')} lang="rust" />
+
+The client's `Event` is a friendly owned type (built from `&str`, `&[&str]`, and bytes). The
+engine has a second, packed `Event` used only when you embed the engine directly; the two do not
+interconvert, and the client type is the one you want here. See [Embedded](../embedded/) for the
+other one.
+
+## Read
+
+`read` and `read_all` take a query and an `after` position. `Position::ZERO` means "from the
+start of the log". Results come back in ascending position order.
+
+<Code code={anchor(gsRaw, 'read')} lang="rust" />
+
+Because the writer publishes each commit before the append reply returns, a client sees its own
+writes immediately: the read above returns the event the append above just recorded.
+
+## Subscribe
+
+A subscription catches up on history and then tails the live edge, as one loop. It yields events
+in order, then a `CaughtUp` marker each time it reaches the live edge. The marker is where a read
+model can report that it is current.
+
+<Code code={anchor(gsRaw, 'subscribe')} lang="rust" />
+
+A subscription does not end on its own: drop the stream, or call `cancel` on the paired
+`SubscribeCancel`, to close it.
+
+## Next
+
+[Core concepts](../core-concepts/) is the precise definition of events, tags, positions, and
+query semantics. [Guides](../guides/decision-models/) builds a real decision model and a read
+model on top of what is here.

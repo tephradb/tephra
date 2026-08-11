@@ -1,0 +1,105 @@
+---
+title: Tephra
+description: An immutable event store with global ordering, built for the Dynamic Consistency Boundary.
+template: splash
+hero:
+  tagline: An immutable event store with global ordering, built for the Dynamic Consistency Boundary.
+  actions:
+    - text: Get started
+      link: getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Introduction
+      link: introduction/
+      icon: open-book
+      variant: minimal
+    - text: GitHub
+      link: https://github.com/tqwewe/tephra
+      icon: external
+      variant: minimal
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../lib/snippet';
+import heroRaw from '../../../tephra-site-examples/tests/landing.rs?raw';
+
+## What it is
+
+Tephra is an append-only event store. Every event carries a type and a set of tags, a query
+reads exactly the events a decision depends on, and the same query guards the append that
+records the decision. A single writer assigns a dense, monotonic position to every event, so
+the log is one global order and everything else (the tag index, the type column) is derived
+from it and rebuildable by replaying it.
+
+It is for teams applying the Dynamic Consistency Boundary pattern, where the consistency
+boundary is derived per decision from a query rather than baked into an aggregate. You run it as
+a server and talk to it with the client, one node, one logical writer per bounded context. If
+you need to shard writes horizontally, this is the wrong tool, and the constraints below say so
+before you adopt it, not after.
+
+## Append with a condition, then read
+
+<Code code={anchor(heroRaw, 'hero')} lang="rust" />
+
+Prefer to embed the engine in your own process instead of running the server? See
+[Embedded](embedded/).
+
+## What holds it up
+
+The log is the source of truth. The indexes keep no write-ahead log and no crash-consistent
+update path, because a lost or corrupt index is rebuilt by replaying the log segment it
+derives from.
+
+Data is written once. There is no update, no delete, no compaction, no free list, and no page
+reuse, so the machinery a B-tree or an LSM exists to run is simply not here.
+
+Structures split on cardinality. High-cardinality tags get an inverted index: an FST term
+dictionary over tiered posting lists. Low-cardinality types get a dense two-byte column,
+indexed by position, that a type-only query scans directly.
+
+Segments are position-disjoint. An `after: p` bound prunes whole segments by comparing a
+header, with no probing, and merging two adjacent index segments is per-term concatenation
+rather than a k-way merge, because their position ranges never overlap.
+
+The planner changes the speed, never the answer. Indexed fetch and filtered scan return the
+identical positions, and a test runs every read under both to prove it, so a wrong cost
+estimate can only pick a slower correct path.
+
+## The constraints, stated plainly
+
+One logical writer per bounded context. You cannot shard your way out: the value of the
+Dynamic Consistency Boundary is queries that span entities, so partitioning by tag would break
+exactly the cross-entity conditions the store exists to check. You scale by running more
+bounded contexts, not by splitting one.
+
+The ceiling is fsync, not ordering. Throughput is set by how many writes coalesce into one
+group-committed fsync. On one Hetzner box (AMD EPYC-Milan, ext4 SSD, about 1.15 ms fsync,
+256-byte events, 16 concurrent writers) the same build records 6,464 conditional appends per
+second when each commits on its own and 796,724 events per second when they batch 512 at a time,
+which is the same disk and the same code separated by two orders of magnitude. Batch, and measure
+on the storage you will actually run on.
+
+Single node. Replication is not built. See [Status](status/) for what is deferred and what
+would need to be true before it starts.
+
+## Install
+
+```sh
+# Run the server, then talk to it with the client:
+cargo run -p tephra-server
+cargo add tephra-client
+
+# Or embed the engine directly in a Rust process:
+cargo add tephra
+```
+
+Next: read the [Introduction](introduction/) for what a Dynamic Consistency Boundary is and the
+problem it removes, or jump to [Getting started](getting-started/) to run the server and append
+your first event.
+
+## About the name
+
+Tephra is the ash and rock a volcano throws out in a single eruption. One fall settles as one
+layer across otherwise unrelated sediment records, and tephrochronology reads that layer as a
+shared time marker to line those records up. A globally ordered log is the same marker for
+events: one order every reader agrees on, laid down once.

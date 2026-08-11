@@ -1,0 +1,58 @@
+---
+// The seglog on-disk record frame, and how a batch terminates in a commit marker.
+// Themed with the --diagram-* CSS variables so it reads in both colour schemes.
+---
+
+<svg
+  class="tephra-diagram"
+  viewBox="0 0 640 260"
+  role="img"
+  aria-labelledby="recfmt-title recfmt-desc"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <title id="recfmt-title">The seglog record format and batch commit marker</title>
+  <desc id="recfmt-desc">
+    A record is a 4-byte length field (one bit of which is the control flag), a 4-byte CRC32, and
+    the data. A batch is a run of data records terminated by a control record whose payload is the
+    highest position in the batch.
+  </desc>
+
+  <g fill="var(--diagram-fill)" stroke="var(--diagram-stroke)" stroke-width="1.5">
+    <rect x="20" y="30" width="120" height="56" rx="4"></rect>
+    <rect x="140" y="30" width="120" height="56" rx="4"></rect>
+    <rect x="260" y="30" width="360" height="56" rx="4"></rect>
+  </g>
+  <g text-anchor="middle" font-size="15" fill="var(--diagram-text)">
+    <text x="80" y="63">Length 4B</text>
+    <text x="200" y="63">CRC32 4B</text>
+    <text x="440" y="63">Data (N bytes)</text>
+  </g>
+  <g text-anchor="middle" font-size="12" fill="var(--diagram-muted)">
+    <text x="80" y="104">bit 30: control flag</text>
+    <text x="200" y="104">IEEE 802.3</text>
+    <text x="440" y="104">the encoded event, verbatim</text>
+  </g>
+
+  <text x="20" y="160" font-size="14" fill="var(--diagram-muted)">One batch, one fsync:</text>
+
+  <g fill="var(--diagram-fill)" stroke="var(--diagram-stroke)" stroke-width="1.5">
+    <rect x="20" y="176" width="150" height="52" rx="4"></rect>
+    <rect x="180" y="176" width="150" height="52" rx="4"></rect>
+    <rect
+      x="340"
+      y="176"
+      width="220"
+      height="52"
+      rx="4"
+      fill="var(--diagram-accent-soft)"
+      stroke="var(--diagram-accent)"></rect>
+  </g>
+  <g text-anchor="middle" font-size="14" fill="var(--diagram-text)">
+    <text x="95" y="207">data record</text>
+    <text x="255" y="207">data record</text>
+    <text x="450" y="207">commit marker</text>
+  </g>
+  <text x="450" y="248" text-anchor="middle" font-size="12" fill="var(--diagram-muted)"
+    >control flag set, carries the highest position</text
+  >
+</svg>

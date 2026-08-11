@@ -6,6 +6,7 @@ members = [
     "crates/tephra-proto",
     "crates/tephra-server",
     "crates/tephra-types",
+    "site/tephra-site-examples",
 ]
 resolver = "2"
 
@@ -15,6 +16,7 @@ seglog = { path = "crates/seglog" }
 tephra = { path = "crates/tephra" }
 tephra-client = { path = "crates/tephra-client" }
 tephra-proto = { path = "crates/tephra-proto" }
+tephra-server = { path = "crates/tephra-server" }
 tephra-types = { path = "crates/tephra-types" }
 
 # Third-party

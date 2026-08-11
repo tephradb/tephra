@@ -1,0 +1,42 @@
+---
+title: The uniqueness guard
+description: Omit after to guard that something happens at most once.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import ugRaw from '../../../../tephra-site-examples/tests/uniqueness_guard.rs?raw';
+
+The uniqueness guard is the decision model's simplest case: the decision is "has this happened
+before?", and the answer must hold at the instant of the write. It is what enforces "a course is
+opened at most once", "an email registers at most one account", "an order is placed once".
+
+## Omit `after`
+
+An append condition is a query plus an `after` position. Leave `after` at its default,
+`Position::ZERO`, and the condition reads as "fail if any event matches at all", across the whole
+log, not just since some point. That is the guard: the append succeeds only if nothing matching
+the query already exists.
+
+<Code code={anchor(ugRaw, 'guard')} lang="rust" />
+
+The query is precise: `CourseOpened` events carrying this course's tag. It does not guard against
+opening a different course, and it does not guard against unrelated events on the same course, so
+two different courses opening concurrently never contend.
+
+## Why you do not read first
+
+You could read the log, see no `CourseOpened` for this course, and then append. Between the read
+and the append, another writer could open the same course, and you would both succeed. The guard
+removes the gap: the check and the write are one atomic operation on the writer, so exactly one of
+two concurrent opens wins and the other is told it conflicts.
+
+That is why the uniqueness guard omits `after` rather than reading and comparing. There is no
+position to read up to, because the guarantee is not "since I looked" but "ever".
+
+## The conflict is terminal
+
+A conflict here means the course already exists. That is a durable conflict, not an advisory one:
+retrying will hit the same existing event and fail again. The caller treats it as a definite "no",
+which is why the example returns `false` rather than looping. The difference between an advisory
+and a terminal conflict is the subject of [Handling conflicts](../conflicts/).

@@ -1,0 +1,110 @@
+---
+// The two-arm append-condition check: a staged tag lookup for the current drain window, then
+// the durable arm (tag-tips fast reject, then an early-terminating index existence check, with
+// the log scan as the oracle).
+---
+
+<svg
+  class="tephra-diagram"
+  viewBox="0 0 640 320"
+  role="img"
+  aria-labelledby="cond-title cond-desc"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <title id="cond-title">The two-arm append-condition check</title>
+  <desc id="cond-desc">
+    An append condition is evaluated first against the staged tips of the current commit batch,
+    then against the durable state: a tag-tips fast reject, falling through to an index existence
+    check, with a log scan as the authoritative oracle.
+  </desc>
+
+  <g text-anchor="middle" font-size="14">
+    <!-- entry -->
+    <rect
+      x="240"
+      y="16"
+      width="160"
+      height="40"
+      rx="6"
+      fill="var(--diagram-fill)"
+      stroke="var(--diagram-stroke)"
+      stroke-width="1.5"></rect>
+    <text x="320" y="41" fill="var(--diagram-text)">append + condition</text>
+
+    <line x1="320" y1="56" x2="320" y2="84" stroke="var(--diagram-stroke)" stroke-width="1.5"></line>
+
+    <!-- staged arm -->
+    <rect
+      x="200"
+      y="84"
+      width="240"
+      height="46"
+      rx="6"
+      fill="var(--diagram-fill)"
+      stroke="var(--diagram-stroke)"
+      stroke-width="1.5"></rect>
+    <text x="320" y="106" fill="var(--diagram-text)">staged arm: same-batch tags</text>
+    <text x="320" y="122" font-size="11" fill="var(--diagram-muted)"
+      >conflict &#8594; SameBatch (retryable)</text
+    >
+
+    <line x1="320" y1="130" x2="320" y2="158" stroke="var(--diagram-stroke)" stroke-width="1.5"
+    ></line>
+
+    <!-- durable fast reject -->
+    <rect
+      x="200"
+      y="158"
+      width="240"
+      height="46"
+      rx="6"
+      fill="var(--diagram-fill)"
+      stroke="var(--diagram-stroke)"
+      stroke-width="1.5"></rect>
+    <text x="320" y="180" fill="var(--diagram-text)">tag tips: fast reject</text>
+    <text x="320" y="196" font-size="11" fill="var(--diagram-muted)"
+      >DefinitelyNoMatch &#8594; accept</text
+    >
+
+    <line x1="320" y1="204" x2="320" y2="232" stroke="var(--diagram-stroke)" stroke-width="1.5"
+    ></line>
+    <text x="360" y="222" font-size="11" fill="var(--diagram-muted)">Unknown</text>
+
+    <!-- index existence check -->
+    <rect
+      x="200"
+      y="232"
+      width="240"
+      height="46"
+      rx="6"
+      fill="var(--diagram-accent-soft)"
+      stroke="var(--diagram-accent)"
+      stroke-width="1.5"></rect>
+    <text x="320" y="254" fill="var(--diagram-text)">index existence check</text>
+    <text x="320" y="270" font-size="11" fill="var(--diagram-muted)"
+      >first match &#8594; Durable(pos)</text
+    >
+
+    <!-- oracle -->
+    <rect
+      x="470"
+      y="232"
+      width="150"
+      height="46"
+      rx="6"
+      fill="var(--diagram-fill)"
+      stroke="var(--diagram-stroke)"
+      stroke-width="1.5"
+      stroke-dasharray="4 3"></rect>
+    <text x="545" y="254" fill="var(--diagram-text)">log scan</text>
+    <text x="545" y="270" font-size="11" fill="var(--diagram-muted)">oracle</text>
+    <line
+      x1="440"
+      y1="255"
+      x2="470"
+      y2="255"
+      stroke="var(--diagram-muted)"
+      stroke-width="1.5"
+      stroke-dasharray="4 3"></line>
+  </g>
+</svg>

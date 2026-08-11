@@ -1,0 +1,51 @@
+---
+title: Handling conflicts
+description: SameBatch is advisory and retryable; Durable is terminal until you rebuild. Get this right.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import cfRaw from '../../../../tephra-site-examples/tests/conflicts.rs?raw';
+
+When an append is rejected by its condition, the rejection comes in two kinds, and treating them
+the same is a real bug. One is advisory and you should retry it. The other is terminal and
+retrying it verbatim will fail again. The client tells you which through
+`ClientError::Server { retryable, conflict_position, .. }`.
+
+## The two kinds
+
+A durable conflict means a real event matching your condition landed since the position you read
+at. Your decision was made against stale state. This is `retryable: false`, and it carries the
+`conflict_position` of the event that beat you. Retrying the exact same append is pointless: the
+conflicting event is still there. You have to rebuild your decision model against the new tail and
+decide again, which may now come out differently (the seat you wanted is taken).
+
+A same-batch conflict is advisory. Several writes drain into one group commit, and within that
+window the store uses a conservative, tag-only check that cannot see event types, so it can reject
+two writes that a precise check would have allowed. This is `retryable: true`. A retry re-reads the
+now-durable state and gets the precise answer, which is often "no real conflict, proceed".
+
+Collapsing the two into a bare "it conflicted" loses this. Retrying a durable conflict spins; not
+retrying a same-batch conflict fails a write that should have succeeded.
+
+## The retry loop
+
+Rebuild the model from the current tail each attempt. Retry a same-batch conflict. On a durable
+conflict, surface it: the loop has already re-read, so the next decision is made against the state
+that beat you.
+
+<Code code={anchor(cfRaw, 'retry')} lang="rust" />
+
+The loop is bounded. A same-batch conflict clears once the contending batch commits, so a small
+retry count is enough; an unbounded retry would only matter under sustained contention on the exact
+same tags, which is the case you want to surface, not hide.
+
+## Why the store is conservative here
+
+The same-batch check is deliberately pessimistic: it would rather reject a write that was actually
+fine than accept one that was not, because a false rejection is recoverable by a retry while a
+false acceptance is a durability bug. This is safe only if callers honour the retry contract, which
+is why this page exists and why the distinction is worth getting right in a shared helper rather
+than at every call site.
+
+For how the two-arm check works inside the writer, see [Architecture](../../architecture/).

@@ -1,0 +1,80 @@
+---
+title: Status
+description: What is built, what is deliberately deferred, and what would need to be true before the deferred work starts.
+---
+
+This documentation describes Tephra at commit `b5d2d96`. Everything on the other pages is built
+and tested at that commit. This page is the boundary between what exists and what does not.
+
+## Built
+
+The store is complete through subscriptions. In dependency order:
+
+The log is durable, position-addressed segmented storage with per-record CRCs, batch commit
+markers, and a recovery rule that validates a whole run rather than trusting a trailing marker.
+The event model is a packed, zero-copy codec: type, sorted tags, and payload, with the in-memory
+layout matching the on-disk layout. The query model is the OR-across-items, AND-within-tags
+predicate, shared by the read path and the append-condition check.
+
+The write coordinator is a single logical writer with group commit, position assignment, and the
+two-arm append-condition check (a staged arm for the current batch, a durable arm that fast-rejects
+on a tag map and falls through to an index existence check, with a log scan as the oracle). Index
+segments are immutable and position-disjoint, one per sealed log segment, with an FST term
+dictionary over tiered postings for tags and a dense column for types.
+
+The query planner chooses index against scan by comparing an estimated result size to the pruned
+range width, and is proven to change only the speed and never the answer. Reads run on the caller's
+own thread over an immutable snapshot and an atomically published watermark, with the active tail
+an append-only, lock-free structure. Subscriptions are catch-up and live-tail unified as one loop
+off the advancing watermark, wired through the server and client.
+
+For the full checklist, see [`ROADMAP.md`](https://github.com/tqwewe/tephra/blob/main/ROADMAP.md).
+
+## Not built yet
+
+The following are designed but unbuilt. They are listed in future or conditional terms on purpose:
+none of it exists today, and none of it has a date. Each is deferred without design debt, meaning
+nothing above depends on it and it depends on nothing above.
+
+Persisted offset sidecars, or lazy per-segment construction, would matter when a log grows large
+enough that reading every segment at startup to rebuild the in-memory offset index becomes the
+dominant startup cost.
+
+Index segment merging would reduce the open-file count for a store with many sealed segments. It
+would be concatenation, not a k-way merge, because the segments are position-disjoint, and it would
+be an amortisation, never a correctness requirement.
+
+Retention and archival, and cold-segment recompression on seal, would let old segments move to
+cheaper storage. Whole-segment compression belongs only on the cold path, where a full-segment
+rehydrate per read is acceptable, never on the warm read path.
+
+A separately addressed, block-compressed payload region would keep type and tags scannable and
+uncompressed while a per-segment dictionary compresses the payloads, so condition checks and
+counting projections would never decompress. This is the real compression story, and the enabler
+is the payload split, not the compression granularity.
+
+Crypto-shredding would satisfy an erasure request by discarding a key rather than rewriting the
+log, which an append-only store cannot do in place.
+
+Replication would take the store beyond a single node. It is the largest deferred item and the one
+most likely to change operational assumptions.
+
+A verifiable audit log would add tamper-evidence against an adversary with file access, not just
+corruption: a per-batch cryptographic hash chain, finalised once per fsync, with the tamper-evidence
+coming from external witnessing rather than from the engine. It would be built only against a
+concrete requirement, because a half-built integrity feature gives false assurance.
+
+Published benchmark suites for fsync-bound throughput, group-commit behaviour under load, and
+condition-check latency would replace the current position, which is that the benchmark harness
+exists and the numbers must be run on the storage you deploy on rather than quoted from memory.
+
+## What would change the order
+
+Deferred does not mean unordered. Replication and retention become urgent when a real deployment
+outgrows a single node or a single disk. The payload blob region becomes worthwhile when payloads
+are large relative to the metadata, since the whole point of it is to keep the scannable metadata
+small. Until a concrete workload pushes on one of these, the effort stays on correctness and the
+measured write path.
+
+See [Architecture](../architecture/) for why each of these was designed the way it was before being
+deferred.

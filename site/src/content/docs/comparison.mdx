@@ -1,0 +1,178 @@
+---
+title: Comparison
+description: Measured write and read comparisons against UmaDB, Axon Server, KurrentDB, and Postgres, including where Tephra loses.
+---
+
+A useful comparison is about what each system optimises for, not who wins a number. The honest
+version includes where Tephra is behind.
+
+## UmaDB
+
+UmaDB is the closest comparable, and it is worth reading. It is LMDB specialised for the Dynamic
+Consistency Boundary: a single paged file, copy-on-write B+trees, dual headers, TSN-based MVCC, a
+free-list tree, memory-mapped readers, and one writer. It reaches the same single-writer conclusion
+Tephra does, by a different route, and its tag-value tiering (an inline list for a rare tag,
+promoted to a subtree when the tag gets hot) is the same insight as Tephra's tiered postings,
+arrived at independently.
+
+In one respect its design is cleaner. Its dual-header copy-on-write gives crash safety with no
+write-ahead log and O(1) recovery: the store opens at the last valid header, with no scan. Tephra
+recovers by scanning the last segment, which is more work at startup, though bounded to one
+segment.
+
+Tephra diverges on a workload bet: that position-ordered sequential scans are the dominant read.
+Projection rebuilds and subscription catch-up both read the log in position order, and in an
+append-only log that is a sequential read at disk bandwidth. In a copy-on-write B+tree, once pages
+have been reused, logical order stops matching physical order and the same scan becomes random I/O.
+Three consequences follow from the same bet. Payloads in B+tree leaves mean fewer positions per
+page and every copied leaf drags payload bytes along, where Tephra keeps payloads in the log and
+scannable metadata separate. A commit touching k tags copies k root-to-leaf paths plus free-list
+churn and pays two fsyncs, where Tephra appends once and fsyncs once. And hashing tags to fixed-width
+keys forbids prefix scans and needs collision post-filtering, where an FST over the raw strings
+costs less space given their shared prefixes. None of these make UmaDB wrong; they make it a
+different bet, and on a workload dominated by random point reads rather than ordered scans the bet
+runs the other way. The numbers below measure both directions of it: Tephra leads on batched writes
+and warm ordered scans, and loses on cold random reads.
+
+## Axon Server
+
+Axon Server is the third system in the head-to-head tables. It ran as
+`axoniq/axonserver:2026.0.5-jdk-21-nonroot`, the licensed image, in unregistered twelve-hour trial
+mode with no licence, single-node standalone DCB. It is not a free or SE edition, and a licensed or
+clustered deployment may behave differently. It is a JVM system with a different operational model
+from the two Rust stores, which shows up as higher latency and heavier memory use throughout. Its
+write runs used the same 256 MiB segment size as Tephra; its read runs used 16 MiB, because a fair
+256 MiB read would need reseeding the multi-gigabyte cold corpus and its cold-read path exhausted
+memory at that size. Reads are near segment-insensitive here, and larger segments read slightly
+faster, so a 16 MiB Axon read can only understate Axon at 256, never flatter it.
+
+## Write throughput
+
+The comparative write tables were held for a rerun at Tephra's 256 MiB default segment size, and
+that rerun is done, so here they are. Every append below carries a Dynamic Consistency Boundary
+condition (one tag, one type): this is the guarded write path, not a raw insert. Tephra and Axon
+ran at a matched 256 MiB segment size, and UmaDB is page-based, so segment size does not enter its
+column.
+
+The dial that matters is batch size, because it sets how many events share one fsync. At 64
+concurrent writers:
+
+| Batch size | Tephra | UmaDB | Axon Server |
+|---|---|---|---|
+| 1 | 21,397 events/s | 6,266 | 9,736 |
+| 64 | 533,955 events/s | 82,264 | 22,130 |
+| 512 | 984,881 events/s | 98,614 | 2,822 (latency-bound) |
+
+Group commit is why the Tephra column climbs so steeply: 512 conditional appends become one durable
+operation, so throughput rises with batch size, while UmaDB pays per-append B+tree and fsync costs
+and flattens by batch 64, and Axon peaks around batch 64 then collapses under larger batches (the
+last cell is treated below, not as a throughput number).
+
+Concurrency is the second dial, and it separates the stores further. Unbatched, Tephra scales from
+about 1,000 conditional appends per second at a single writer to 32,738 at 128 writers, with p50
+latency holding near 3.8 ms. UmaDB tops out around 7,776 (p50 climbing to 17 ms) and Axon around
+10,272 (p50 12 ms). Tephra's single-writer coordinator serialises only the in-memory position
+assignment and condition check, so more writers fill the same group commit rather than contending,
+and the gap widens with load.
+
+## Warm reads
+
+Reads fall into two regimes, and they measure different things, so they are reported apart. Warm
+reads run against 50,000 prepopulated events, a few megabytes that sit entirely in memory, so no
+read touches disk. UmaDB was configured with a 2 GB page cache reading through file I/O; Tephra
+loads its index segments into memory. These characterise in-memory read cost.
+
+Warm, Tephra leads on selective reads and ties UmaDB on a full scan:
+
+| Warm read | Tephra | UmaDB | Axon Server |
+|---|---|---|---|
+| Selective, single entity (64 readers) | 381,068 events/s | 240,276 | 170,279 |
+| Full scan (16 readers) | 1,995,838 events/s | 1,949,619 | 860,521 |
+
+The full scan is a near tie on throughput, and UmaDB holds a tighter tail there (p99 435 ms against
+Tephra's 717 ms), so even is a fairer word for it than win. On selective reads Tephra's index plus
+dense type column pulls clearly ahead. Both Rust stores read roughly twice as fast as Axon warm.
+
+## Cold reads
+
+Warm numbers do not answer the question that decides a large deployment: what happens when the data
+does not fit in memory. The cold runs prepopulate 8,000,000 events, larger than the container's
+memory, so reads hit disk. This is where Tephra loses, and it loses clearly.
+
+| Cold selective read (16 readers) | Tephra | UmaDB | Also measured |
+|---|---|---|---|
+| 256-byte events | 10,894 events/s | 169,226 | Axon 1,037 |
+| 1 KiB events | 11,955 events/s | 173,368 | KurrentDB 17,335 |
+
+UmaDB is more than fifteen times faster on a small selective read against a cold corpus. This is not
+a surprise, and the architecture already predicts it: a memory-mapped B+tree keeps a key next to its
+data and turns a point lookup into one or two page reads, while Tephra finds positions through its
+index and then fetches each payload from a cold log, which is a scatter of random reads. Tephra bets
+on ordered scans (subscription catch-up, projection rebuilds, the warm full scan above), and on cold
+random point reads the bet runs the other way. If your dominant read is a selective lookup into a
+corpus far larger than memory, UmaDB is the better fit, and this benchmark says so plainly.
+
+## The wider field
+
+A second session ran a broader group on unconditional writes, adding KurrentDB (the store formerly
+named EventStoreDB), Postgres through Marten, EventSourcingDB, and Fact. On the same batched write at
+64 writers, KurrentDB reached 179,329 events/s and Marten's bare Postgres insert path 66,586, against
+Tephra's 984,881, and Tephra's figure is from the conditional path while theirs are unconditional, so
+the comparison understates Tephra rather than flattering it. EventSourcingDB and Fact could not
+complete the batched or flood write runs (near-zero throughput with high error counts) and are left
+out rather than shown as a number that means nothing.
+
+## Large synchronous batches
+
+The last write cell above, Axon at batch 512, is a latency finding rather than a throughput one, and
+it is worth stating on its own. At a fixed number of synchronous writers, sustained throughput is
+bounded by the writers divided by per-append latency, times the batch size: each writer waits for one
+append to commit before it issues the next, so per-append service time under large batches sets the
+ceiling whatever the disk can do.
+
+Axon's per-append latency climbed steeply with batch size: a median 39 milliseconds at batch 64 with
+16 writers, 183 milliseconds at 64 writers, and at batch 512 it completed too few appends in the
+fifteen-second window to sample latency at all (fewer than 1,000, so its percentiles are suppressed),
+with throughput falling to 2,822 events/s, below its own batch-64 result. Tephra commits the same
+batch-512 append in a median 33 milliseconds at 64 writers, because group commit makes the batch one
+durable operation rather than 512. The finding is narrow and defensible: Axon does not sustain large
+synchronous batches at these writer counts, and a pipelined client with many appends in flight was not
+measured and could do better.
+
+## EventStoreDB, Kafka, Postgres
+
+These are further away, and the useful framing is what each optimises for.
+
+EventStoreDB, now shipping as KurrentDB and measured in the wider field above, optimises for
+stream-per-aggregate event sourcing: a stream is the unit of read, subscription, and consistency.
+Tephra's boundary is a query across tags rather than a stream, which is the thing the Dynamic
+Consistency Boundary exists to express and the thing a stream-oriented store makes you assemble from
+many streams plus a process manager. On raw batched writes it was the fastest of the wider field
+after Tephra, and on cold selective reads it sat close to Tephra and far behind UmaDB.
+
+Kafka optimises for high-throughput partitioned pub/sub, and it scales by partitioning. That is the
+one move a globally ordered DCB store cannot make, because the value is queries that span entities
+and partitioning by entity breaks exactly those. Kafka is the right tool when you can partition;
+Tephra exists for the case where you deliberately cannot.
+
+Postgres optimises for general-purpose mutable relational data with rich secondary indexes. You can
+build an event store on it, and many do, but you carry the machinery for update and delete that an
+immutable log does not need, and the append-condition check becomes a transaction with the
+isolation and contention that implies.
+
+## The conditions behind every figure
+
+All figures come from the benchmark harness, not from memory. One Hetzner CCX box: AMD EPYC-Milan,
+4 cores / 8 threads, 32 GB RAM, Ubuntu 26.04, ext4 on an SSD, measured fsync latency about 1.15 ms
+average. Each store ran in a container with a 4 GB memory limit. Events are 256 bytes unless a row
+says otherwise, runs are 15 seconds each, seed 42. Tephra and Axon writes are at 256 MiB segments;
+UmaDB used a 2 GB page cache with file I/O.
+
+## Run it yourself
+
+The full results are browsable in an interactive dashboard at
+[event-store-benchmark.tqwewe.com](https://event-store-benchmark.tqwewe.com), and the harness and its
+configurations are public: see
+[tqwewe/event-store-benchmark](https://github.com/tqwewe/event-store-benchmark/tree/fair-benchmarks-web-ui).
+Run it on the storage you intend to deploy on, because a tmpfs makes fsync almost free and the write
+numbers meaningless.

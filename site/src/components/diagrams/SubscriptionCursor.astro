@@ -1,0 +1,59 @@
+---
+// Catch-up and live-tail are the same operation: read (cursor, watermark], advance the cursor
+// to the pinned watermark, block until the watermark moves, repeat.
+---
+
+<svg
+  class="tephra-diagram"
+  viewBox="0 0 640 220"
+  role="img"
+  aria-labelledby="sub-title sub-desc"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <title id="sub-title">The subscription cursor: catch-up equals live-tail</title>
+  <desc id="sub-desc">
+    A subscription reads the half-open range from its cursor to the published watermark, advances
+    the cursor to that watermark, and blocks until the watermark advances. Catch-up and live
+    tailing are the same loop, so the handoff has no separate code path.
+  </desc>
+
+  <line x1="20" y1="90" x2="620" y2="90" stroke="var(--diagram-stroke)" stroke-width="1.5"></line>
+
+  <!-- delivered region -->
+  <rect x="20" y="76" width="300" height="28" fill="var(--diagram-fill)" stroke="none"></rect>
+  <line x1="20" y1="90" x2="320" y2="90" stroke="var(--diagram-muted)" stroke-width="4"></line>
+  <text x="170" y="66" text-anchor="middle" font-size="13" fill="var(--diagram-muted)"
+    >delivered</text
+  >
+
+  <!-- read region (cursor, watermark] -->
+  <line x1="320" y1="90" x2="470" y2="90" stroke="var(--diagram-accent)" stroke-width="4"></line>
+  <text x="395" y="66" text-anchor="middle" font-size="13" fill="var(--diagram-accent)"
+    >read (cursor, watermark]</text
+  >
+
+  <!-- cursor marker -->
+  <line x1="320" y1="70" x2="320" y2="120" stroke="var(--diagram-stroke)" stroke-width="2"></line>
+  <text x="320" y="140" text-anchor="middle" font-size="13" fill="var(--diagram-text)">cursor</text>
+
+  <!-- watermark marker -->
+  <line
+    x1="470"
+    y1="70"
+    x2="470"
+    y2="120"
+    stroke="var(--diagram-accent)"
+    stroke-width="2"></line>
+  <text x="470" y="140" text-anchor="middle" font-size="13" fill="var(--diagram-accent)"
+    >watermark</text
+  >
+
+  <!-- unread tail -->
+  <text x="545" y="82" text-anchor="middle" font-size="12" fill="var(--diagram-muted)"
+    >not yet visible</text
+  >
+
+  <text x="320" y="180" text-anchor="middle" font-size="13" fill="var(--diagram-muted)"
+    >on exhaustion, cursor advances to the watermark, then blocks until it moves</text
+  >
+</svg>

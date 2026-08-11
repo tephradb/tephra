@@ -1,0 +1,69 @@
+---
+title: Embedded
+description: Embed the engine in your own process instead of running the server.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../lib/snippet';
+import embRaw from '../../../tephra-site-examples/tests/embedded.rs?raw';
+
+Running the server and talking to it with the client is the common path, and most of this site
+assumes it. You can also link the engine (`tephra`) directly into a Rust process and skip the
+wire entirely. This page is the whole of what that changes.
+
+## When to embed
+
+Embed when the code making decisions and the store live in the same process and you want no
+network hop: a single-process service, a command-line tool, a test harness. You give up the
+things the server provides: remote access over TCP, multiple client processes against one store,
+and the language-agnostic protobuf protocol. You gain the removal of serialisation and a socket
+from the write path.
+
+What you do not gain is a second writer. The engine is one logical writer per store whether you
+embed it or run the server, so embedding is not a way around the single-writer constraint. It is
+the same store, reached directly.
+
+## Open the store and start the coordinator
+
+`SegmentSet::open` opens (or creates) a log directory, and `WriteCoordinator::start` starts the
+single writer thread and hands back a cloneable `WriteHandle`. `SegmentConfig` and `SegmentSet`
+are re-exported at the crate root.
+
+<Code code={anchor(embRaw, 'open')} lang="rust" />
+
+There is no library default segment size: you pass one to `SegmentConfig::new`. The 256 MiB
+figure quoted elsewhere is the server's default, not the engine's.
+
+## Append
+
+The engine's `Event` is a packed, zero-copy codec type, distinct from the client's owned `Event`.
+It is built from `&EventType`, `&Tags`, and a payload, and the in-memory layout is the on-disk
+layout, so the events you build are the bytes that get written.
+
+<Code code={anchor(embRaw, 'append')} lang="rust" />
+
+`append` blocks until the batch is durable and returns the position range. Under the `async`
+cargo feature there is also an `append_async`; it is feature-gated and off by default.
+
+## Read
+
+Reads run on the caller's own thread over a snapshot the writer publishes at each commit. The
+read handle's `read` returns `Reads`, a lending iterator: it yields a borrow of its own buffer
+per item, which is why it is consumed with `while let` rather than a `for` loop.
+
+<Code code={anchor(embRaw, 'read')} lang="rust" />
+
+`Reads::next` is not `std::iter::Iterator::next`. That is deliberate: a standard iterator cannot
+yield a borrow of itself per item, and yielding an owned value would force an allocation and a
+copy on the highest-volume read path. The client's read stream, by contrast, is a plain
+`Iterator`, because it hands back owned events decoded off the wire.
+
+## Shutdown
+
+`WriteCoordinator::shutdown` signals the writer thread, joins it, and returns the `SegmentSet`.
+Dropping the coordinator does the same. Either way the writer thread is joined before the process
+exits, so no committed batch is left unflushed.
+
+For the field-by-field configuration surface, durability semantics, and what recovery does on
+restart, see [Operations](../operations/). For why the engine is shaped this way, see
+[Architecture](../architecture/).

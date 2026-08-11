@@ -1,0 +1,19 @@
+{
+  "name": "tephra-site",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Tephra website and documentation.",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.7",
+    "astro": "^7.2.0",
+    "sharp": "^0.35.3"
+  }
+}

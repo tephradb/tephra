@@ -1,0 +1,85 @@
+---
+title: Introduction
+description: What a Dynamic Consistency Boundary is, and the problem it removes.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../lib/snippet';
+import decideRaw from '../../../tephra-site-examples/tests/introduction.rs?raw';
+
+## The boundary problem
+
+Most event-sourced systems fix the consistency boundary in advance. You choose an aggregate,
+you give it a stream, and every invariant that aggregate enforces is checked by replaying that
+one stream. This works until a decision depends on more than one aggregate at once, which in a
+real domain is often.
+
+Take enrolment. A student enrols in a course. Two rules govern it: a course has a seat limit,
+and a student may hold at most some number of concurrent enrolments. The decision to accept an
+enrolment depends on two entities: how many seats the course has left, and how many enrolments
+the student already holds. Neither aggregate owns the whole decision.
+
+With a stream per aggregate you have three ways out, and each costs something. Fold both
+entities into one larger aggregate, and the boundary grows until unrelated changes contend on
+the same stream. Model an Enrolment aggregate that duplicates the course and student
+invariants, and the same fact is now enforced in two places that can disagree. Or keep the two
+aggregates apart and coordinate them with a process manager: emit on one side, react on the
+other, and compensate when the second step fails. One fact, "this student enrolled in this
+course", becomes two events and a saga to hold them together.
+
+```text
+Aggregate + saga shape (not Tephra):
+
+  Course stream:   [ CourseOpened ] [ SeatTaken ] ...
+  Student stream:  [ StudentRegistered ] [ EnrolmentAdded ] ...
+
+  enrol(student, course):
+    load Course aggregate      -> seats_left
+    load Student aggregate     -> enrolment_count
+    if seats_left == 0 or enrolment_count >= limit: reject
+    append SeatTaken to Course stream
+    append EnrolmentAdded to Student stream   // second write
+    ... and a process manager to compensate if the second write loses a race
+```
+
+## What a Dynamic Consistency Boundary is
+
+The Dynamic Consistency Boundary, from Sara Pellegrini's work, derives the boundary per
+decision instead of fixing it in an aggregate. There is one event stream per bounded context.
+Each event carries a type and a set of tags, so `StudentEnrolled` can carry both `course:c1`
+and `student:s1` and belong to both entities at once. A decision reads exactly the events its
+tags touch, folds them into whatever it needs to decide, and appends its result guarded by the
+same query it read under. The boundary is the union of the filters the decision actually
+depended on, and nothing wider.
+
+The enrolment decision reads the events tagged `course:c1` (to count seats used) and the
+events tagged `student:s1` (to count the student's current enrolments), decides, and appends a
+single `StudentEnrolled` event carrying both tags. The guard on that append is the same query:
+fail if any conflicting event landed since the position the decision was made against. No
+second stream, no saga, one event.
+
+<Code code={anchor(decideRaw, 'decide')} lang="rust" />
+
+The `after(watermark)` bound is the whole point of the guard. It says: ignore everything at or
+before the position I read up to, and reject only if something matching my query landed since.
+That is what makes the boundary dynamic. It covers exactly the events the decision depended on,
+so two enrolments into the same last seat conflict, while two enrolments into different courses
+do not, with no coordinator deciding that in advance.
+
+## The two operations
+
+A minimally compliant store offers two operations, and Tephra is built around them:
+
+`read(query, after)` returns the matching events in ascending position order.
+
+`append(events, condition)` records events atomically and fails if any event matches the
+condition's query after its `after` bound. Omit `after` (leave it at `Position::ZERO`) and the
+guard becomes "fail if any event matches at all", which is the uniqueness guard: the pattern
+behind "this course may be opened only once".
+
+## Where to go next
+
+[Core concepts](../core-concepts/) defines events, types and tags, positions, and the exact
+query and append-condition semantics. [Guides](../guides/decision-models/) walks the full
+decision-model cycle end to end, including the retry a same-batch conflict requires.
+[Getting started](../getting-started/) gets a server running so you can append against it.
