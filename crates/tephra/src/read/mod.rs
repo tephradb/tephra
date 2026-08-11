@@ -64,7 +64,7 @@ use crate::index::IndexSet;
 
 mod subscribe;
 
-pub use subscribe::Subscription;
+pub use subscribe::{DEFAULT_MAX_BATCH_EVENTS, Subscription};
 
 /// Configuration for the read paths: the index-vs-scan cost model's tuning.
 #[derive(Clone, Copy, Debug)]
