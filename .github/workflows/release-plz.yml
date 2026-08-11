@@ -1,0 +1,67 @@
+name: release-plz
+
+# Automated releases (https://release-plz.dev). On every push to main:
+#   - release-plz-pr keeps a release PR up to date (version bumps + changelogs from the
+#     conventional commits since the last release).
+#   - release-plz-release publishes any crate whose Cargo.toml version is not yet on crates.io,
+#     pushes its git tag, and creates the GitHub release.
+#
+# RELEASE_PLZ_TOKEN is a fine-grained PAT: using it (instead of the default GITHUB_TOKEN) is
+# what lets the tags release-plz pushes trigger downstream workflows, so a tephra-server release
+# (tagged v{version}) fires the docker build.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Publish + tag + GitHub release for any crate whose version is unpublished.
+  release-plz-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # cargo publish verifies each crate by building it, and tephra-proto's build.rs runs protoc.
+      - name: Install protoc 35.1
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Keep the release PR (version bumps + changelogs) up to date.
+  release-plz-pr:
+    runs-on: ubuntu-latest
+    # One release PR at a time; do not cancel an in-progress update.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Install protoc 35.1
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
