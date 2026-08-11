@@ -8,6 +8,7 @@ keywords = ["database", "event-sourcing", "event-store", "storage"]
 license = "Apache-2.0"
 version = "0.3.0"
 rust-version = "1.95.0"
+repository.workspace = true
 
 [dependencies]
 crc32fast.workspace = true

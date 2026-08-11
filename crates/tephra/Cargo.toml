@@ -1,8 +1,11 @@
 [package]
 name = "tephra"
+description = "A DCB-compliant, immutable event store with global ordering."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
+license = "Apache-2.0"
+repository.workspace = true
 
 [dependencies]
 seglog.workspace = true

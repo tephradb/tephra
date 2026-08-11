@@ -10,14 +10,17 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+repository = "https://github.com/tqwewe/tephra"
+
 [workspace.dependencies]
 # Internal crates
-seglog = { path = "crates/seglog" }
-tephra = { path = "crates/tephra" }
-tephra-client = { path = "crates/tephra-client" }
-tephra-proto = { path = "crates/tephra-proto" }
-tephra-server = { path = "crates/tephra-server" }
-tephra-types = { path = "crates/tephra-types" }
+seglog = { path = "crates/seglog", version = "0.3.0" }
+tephra = { path = "crates/tephra", version = "0.1.0" }
+tephra-client = { path = "crates/tephra-client", version = "0.1.0" }
+tephra-proto = { path = "crates/tephra-proto", version = "0.1.0" }
+tephra-server = { path = "crates/tephra-server", version = "0.1.0" }
+tephra-types = { path = "crates/tephra-types", version = "0.1.0" }
 
 # Third-party
 argh = "0.1"
