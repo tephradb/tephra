@@ -10,7 +10,7 @@ pub use tephra_types::{
     TagsError,
 };
 pub use event::{Event, EventRef};
-pub use log::set::PositionRange;
+pub use log::set::{PositionRange, SegmentConfig, SegmentSet};
 pub use query::Matches;
 pub use read::{ReadConfig, ReadError, ReadHandle, Subscription, WaitOutcome};
 pub use writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};
