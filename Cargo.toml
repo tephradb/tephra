@@ -37,11 +37,6 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-# Only pulled in by the `umadb-compare` bench feature (the tephra-vs-umadb comparison).
-# Pinned to the exact rev the comparison was run against, so the numbers reproduce.
-umadb-core = { git = "https://github.com/umadb-io/umadb", rev = "cb4e9161c5617ded16aaf3db0c2f61bbfbf39701" }
-umadb-dcb = { git = "https://github.com/umadb-io/umadb", rev = "cb4e9161c5617ded16aaf3db0c2f61bbfbf39701" }
-
 # Dev
 criterion = "0.8"
 tempfile = "3"

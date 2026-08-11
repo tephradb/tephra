@@ -912,7 +912,6 @@ Bench files (all under `/home/ari/dev/tqwewe/dcbdb/crates/tephra/benches/`):
 - `read_path.rs`: measures the index-vs-scan crossover (both arms over the same store).
 - `condition_path.rs`: measures the append-condition check cost (index existence check
   vs linear log decode), no append, no fsync.
-- `compare.rs`: optional comparison against UmaDB (behind the `umadb-compare` feature).
 
 Also `/home/ari/dev/tqwewe/dcbdb/crates/seglog/benches/seglog_bench.rs`.
 
