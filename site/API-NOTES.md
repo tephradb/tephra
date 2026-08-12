@@ -679,6 +679,7 @@ pub struct ServerSettings {
     pub subscribe_wait_tick_ms: u64,
     pub max_inflight_requests_per_conn: usize,
     pub max_concurrent_subscriptions: usize,
+    pub read_worker_threads: usize,
     pub frame_queue_depth: usize,
     pub keepalive_idle_secs: u64,
     pub keepalive_interval_secs: u64,
@@ -692,6 +693,7 @@ impl Default for ServerSettings {
             subscribe_wait_tick_ms: 250,
             max_inflight_requests_per_conn: 256,
             max_concurrent_subscriptions: 64,
+            read_worker_threads: 0,                  // 0 = one worker per logical CPU
             frame_queue_depth: 256,
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
