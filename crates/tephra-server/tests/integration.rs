@@ -15,9 +15,9 @@ use tephra_client::{
     AppendCondition, AsyncClient, Client, ClientError, ErrorCode, Event, Position, Query,
     QueryItem, SequencedEvent, SubEvent, Tag, Tags,
 };
-use tokio_stream::StreamExt as _;
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame, tephra as pb, write_frame};
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
+use tokio_stream::StreamExt as _;
 
 /// A server running on its own thread over a temp-dir store, torn down on drop.
 struct TestServer {
@@ -136,7 +136,7 @@ fn append_then_read_round_trips_events() {
         .append([ev("Renamed", &["course:c1"], b"payload-2")], None)
         .unwrap();
 
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
     assert_eq!(watermark.get(), 2);
     assert_eq!(events.len(), 2);
 
@@ -161,7 +161,7 @@ fn tag_query_filters_the_read() {
     client.append([ev("C", &["course:c1"], b"")], None).unwrap();
 
     let (events, _) = client
-        .read_all(tag_query(&["course:c1"]), Position::ZERO)
+        .read_all(tag_query(&["course:c1"]), Position::ZERO, None)
         .unwrap();
     assert_eq!(positions(&events), vec![1, 3]);
 }
@@ -176,7 +176,9 @@ fn read_after_skips_the_prefix() {
             .unwrap();
     }
 
-    let (events, watermark) = client.read_all(Query::all(), Position::new(2)).unwrap();
+    let (events, watermark) = client
+        .read_all(Query::all(), Position::new(2), None)
+        .unwrap();
     assert_eq!(positions(&events), vec![3, 4, 5]);
     assert_eq!(watermark.get(), 5);
 }
@@ -188,9 +190,65 @@ fn empty_read_yields_only_a_watermark() {
     client.append([ev("E", &["k:1"], b"")], None).unwrap();
 
     // Nothing after the tip.
-    let (events, watermark) = client.read_all(Query::all(), Position::new(1)).unwrap();
+    let (events, watermark) = client
+        .read_all(Query::all(), Position::new(1), None)
+        .unwrap();
     assert!(events.is_empty());
     assert_eq!(watermark.get(), 1);
+}
+
+#[test]
+fn read_limit_caps_the_result_and_paginates() {
+    let ts = TestServer::start();
+    let mut client = ts.client();
+
+    // One selective entity with a known history, interleaved with noise the query must skip,
+    // so the limit and pagination exercise a real filter rather than a dense prefix.
+    let total = 25u64;
+    for i in 0..total {
+        client
+            .append(
+                [ev("Enrolled", &["student:s0"], format!("e{i}").as_bytes())],
+                None,
+            )
+            .unwrap();
+        client
+            .append([ev("Enrolled", &["student:s1"], b"noise")], None)
+            .unwrap();
+    }
+    let query = || tag_query(&["student:s0"]);
+
+    // A limit returns exactly its cap, the leading prefix of the full selective history.
+    let (all, _) = client.read_all(query(), Position::ZERO, None).unwrap();
+    assert_eq!(all.len() as u64, total);
+    let (page, _) = client.read_all(query(), Position::ZERO, Some(10)).unwrap();
+    assert_eq!(positions(&page), positions(&all)[..10].to_vec());
+
+    // A cap above the history returns all of it, no more.
+    let (over, _) = client
+        .read_all(query(), Position::ZERO, Some(total + 100))
+        .unwrap();
+    assert_eq!(positions(&over), positions(&all));
+
+    // Paginate the whole selective history with `after` + `limit`: the concatenation equals
+    // the unlimited read exactly, with no gap and no duplicate at any seam.
+    let page_size = 7;
+    let mut after = Position::ZERO;
+    let mut tiled: Vec<u64> = Vec::new();
+    loop {
+        let (chunk, _) = client.read_all(query(), after, Some(page_size)).unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        after = chunk.last().unwrap().position();
+        tiled.extend(positions(&chunk));
+    }
+    assert_eq!(tiled, positions(&all));
+
+    // A zero limit yields nothing but still terminates cleanly with the pinned watermark.
+    let (none, watermark) = client.read_all(query(), Position::ZERO, Some(0)).unwrap();
+    assert!(none.is_empty());
+    assert_eq!(watermark.get(), 2 * total);
 }
 
 #[test]
@@ -288,7 +346,7 @@ fn large_streamed_read_returns_every_event_in_order() {
             .unwrap();
     }
 
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
     assert_eq!(watermark.get(), total);
     let expected: Vec<u64> = (1..=total).collect();
     assert_eq!(positions(&events), expected);
@@ -304,7 +362,7 @@ fn streaming_read_iterator_yields_incrementally() {
             .unwrap();
     }
 
-    let mut stream = client.read(Query::all(), Position::ZERO).unwrap();
+    let mut stream = client.read(Query::all(), Position::ZERO, None).unwrap();
     let mut count = 0;
     for item in stream.by_ref() {
         item.unwrap();
@@ -333,14 +391,14 @@ fn dropping_a_read_early_keeps_the_connection_usable() {
     }
 
     {
-        let mut stream = client.read(Query::all(), Position::ZERO).unwrap();
+        let mut stream = client.read(Query::all(), Position::ZERO, None).unwrap();
         let first = stream.next().unwrap().unwrap();
         assert_eq!(first.position().get(), 1);
         // `stream` is dropped here, mid-read, with 19 events plus the terminator unread.
     }
 
     // The next read on the same connection returns complete, correct results.
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
     assert_eq!(watermark.get(), 20);
     assert_eq!(positions(&events), (1..=20).collect::<Vec<_>>());
 }
@@ -391,7 +449,7 @@ fn concurrent_clients_stay_consistent() {
     }
 
     let mut client = ts.client();
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).unwrap();
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
     let total = threads * per_thread;
     assert_eq!(watermark.get(), total);
     assert_eq!(events.len() as u64, total);
@@ -725,7 +783,12 @@ fn pipelined_appends_all_succeed_with_dense_positions() {
 
     let n = 8u64;
     for id in 1..=n {
-        write_frame(&mut writer, &append_frame(id, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+        write_frame(
+            &mut writer,
+            &append_frame(id, "E", "k:1"),
+            DEFAULT_MAX_FRAME_LEN,
+        )
+        .unwrap();
     }
     writer.flush().unwrap();
 
@@ -762,7 +825,12 @@ fn a_subscription_does_not_block_a_concurrent_append() {
     let mut reader = BufReader::new(stream);
 
     // Open the subscription (id 1) over the empty store; it reaches the live edge immediately.
-    write_frame(&mut writer, &subscribe_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(
+        &mut writer,
+        &subscribe_all_frame(1, 0),
+        DEFAULT_MAX_FRAME_LEN,
+    )
+    .unwrap();
     writer.flush().unwrap();
     let first = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
         .unwrap()
@@ -771,7 +839,12 @@ fn a_subscription_does_not_block_a_concurrent_append() {
     assert!(matches!(first.kind(), pb::response::KindOneof::CaughtUp(_)));
 
     // With the subscription still live, append on the same connection (id 2).
-    write_frame(&mut writer, &append_frame(2, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(
+        &mut writer,
+        &append_frame(2, "E", "k:1"),
+        DEFAULT_MAX_FRAME_LEN,
+    )
+    .unwrap();
     writer.flush().unwrap();
 
     // We must see both the append's own response (id 2) and the subscription (id 1) delivering
@@ -800,7 +873,10 @@ fn a_subscription_does_not_block_a_concurrent_append() {
         }
     }
     assert!(saw_append, "the append was answered while subscribed");
-    assert!(saw_sub_event, "the subscription delivered the appended event");
+    assert!(
+        saw_sub_event,
+        "the subscription delivered the appended event"
+    );
 }
 
 #[test]
@@ -813,12 +889,20 @@ fn cancel_stops_a_subscription_and_frees_the_connection() {
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     let mut reader = BufReader::new(stream);
 
-    write_frame(&mut writer, &subscribe_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(
+        &mut writer,
+        &subscribe_all_frame(1, 0),
+        DEFAULT_MAX_FRAME_LEN,
+    )
+    .unwrap();
     writer.flush().unwrap();
     let caught = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
         .unwrap()
         .expect("subscription responds");
-    assert!(matches!(caught.kind(), pb::response::KindOneof::CaughtUp(_)));
+    assert!(matches!(
+        caught.kind(),
+        pb::response::KindOneof::CaughtUp(_)
+    ));
 
     // Cancel the subscription (id 1).
     let mut cancel = pb::CancelRequest::new();
@@ -830,7 +914,12 @@ fn cancel_stops_a_subscription_and_frees_the_connection() {
     writer.flush().unwrap();
 
     // The connection is still usable: an append is answered normally.
-    write_frame(&mut writer, &append_frame(2, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(
+        &mut writer,
+        &append_frame(2, "E", "k:1"),
+        DEFAULT_MAX_FRAME_LEN,
+    )
+    .unwrap();
     writer.flush().unwrap();
 
     // The next append response (id 2) arrives; the cancelled subscription may deliver the event
@@ -846,7 +935,10 @@ fn cancel_stops_a_subscription_and_frees_the_connection() {
             break;
         }
     }
-    assert!(saw_append, "append answered after the subscription was cancelled");
+    assert!(
+        saw_append,
+        "append answered after the subscription was cancelled"
+    );
 }
 
 // --- async client: multiplexing over one connection ---
@@ -865,11 +957,40 @@ async fn async_client_appends_and_reads_round_trip() {
         .await
         .unwrap();
 
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).await.unwrap();
+    let (events, watermark) = client
+        .read_all(Query::all(), Position::ZERO, None)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].position(), Position::new(1));
     assert_eq!(events[1].position(), Position::new(2));
     assert_eq!(watermark, Position::new(2));
+}
+
+#[tokio::test]
+async fn async_read_limit_caps_the_result_and_paginates() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+    for i in 0..12u64 {
+        client
+            .append(
+                [ev("Enrolled", &["student:s0"], format!("e{i}").as_bytes())],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let query = || tag_query(&["student:s0"]);
+
+    // Exact cap, and a page that resumes after the last position tiles the rest with no gap.
+    let (page, _) = client
+        .read_all(query(), Position::ZERO, Some(5))
+        .await
+        .unwrap();
+    assert_eq!(positions(&page), vec![1, 2, 3, 4, 5]);
+    let after = page.last().unwrap().position();
+    let (rest, _) = client.read_all(query(), after, Some(100)).await.unwrap();
+    assert_eq!(positions(&rest), (6..=12).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -971,7 +1092,12 @@ fn subscription_budget_rejects_excess_subscriptions() {
     // Two subscriptions fit (each acquires a permit in the reader before spawning), so by the
     // time the third is read both permits are held and it is rejected deterministically.
     for id in 1..=3u64 {
-        write_frame(&mut writer, &subscribe_all_frame(id, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+        write_frame(
+            &mut writer,
+            &subscribe_all_frame(id, 0),
+            DEFAULT_MAX_FRAME_LEN,
+        )
+        .unwrap();
     }
     writer.flush().unwrap();
 
@@ -984,7 +1110,11 @@ fn subscription_budget_rejects_excess_subscriptions() {
         match resp.kind() {
             pb::response::KindOneof::CaughtUp(_) => caught_up += 1,
             pb::response::KindOneof::Error(_) => {
-                assert_eq!(resp.request_id(), 3, "the third subscription is the one rejected");
+                assert_eq!(
+                    resp.request_id(),
+                    3,
+                    "the third subscription is the one rejected"
+                );
                 rejected += 1;
             }
             other => panic!("unexpected frame: {other:?}"),

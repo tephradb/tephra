@@ -240,7 +240,7 @@ pub fn append(
     condition: Option<AppendCondition>,
 ) -> Result<PositionRange, AppendError>                   // line 39-43
 
-pub fn read(&self, query: Query, after: Position) -> Reads             // line 67
+pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> Reads             // line 67
 pub fn subscribe(&self, query: Query, after: Position) -> Subscription // line 76
 pub fn reader(&self) -> ReadHandle                                     // line 82
 
@@ -261,7 +261,7 @@ File: `/home/ari/dev/tqwewe/dcbdb/crates/tephra/src/read/mod.rs`
 #[derive(Clone)]
 pub struct ReadHandle { /* private */ }                   // line 341-345
 
-pub fn read(&self, query: Query, after: Position) -> Reads              // line 355
+pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> Reads              // line 355
 pub fn subscribe(&self, query: Query, after: Position) -> Subscription  // line 363
 ```
 
@@ -464,11 +464,12 @@ pub fn append(
     events: impl IntoIterator<Item = Event>,
     condition: Option<AppendCondition>,
 ) -> Result<AppendResult, ClientError>                                      // line 280-284
-pub fn read(&mut self, query: Query, after: Position) -> Result<ReadStream<'_>, ClientError>   // line 314
+pub fn read(&mut self, query: Query, after: Position, limit: Option<u64>) -> Result<ReadStream<'_>, ClientError>   // line 314
 pub fn read_all(
     &mut self,
     query: Query,
     after: Position,
+    limit: Option<u64>,
 ) -> Result<(Vec<SequencedEvent>, Position), ClientError>                   // line 336-340
 pub fn subscribe(
     &mut self,

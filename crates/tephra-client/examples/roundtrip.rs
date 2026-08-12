@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(err) => println!("second reservation rejected: {err}"),
     }
 
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO)?;
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None)?;
     println!("log holds {} events (watermark {watermark}):", events.len());
     for sequenced in &events {
         let ev = sequenced.event();

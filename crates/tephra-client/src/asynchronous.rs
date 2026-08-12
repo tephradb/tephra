@@ -17,7 +17,7 @@
 //!     .append([Event::new("Enrolled", &["course:c1"], b"{}")?], None)
 //!     .await?;
 //!
-//! let mut stream = client.read(Query::all(), Position::ZERO).await;
+//! let mut stream = client.read(Query::all(), Position::ZERO, None).await;
 //! while let Some(sequenced) = stream.next().await {
 //!     let sequenced = sequenced?;
 //!     println!("{}: {}", sequenced.position(), sequenced.event().event_type());
@@ -177,11 +177,18 @@ impl AsyncClient {
     /// order. Awaits room in the outbound queue (backpressure) before returning.
     /// [`watermark`](ReadStream::watermark) is available once the stream ends; dropping the stream
     /// early cancels the read server-side.
-    pub async fn read(&self, query: Query, after: Position) -> ReadStream {
+    ///
+    /// `limit` caps the number of matched events returned (`None` = unlimited), applied
+    /// server-side during planning. With `after` it forms a stateless pagination cursor: read
+    /// a page, then read again with `after` set to the last position, with no gap or duplicate.
+    pub async fn read(&self, query: Query, after: Position, limit: Option<u64>) -> ReadStream {
         let id = self.shared.next_id();
         let mut read = pb::ReadRequest::new();
         read.set_query(wire::query_to_pb(&query));
         read.set_after(after.get());
+        if let Some(limit) = limit {
+            read.set_limit(limit);
+        }
         let mut request = pb::Request::new();
         request.set_request_id(id);
         request.set_read(read);
@@ -209,12 +216,14 @@ impl AsyncClient {
     }
 
     /// Convenience: drains a read fully, returning the events and the watermark it was pinned to.
+    /// See [`read`](Self::read) for `limit` semantics.
     pub async fn read_all(
         &self,
         query: Query,
         after: Position,
+        limit: Option<u64>,
     ) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
-        let mut stream = self.read(query, after).await;
+        let mut stream = self.read(query, after, limit).await;
         let mut events = Vec::new();
         while let Some(item) = stream.next().await {
             events.push(item?);
@@ -306,8 +315,13 @@ async fn reader_task(mut read_half: OwnedReadHalf, shared: Arc<Shared>) {
                 // close. Remember its message so pending requests learn why.
                 if response.request_id() == UNATTRIBUTED_REQUEST_ID {
                     if let pb::response::KindOneof::Error(error) = response.kind() {
-                        last_error =
-                            Some(error.message().to_str().unwrap_or("server error").to_string());
+                        last_error = Some(
+                            error
+                                .message()
+                                .to_str()
+                                .unwrap_or("server error")
+                                .to_string(),
+                        );
                     }
                     continue;
                 }

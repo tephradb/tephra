@@ -19,7 +19,7 @@ fn decide(addr: &str) -> Result<(), Box<dyn Error>> {
     let query = Query::items([course, student]);
 
     // Read once, fold both projections over the same pass.
-    let (events, watermark) = client.read_all(query.clone(), Position::ZERO)?;
+    let (events, watermark) = client.read_all(query.clone(), Position::ZERO, None)?;
     let mut seats_used = 0usize;
     let mut student_enrolments = 0usize;
     for seq in &events {

@@ -95,35 +95,44 @@ impl Subscription {
             return Ok(Vec::new());
         }
 
-        // No `limit` is passed to the read: `None` from `reads.next()` therefore means the
-        // pinned `(cursor, watermark]` range is genuinely drained, never an early stop. If
-        // `Reads` ever gains an early-termination mode, gate the watermark advance below on an
-        // explicit `Reads::is_exhausted()` instead of on observing `None`.
+        // `Reads` now has a result-limit early-termination mode, but this read passes
+        // `limit = None`, so it never caps: the subscription's own `max_batch_events` is the
+        // only bound, and `None` from `reads.next()` means the pinned `(cursor, watermark]`
+        // range is genuinely drained. The `is_exhausted()` gate on the `None` branch makes
+        // that explicit and stays correct even if a limit is ever threaded in here.
         //
         // `plan` borrows the query, so a poll that lands on the index or full-scan path (the
         // common cases, including every idle tick) allocates nothing; only a broad *filtered*
         // plan clones it, and only once for the resulting scan.
-        let mut reads = Reads::plan(snapshot, &self.query, self.cursor, watermark, &self.config);
+        let mut reads = Reads::plan(
+            snapshot,
+            &self.query,
+            self.cursor,
+            watermark,
+            &self.config,
+            None,
+        );
         let mut out = Vec::new();
-        loop {
-            match reads.next() {
-                Some(item) => {
-                    let seq = item?;
-                    out.push((seq.position, seq.event.to_owned()));
-                    if out.len() >= self.max_batch_events {
-                        // Cap hit: more may remain in the pinned range. Advance only to the
-                        // last delivered position.
-                        self.cursor = out.last().unwrap().0;
-                        return Ok(out);
-                    }
-                }
-                None => {
-                    // Genuine exhaustion of the pinned range.
-                    self.cursor = watermark;
-                    return Ok(out);
-                }
+        while let Some(item) = reads.next() {
+            let seq = item?;
+            out.push((seq.position, seq.event.to_owned()));
+            if out.len() >= self.max_batch_events {
+                // Cap hit: more may remain in the pinned range. Advance only to the last
+                // delivered position.
+                self.cursor = out.last().unwrap().0;
+                return Ok(out);
             }
         }
+        // The read yielded `None`. On genuine exhaustion (the only case here, since `limit` is
+        // `None`) jump the cursor past any non-matching tail to the pinned watermark. The
+        // `is_exhausted` gate keeps this correct even if a limit is ever threaded in: a limit
+        // stop advances only to the last delivered position so nothing in the range is skipped.
+        if reads.is_exhausted() {
+            self.cursor = watermark;
+        } else if let Some((position, _)) = out.last() {
+            self.cursor = *position;
+        }
+        Ok(out)
     }
 
     /// Blocks until the watermark advances past the cursor, returning `true`, or the store

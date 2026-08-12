@@ -71,13 +71,24 @@ other one.
 
 ## Read
 
-`read` and `read_all` take a query and an `after` position. `Position::ZERO` means "from the
-start of the log". Results come back in ascending position order.
+`read` and `read_all` take a query, an `after` position, and a `limit`. `Position::ZERO` means
+"from the start of the log", and a `limit` of `None` reads the whole matching history. Results
+come back in ascending position order.
 
 <Code code={anchor(gsRaw, 'read')} lang="rust" />
 
 Because the writer publishes each commit before the append reply returns, a client sees its own
 writes immediately: the read above returns the event the append above just recorded.
+
+## Paginate
+
+Pass `Some(n)` as the `limit` to cap how many events a read returns. The cap is applied on the
+server during planning, so reading the first ten events of an entity does the work of ten, not
+of its whole history. Pair `limit` with `after` to page through a large result: each page
+resumes at the last position seen, with no gap and no duplicate at the seam. A page shorter than
+the limit is the last one.
+
+<Code code={anchor(gsRaw, 'paginate')} lang="rust" />
 
 ## Subscribe
 

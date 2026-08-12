@@ -36,7 +36,7 @@ fn reserve_seat(
             QueryItem::with_tags(Tags::new([Tag::new(&course_tag)?])?),
             QueryItem::with_tags(Tags::new([Tag::new(&student_tag)?])?),
         ]);
-        let (events, watermark) = client.read_all(query.clone(), Position::ZERO)?;
+        let (events, watermark) = client.read_all(query.clone(), Position::ZERO, None)?;
 
         let seats_used = events
             .iter()

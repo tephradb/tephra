@@ -19,7 +19,10 @@ and tags; the union of those filters is the query. Here the decision needs two c
 on a course and enrolments held by a student, so the query is two items OR'd together.
 
 Read once, at a position you remember. `read_all` returns the matching events and the watermark it
-read up to. Fold every projection over that single pass.
+read up to. Fold every projection over that single pass. A decision read passes no `limit`: it
+folds the whole matching set, so it is complete. (The `limit` parameter is for paging through a
+large result when browsing or streaming, not for a decision read. See
+[Getting started](../../getting-started/#paginate).)
 
 Decide from the folded state. If the decision is "no", there is no write, and nothing was locked,
 so nothing needs releasing.

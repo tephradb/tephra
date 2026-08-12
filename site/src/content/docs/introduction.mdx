@@ -70,7 +70,8 @@ do not, with no coordinator deciding that in advance.
 
 A minimally compliant store offers two operations, and Tephra is built around them:
 
-`read(query, after)` returns the matching events in ascending position order.
+`read(query, after, limit)` returns the matching events in ascending position order, capped at
+`limit` (or the whole matching history when it is unset).
 
 `append(events, condition)` records events atomically and fails if any event matches the
 condition's query after its `after` bound. Omit `after` (leave it at `Position::ZERO`) and the

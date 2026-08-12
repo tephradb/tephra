@@ -37,6 +37,11 @@ message AppendRequest {
 message ReadRequest {
   Query query = 1;
   uint64 after = 2;
+  // Caps the number of matched events returned. Absent means unlimited (an old client, which
+  // never sets it, keeps the full-history behavior); explicit presence distinguishes a real
+  // cap of 0 (return nothing) from "no cap". Composes with `after` as a stateless pagination
+  // cursor: read a page, then read again with `after` set to the last position.
+  optional uint64 limit = 3;
 }
 
 // Opens a live subscription: catch up on all events matching `query` after `after`, then

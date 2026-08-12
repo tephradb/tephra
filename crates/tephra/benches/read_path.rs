@@ -164,7 +164,7 @@ fn query_for(denom: u64) -> Query {
 
 /// Runs one read to exhaustion and returns how many events it yielded.
 fn run_read(handle: &WriteHandle, query: Query, after: Position) -> u64 {
-    let mut reads = handle.read(query, after);
+    let mut reads = handle.read(query, after, None);
     let mut count = 0u64;
     while let Some(item) = reads.next() {
         item.expect("read");

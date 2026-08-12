@@ -183,11 +183,11 @@ impl ConnCtx {
 fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply>) {
     let request_id = request.request_id();
     match request.kind() {
-        pb::request::KindOneof::Append(append) => {
-            handle_append(request_id, append, conn, reply_tx)
-        }
+        pb::request::KindOneof::Append(append) => handle_append(request_id, append, conn, reply_tx),
         pb::request::KindOneof::Read(read) => spawn_read(request_id, read, conn),
-        pb::request::KindOneof::Subscribe(subscribe) => spawn_subscribe(request_id, subscribe, conn),
+        pb::request::KindOneof::Subscribe(subscribe) => {
+            spawn_subscribe(request_id, subscribe, conn)
+        }
         pb::request::KindOneof::Cancel(cancel) => {
             if let Some(flag) = conn.cancels.lock().unwrap().get(&cancel.target()) {
                 flag.store(true, Ordering::Release);
@@ -255,11 +255,7 @@ fn handle_append(
 
 /// Validates the query, then spawns a worker to stream the read. Acquiring an in-flight permit
 /// here (shared with appends) caps read worker threads and applies backpressure to the reader.
-fn spawn_read(
-    request_id: u64,
-    read: pb::ReadRequestView<'_>,
-    conn: &ConnCtx,
-) {
+fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
     let query = match convert::query_from_proto(read.query()) {
         Ok(query) => query,
         Err(err) => {
@@ -271,6 +267,8 @@ fn spawn_read(
         }
     };
     let after = Position::new(read.after());
+    // Explicit presence: absent means unlimited, present (even 0) is a real cap.
+    let limit = read.limit_opt();
 
     let cancel = register_cancel(conn, request_id);
     conn.inflight.acquire();
@@ -286,7 +284,7 @@ fn spawn_read(
         .name("tephra-conn-read".to_string())
         .spawn(move || {
             let _cleanup = cleanup;
-            run_read(request_id, query, after, &conn_owned, &cancel);
+            run_read(request_id, query, after, limit, &conn_owned, &cancel);
         })
     {
         tracing::warn!(%err, "failed to spawn read worker");
@@ -342,7 +340,9 @@ fn spawn_subscribe(request_id: u64, subscribe: pb::SubscribeRequestView<'_>, con
         tracing::warn!(%err, "failed to spawn subscribe worker");
         let _ = conn.out_tx.send(make_response(
             request_id,
-            ResponseKind::Error(convert::bad_request("server could not start the subscription")),
+            ResponseKind::Error(convert::bad_request(
+                "server could not start the subscription",
+            )),
         ));
     }
 }
@@ -360,8 +360,15 @@ fn register_cancel(conn: &ConnCtx, request_id: u64) -> Arc<AtomicBool> {
 /// Streams one read: `ReadEvents` batches then a terminating `ReadEnd`, framed on the same
 /// event-count / byte thresholds a subscription uses. Stops quietly if cancelled or the
 /// connection dies mid-stream. A log-integrity failure terminates with a single error frame.
-fn run_read(request_id: u64, query: Query, after: Position, conn: &ConnCtx, cancel: &AtomicBool) {
-    let mut reads = conn.handle.read(query, after);
+fn run_read(
+    request_id: u64,
+    query: Query,
+    after: Position,
+    limit: Option<u64>,
+    conn: &ConnCtx,
+    cancel: &AtomicBool,
+) {
+    let mut reads = conn.handle.read(query, after, limit);
     let watermark = reads.watermark();
 
     let mut batch = pb::ReadEvents::new();
@@ -541,7 +548,11 @@ fn writer_loop(
 /// The append completion pump: turns each durable reply into a response frame and releases the
 /// append's in-flight permit. Exits when the reply channel closes (all appends done and the
 /// reader gone) or the writer has gone away.
-fn pump_loop(reply_rx: Receiver<AppendReply>, out_tx: Sender<pb::Response>, inflight: Arc<Semaphore>) {
+fn pump_loop(
+    reply_rx: Receiver<AppendReply>,
+    out_tx: Sender<pb::Response>,
+    inflight: Arc<Semaphore>,
+) {
     while let Ok((request_id, result)) = reply_rx.recv() {
         let response = match result {
             Ok(range) => {

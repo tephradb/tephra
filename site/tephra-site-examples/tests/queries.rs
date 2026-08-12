@@ -6,7 +6,7 @@ use tephra_client::{Client, Event, EventType, Position, Query, QueryItem, Tag, T
 use tephra_site_examples::TestServer;
 
 fn count(client: &mut Client, query: Query) -> Result<usize, Box<dyn Error>> {
-    let (events, _watermark) = client.read_all(query, Position::ZERO)?;
+    let (events, _watermark) = client.read_all(query, Position::ZERO, None)?;
     Ok(events.len())
 }
 

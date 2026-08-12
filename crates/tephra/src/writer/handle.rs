@@ -92,12 +92,12 @@ impl WriteHandle {
     }
 
     /// Reads events matching `query`, ascending, strictly after `after`, up to the
-    /// watermark pinned now. Runs on the **caller's own thread** over the published read
-    /// snapshot: it never touches the writer thread, and read-your-writes still holds (the
-    /// writer publishes the watermark before replying to an append). See
-    /// [`ReadHandle::read`] and [`Reads`].
-    pub fn read(&self, query: Query, after: Position) -> Reads {
-        self.reader.read(query, after)
+    /// watermark pinned now, yielding at most `limit` matched events (`None` = unlimited).
+    /// Runs on the **caller's own thread** over the published read snapshot: it never touches
+    /// the writer thread, and read-your-writes still holds (the writer publishes the watermark
+    /// before replying to an append). See [`ReadHandle::read`] and [`Reads`].
+    pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> Reads {
+        self.reader.read(query, after, limit)
     }
 
     /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up

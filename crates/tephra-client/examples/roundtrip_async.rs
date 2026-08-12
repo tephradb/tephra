@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("appended at position {}", range.first);
     }
 
-    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).await?;
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None).await?;
     println!("log holds {} events (watermark {watermark}):", events.len());
     for sequenced in &events {
         let ev = sequenced.event();
@@ -48,7 +48,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while let Some(item) = sub.next().await {
         match item? {
             SubEvent::Event(sequenced) => {
-                println!("  live {} {}", sequenced.position(), sequenced.event().event_type());
+                println!(
+                    "  live {} {}",
+                    sequenced.position(),
+                    sequenced.event().event_type()
+                );
             }
             SubEvent::CaughtUp(watermark) => {
                 println!("  caught up at {watermark}");

@@ -16,7 +16,7 @@
 //!     let mut client = Client::connect("127.0.0.1:9000")?;
 //!     client.append([Event::new("Enrolled", &["course:c1"], b"{}")?], None)?;
 //!
-//!     let (events, _watermark) = client.read_all(Query::all(), Position::ZERO)?;
+//!     let (events, _watermark) = client.read_all(Query::all(), Position::ZERO, None)?;
 //!     for sequenced in events {
 //!         println!("{}: {}", sequenced.position(), sequenced.event().event_type());
 //!     }
@@ -320,11 +320,25 @@ impl Client {
 
     /// Starts a read, returning a streaming iterator over the matching events in ascending
     /// position order. The stream borrows the client until it is dropped.
-    pub fn read(&mut self, query: Query, after: Position) -> Result<ReadStream<'_>, ClientError> {
+    ///
+    /// `limit` caps the number of matched events returned (`None` = unlimited). The cap is
+    /// applied server-side during planning, so a selective read does work proportional to
+    /// `limit` rather than to the query's full result. Combined with `after` (an exclusive
+    /// lower bound) it forms a stateless pagination cursor: read a page, then read again with
+    /// `after` set to the last position, with no gap and no duplicate at the seam.
+    pub fn read(
+        &mut self,
+        query: Query,
+        after: Position,
+        limit: Option<u64>,
+    ) -> Result<ReadStream<'_>, ClientError> {
         let id = self.next_id();
         let mut read = pb::ReadRequest::new();
         read.set_query(wire::query_to_pb(&query));
         read.set_after(after.get());
+        if let Some(limit) = limit {
+            read.set_limit(limit);
+        }
         let mut request = pb::Request::new();
         request.set_request_id(id);
         request.set_read(read);
@@ -341,13 +355,14 @@ impl Client {
     }
 
     /// Convenience: drains a read fully into a vector, returning the events and the watermark
-    /// the read was pinned to.
+    /// the read was pinned to. See [`read`](Self::read) for `limit` semantics.
     pub fn read_all(
         &mut self,
         query: Query,
         after: Position,
+        limit: Option<u64>,
     ) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
-        let mut stream = self.read(query, after)?;
+        let mut stream = self.read(query, after, limit)?;
         let mut events = Vec::new();
         for item in stream.by_ref() {
             events.push(item?);

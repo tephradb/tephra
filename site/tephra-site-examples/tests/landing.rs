@@ -27,7 +27,7 @@ fn hero(addr: &str) -> Result<(), Box<dyn Error>> {
 
     // Read every event tagged course:c1, ascending, from the start of the log.
     let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
-    let (events, _watermark) = client.read_all(query, Position::ZERO)?;
+    let (events, _watermark) = client.read_all(query, Position::ZERO, None)?;
     for seq in &events {
         println!("{} {}", seq.position(), seq.event().event_type());
     }

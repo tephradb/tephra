@@ -352,9 +352,15 @@ impl ReadHandle {
     /// Reads events matching `query`, ascending, strictly after `after`, up to the
     /// watermark pinned now. The result is a lending iterator (it borrows its own decode
     /// buffer per item), so consume it with `while let Some(item) = reads.next()`.
-    pub fn read(&self, query: Query, after: Position) -> Reads {
+    ///
+    /// `limit` caps the number of matched events yielded (`None` = unlimited). It is pushed
+    /// into planning, so a selective read does work proportional to `limit`, not to the
+    /// query's full result. Together with `after` (an exclusive lower bound) it forms a
+    /// stateless pagination cursor: read a page, then read again with `after` set to the last
+    /// position, with no gap and no duplicate at the seam.
+    pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> Reads {
         let (watermark, snapshot) = self.core.load();
-        Reads::plan(snapshot, &query, after, watermark, &self.config)
+        Reads::plan(snapshot, &query, after, watermark, &self.config, limit)
     }
 
     /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up
@@ -395,6 +401,17 @@ pub enum ReadError {
 pub struct Reads {
     watermark: Position,
     pending_err: Option<ReadError>,
+    /// Remaining result budget, `None` when unlimited. Decremented once per attempted yield;
+    /// when it reaches zero the read stops with a *limit* stop (see [`is_exhausted`]). The
+    /// indexed path also truncates its planned positions to the budget up front, so this is a
+    /// second line of defense there and the sole enforcement for the streaming scan modes.
+    ///
+    /// [`is_exhausted`]: Reads::is_exhausted
+    remaining: Option<u64>,
+    /// Set only when the read stopped because it hit its `remaining` cap, so a caller can
+    /// distinguish a capped stop from a genuinely drained range. Never set on an unlimited
+    /// read, so `None` from [`next`](Reads::next) there always means exhaustion.
+    hit_limit: bool,
     mode: Mode,
 }
 
@@ -451,6 +468,15 @@ impl Reads {
         self.watermark
     }
 
+    /// Whether the read stopped because its `(after, watermark]` range drained, as opposed to
+    /// hitting its result `limit`. Meaningful once [`next`](Self::next) has returned `None`.
+    /// An unlimited read is always exhausted at its `None`; a limited read is exhausted only
+    /// when it yielded fewer events than the cap. A [`Subscription`] relies on this to advance
+    /// its cursor past a drained tail but never past a merely capped one.
+    pub fn is_exhausted(&self) -> bool {
+        !self.hit_limit
+    }
+
     /// Plans the read. Estimates the result size from exact posting lengths and
     /// picks the cheaper mode: a broad query streams a filtered log scan
     /// ([`Access::Scan`]), a selective one gathers positions from the index and fetches
@@ -462,11 +488,15 @@ impl Reads {
         after: Position,
         watermark: Position,
         config: &ReadConfig,
+        limit: Option<u64>,
     ) -> Reads {
-        if after >= watermark {
+        // Nothing to read: an empty range, or an explicit zero cap.
+        if after >= watermark || limit == Some(0) {
             return Reads {
                 watermark,
                 pending_err: None,
+                remaining: limit,
+                hit_limit: false,
                 mode: Mode::Done,
             };
         }
@@ -508,14 +538,20 @@ impl Reads {
                 Reads {
                     watermark,
                     pending_err: None,
+                    remaining: limit,
+                    hit_limit: false,
                     mode,
                 }
             }
-            // Selective: plan the ascending positions from the index, fetch on demand.
-            Access::Index => match plan_positions(&snapshot, query, after, watermark) {
+            // Selective: plan the ascending positions from the index, fetch on demand. The
+            // position list is truncated to `limit` here, so the fetch loop and the list's
+            // memory are both bounded by the cap, not by the query's full result.
+            Access::Index => match plan_positions(&snapshot, query, after, watermark, limit) {
                 Ok(positions) => Reads {
                     watermark,
                     pending_err: None,
+                    remaining: limit,
+                    hit_limit: false,
                     mode: Mode::Indexed(Box::new(IndexedState {
                         snapshot,
                         positions: positions.into_iter(),
@@ -526,6 +562,8 @@ impl Reads {
                 Err(err) => Reads {
                     watermark,
                     pending_err: Some(err),
+                    remaining: limit,
+                    hit_limit: false,
                     mode: Mode::Done,
                 },
             },
@@ -539,6 +577,19 @@ impl Reads {
         if let Some(err) = self.pending_err.take() {
             self.mode = Mode::Done;
             return Some(Err(err));
+        }
+        // Enforce the result cap before touching the source: one budget unit per attempted
+        // yield (each `next` yields at most one matched event, looping past non-matches
+        // internally, so this counts matched events). When the budget is spent, stop with a
+        // limit stop recorded for `is_exhausted` rather than draining the source further.
+        match &mut self.remaining {
+            Some(0) => {
+                self.hit_limit = true;
+                self.mode = Mode::Done;
+                return None;
+            }
+            Some(n) => *n -= 1,
+            None => {}
         }
         match &mut self.mode {
             Mode::Done => None,
@@ -730,9 +781,14 @@ fn plan_positions(
     query: &Query,
     after: Position,
     watermark: Position,
+    limit: Option<u64>,
 ) -> Result<Vec<Position>, ReadError> {
     let mut out = Vec::new();
     let wm = watermark.get();
+    // The cap as an absolute target length. Each arm collects at most up to it, and the loop
+    // stops touching further segments once it is reached, so a limited read plans O(limit)
+    // positions rather than the query's full result.
+    let cap = limit.map(|k| k as usize);
 
     for (seg, index) in snapshot.sealed_log.iter().zip(snapshot.sealed_index.iter()) {
         let base = seg.base_position();
@@ -749,9 +805,14 @@ fn plan_positions(
             continue; // nothing in `(after, watermark]` here
         }
         match index {
-            // Indexed: take the ascending postings up to the watermark.
+            // Indexed: take the ascending postings up to the watermark, no more than the cap
+            // still allows.
             Some(index_seg) => {
-                out.extend(search(index_seg.as_ref(), query, after).take_while(|p| p.get() <= wm))
+                let iter = search(index_seg.as_ref(), query, after).take_while(|p| p.get() <= wm);
+                match cap {
+                    Some(k) => out.extend(iter.take(k - out.len())),
+                    None => out.extend(iter),
+                }
             }
             // Unindexable sealed segment: scan its own (watermark-clamped) range rather
             // than answer short.
@@ -761,7 +822,16 @@ fn plan_positions(
                 first_after(after, base),
                 Position::new(effective_max),
                 &mut out,
+                cap,
             )?,
+        }
+        // Segments are disjoint and ascending, so once the cap is met the prefix gathered so
+        // far is the globally-ascending answer: stop before opening any further segment.
+        if let Some(k) = cap
+            && out.len() >= k
+        {
+            out.truncate(k);
+            return Ok(out);
         }
     }
 
@@ -785,13 +855,23 @@ fn plan_positions(
                 first_after(after, active_base),
                 watermark,
                 &mut out,
+                cap,
             )?;
         } else {
             let view = snapshot.active_index.view(watermark);
-            out.extend(search(&view, query, after));
+            let iter = search(&view, query, after);
+            match cap {
+                Some(k) => out.extend(iter.take(k.saturating_sub(out.len()))),
+                None => out.extend(iter),
+            }
         }
     }
 
+    // The arms above already respect the cap, so this only guards the empty-range edge; keep
+    // it so the postcondition (`out.len() <= limit`) is obvious at the return.
+    if let Some(k) = cap {
+        out.truncate(k);
+    }
     Ok(out)
 }
 
@@ -802,20 +882,33 @@ fn first_after(after: Position, base: Position) -> Position {
     Position::new(after.get().max(base.get().saturating_sub(1)) + 1)
 }
 
-/// Scans `first..=upto` and appends the positions of matching events (ascending) to `out`.
+/// Scans `first..=upto` and appends the positions of matching events (ascending) to `out`,
+/// stopping once `out` reaches `cap` total positions (`None` = no cap). `cap` is an absolute
+/// target length, since `out` may already hold positions from earlier segments.
 fn scan_positions_into(
     snapshot: &Arc<Snapshot>,
     query: &Query,
     first: Position,
     upto: Position,
     out: &mut Vec<Position>,
+    cap: Option<usize>,
 ) -> Result<(), ReadError> {
+    if let Some(k) = cap
+        && out.len() >= k
+    {
+        return Ok(());
+    }
     let mut scan = Scan::start(Arc::clone(snapshot), first, upto);
     while let Some(item) = scan.next() {
         let record = item.map_err(|err| ReadError::Log(Arc::new(err)))?;
         let event = EventRef::from_bytes(record.data).map_err(ReadError::Corrupt)?;
         if query.matches(event) {
             out.push(record.position);
+            if let Some(k) = cap
+                && out.len() >= k
+            {
+                break;
+            }
         }
     }
     Ok(())
@@ -871,7 +964,7 @@ mod tests {
         // ranges), the plan is exactly 1..=watermark: nothing past it leaks in.
         for wm in 1..=last {
             let planned =
-                plan_positions(&snapshot, &query, Position::ZERO, Position::new(wm)).unwrap();
+                plan_positions(&snapshot, &query, Position::ZERO, Position::new(wm), None).unwrap();
             let got: Vec<u64> = planned.iter().map(|p| p.get()).collect();
             let expected: Vec<u64> = (1..=wm).collect();
             assert_eq!(got, expected, "watermark {wm}");
@@ -923,8 +1016,97 @@ mod tests {
         // Every event matches, so the complete answer is the dense 1..=6. The truncated tail
         // alone would return only 1..=4 (short); the scan fallback restores completeness.
         let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
-        let planned = plan_positions(&snapshot, &query, Position::ZERO, last).unwrap();
+        let planned = plan_positions(&snapshot, &query, Position::ZERO, last, None).unwrap();
         let got: Vec<u64> = planned.iter().map(|p| p.get()).collect();
         assert_eq!(got, (1..=6).collect::<Vec<_>>());
+    }
+
+    /// `plan_positions` returns at most `limit` positions, and they are the leading prefix of
+    /// the unlimited plan. Exercised across sealed-indexed and active ranges (tiny segments
+    /// force several seals) and across the segment-boundary truncation (a cap that lands
+    /// mid-way through the segments still yields the globally-ascending prefix).
+    #[test]
+    fn plan_positions_honors_the_limit() {
+        let dir = TempDir::new().unwrap();
+        let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+        for _ in 0..60 {
+            set.append_batch(&[event("Enrolled", &["course:c1"]).as_bytes()])
+                .unwrap();
+        }
+        assert!(set.sealed_len() >= 2, "need several sealed segments");
+        let index = IndexSet::open(&set).unwrap();
+        let snapshot = Arc::new(Snapshot::capture(&set, &index));
+
+        let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
+        let watermark = set.last_position();
+        let full = plan_positions(&snapshot, &query, Position::ZERO, watermark, None).unwrap();
+        assert_eq!(full.len(), 60);
+
+        // Every cap yields exactly the leading prefix, whichever range it lands in.
+        for limit in [0u64, 1, 5, 30, 59, 60, 61, 1000] {
+            let planned =
+                plan_positions(&snapshot, &query, Position::ZERO, watermark, Some(limit)).unwrap();
+            let want = &full[..(limit as usize).min(full.len())];
+            assert_eq!(planned, want, "limit {limit}");
+        }
+    }
+
+    /// The lending `Reads` iterator yields no more than `limit` events across all modes, the
+    /// yielded events are the leading prefix of the unlimited read, and `is_exhausted` reports
+    /// a capped stop (not a drained range) while an unlimited or under-cap read reports drained.
+    #[test]
+    fn reads_next_respects_the_limit_and_reports_exhaustion() {
+        let dir = TempDir::new().unwrap();
+        let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+        for _ in 0..40 {
+            set.append_batch(&[event("Enrolled", &["course:c1"]).as_bytes()])
+                .unwrap();
+        }
+        let index = IndexSet::open(&set).unwrap();
+
+        let collect = |limit: Option<u64>, scan_bias: u32| -> (Vec<u64>, bool) {
+            let snapshot = Arc::new(Snapshot::capture(&set, &index));
+            let watermark = set.last_position();
+            let mut reads = Reads::plan(
+                snapshot,
+                &Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+                Position::ZERO,
+                watermark,
+                &ReadConfig { scan_bias },
+                limit,
+            );
+            let mut out = Vec::new();
+            while let Some(item) = reads.next() {
+                out.push(item.unwrap().position.get());
+            }
+            (out, reads.is_exhausted())
+        };
+
+        // Force the index arm (bias 1) and the scan arm (bias u32::MAX): both honor the cap
+        // identically, yielding the same leading prefix and the same exhaustion verdict.
+        for scan_bias in [1u32, u32::MAX] {
+            let (full, full_exhausted) = collect(None, scan_bias);
+            assert_eq!(full, (1..=40).collect::<Vec<_>>(), "bias {scan_bias}");
+            assert!(full_exhausted, "an unlimited read is exhausted at its end");
+
+            let (capped, capped_exhausted) = collect(Some(10), scan_bias);
+            assert_eq!(capped, (1..=10).collect::<Vec<_>>(), "bias {scan_bias}");
+            assert!(!capped_exhausted, "a capped read is not exhausted");
+
+            let (zero, zero_exhausted) = collect(Some(0), scan_bias);
+            assert!(zero.is_empty(), "a zero cap yields nothing");
+            assert!(
+                !zero_exhausted,
+                "a zero cap is a limit stop, not exhaustion"
+            );
+
+            let (over, over_exhausted) = collect(Some(1000), scan_bias);
+            assert_eq!(
+                over,
+                (1..=40).collect::<Vec<_>>(),
+                "a cap above the result returns all"
+            );
+            assert!(over_exhausted, "an under-cap read drains and is exhausted");
+        }
     }
 }

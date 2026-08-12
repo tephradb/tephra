@@ -40,7 +40,7 @@ fn enrol(
         ]);
 
         // Read once, fold both projections over the same pass.
-        let (events, watermark) = client.read_all(query.clone(), Position::ZERO)?;
+        let (events, watermark) = client.read_all(query.clone(), Position::ZERO, None)?;
         let mut seats_used = 0usize;
         let mut already_enrolled = false;
         for seq in &events {

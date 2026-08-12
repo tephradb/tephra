@@ -25,12 +25,45 @@ fn quickstart(addr: &str) -> Result<(), Box<dyn Error>> {
 
     // ANCHOR: read
     let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
-    let (events, _watermark) = client.read_all(query, Position::ZERO)?;
+    // `None` reads the whole matching history; pass `Some(n)` to cap the number of events.
+    let (events, _watermark) = client.read_all(query, Position::ZERO, None)?;
     for seq in &events {
         println!("{} {}", seq.position(), seq.event().event_type());
     }
     // ANCHOR_END: read
     assert_eq!(events.len(), 1);
+
+    // A couple more events on the same course, so there is something to page through.
+    for seat in ["s1", "s2"] {
+        let event = Event::new(
+            "SeatReserved",
+            &["course:c1"],
+            format!("{{\"seat\":\"{seat}\"}}"),
+        )?;
+        client.append([event], None)?;
+    }
+
+    // ANCHOR: paginate
+    // `limit` caps how many events a read returns. Pair it with `after` (an exclusive lower
+    // bound) to page through a large result: each page resumes at the last position seen, with
+    // no gap and no duplicate at the seam. A page shorter than the limit is the last one.
+    let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
+    let page_size = 2;
+    let mut after = Position::ZERO;
+    let mut seen = 0usize;
+    loop {
+        let (page, _watermark) = client.read_all(query.clone(), after, Some(page_size))?;
+        let short = (page.len() as u64) < page_size;
+        if let Some(last) = page.last() {
+            after = last.position();
+        }
+        seen += page.len();
+        if short {
+            break;
+        }
+    }
+    // ANCHOR_END: paginate
+    assert_eq!(seen, 3);
 
     // ANCHOR: subscribe
     // Subscribe from the start: catch up on history, then a CaughtUp marker at the live edge.

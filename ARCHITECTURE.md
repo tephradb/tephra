@@ -747,6 +747,19 @@ Three distinct shapes, deliberately not unified:
 3. **Projection catch-up and subscriptions.** Sequential log scan at disk bandwidth with
    the sequential read hint. Highest volume by far.
 
+**Result limit.** A read takes an optional `limit` (`ReadHandle::read`, wire `ReadRequest.
+limit`). It is pushed into planning, not applied at the socket: the indexed path truncates its
+position list to the cap before any payload fetch, and the streaming scan modes stop after the
+cap is met, so a selective read does work proportional to `limit` rather than to the entity's
+full history (the difference between a point lookup and dragging a whole entity through fetch
+and encode). The cap only ever shortens the result to the leading prefix, so it cannot change
+which events a read returns, only how many, and it composes with the exclusive `after` bound as
+a stateless pagination cursor: read a page, then read again with `after` set to the last
+position, with no gap and no duplicate at the seam (the same resume seam a subscription uses).
+Subscriptions pass no limit; their own batch cap bounds each poll, and a `Reads::is_exhausted`
+flag keeps a capped stop distinct from a drained range so the cursor advances only on genuine
+exhaustion.
+
 Subscriptions need catch-up followed by live-tail handoff with no gap and no duplicate at
 the boundary. This is subtle and is where event stores usually have bugs, so the design
 **collapses the handoff out of existence**: catch-up and live-tail are the one operation

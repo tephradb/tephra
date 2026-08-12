@@ -142,7 +142,7 @@ fn read_owned(
     query: Query,
     after: Position,
 ) -> Result<Vec<(Position, Event)>, ReadError> {
-    handle.read(query, after).collect_owned()
+    handle.read(query, after, None).collect_owned()
 }
 
 fn tags(items: &[&str]) -> Tags {
@@ -270,6 +270,58 @@ fn the_planner_never_changes_the_answer() {
 }
 
 #[test]
+fn a_limit_truncates_the_result_identically_on_every_path() {
+    // A `limit` is a pure prefix cap: for any query, `after`, and cap, the limited read must
+    // equal the unlimited read truncated to the cap, on both the forced-index and forced-scan
+    // arms (so the planner still never changes the answer) and against the scan oracle. This is
+    // the limit counterpart of `the_planner_never_changes_the_answer`.
+    let mut wrng = Rng(0x0FF1_CE00_1234_5678);
+    let events: Vec<Event> = (0..400).map(|_| random_event(&mut wrng)).collect();
+    let last = events.len() as u64;
+
+    let mut qrng = Rng(0x1234_5678_0FF1_CE00);
+    // Each case carries its own cap, spanning 0, small, mid, and above-result sizes.
+    let cases: Vec<(Query, Position, u64)> = (0..500)
+        .map(|_| {
+            let query = random_query(&mut qrng);
+            let after = Position::new(qrng.below(last + 1));
+            let limit = qrng.below(6) * qrng.below(40); // 0..=195, skewed toward small
+            (query, after, limit)
+        })
+        .collect();
+
+    for &scan_bias in &[1u32, u32::MAX] {
+        let (coord, handle, _dir) = coordinator_with_scan_bias(scan_bias);
+        for ev in &events {
+            handle.append(vec![ev.clone()], None).unwrap();
+        }
+        let limited: Vec<Vec<Position>> = cases
+            .iter()
+            .map(|(query, after, limit)| {
+                handle
+                    .read(query.clone(), *after, Some(*limit))
+                    .collect_owned()
+                    .unwrap()
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect()
+            })
+            .collect();
+        let set = coord.shutdown();
+
+        for ((query, after, limit), got) in cases.iter().zip(&limited) {
+            let mut want = scan_baseline(&set, query, *after);
+            want.truncate(*limit as usize);
+            assert_eq!(
+                *got, want,
+                "scan_bias {scan_bias}: limited read disagreed with the truncated oracle \
+                 (after {after:?}, limit {limit})"
+            );
+        }
+    }
+}
+
+#[test]
 fn concurrent_reads_see_a_consistent_prefix_under_heavy_appends() {
     // Every event matches `Query::all`, so a read pinned at watermark W must return exactly
     // positions 1..=W: a dense, gap-free prefix. A torn snapshot (a segment set not covering
@@ -285,7 +337,7 @@ fn concurrent_reads_see_a_consistent_prefix_under_heavy_appends() {
             thread::spawn(move || {
                 let mut observed = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let mut reads = reader.read(Query::all(), Position::ZERO);
+                    let mut reads = reader.read(Query::all(), Position::ZERO, None);
                     let watermark = reads.watermark().get();
                     let mut positions = Vec::new();
                     while let Some(item) = reads.next() {
@@ -338,7 +390,7 @@ fn concurrent_reads_of_the_active_index_see_a_consistent_prefix() {
                 let mut max_seen = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
-                    let mut reads = reader.read(query, Position::ZERO);
+                    let mut reads = reader.read(query, Position::ZERO, None);
                     let watermark = reads.watermark().get();
                     let mut positions = Vec::new();
                     while let Some(item) = reads.next() {
@@ -383,7 +435,7 @@ fn watermark_resume_has_no_gap_or_duplicate() {
         handle.append(vec![random_event(&mut rng)], None).unwrap();
     }
 
-    let first = handle.read(Query::all(), Position::ZERO);
+    let first = handle.read(Query::all(), Position::ZERO, None);
     let w1 = first.watermark();
     let prefix: Vec<u64> = collect_positions(first);
     assert_eq!(prefix, (1..=w1.get()).collect::<Vec<_>>());
@@ -392,7 +444,7 @@ fn watermark_resume_has_no_gap_or_duplicate() {
         handle.append(vec![random_event(&mut rng)], None).unwrap();
     }
 
-    let resumed = handle.read(Query::all(), w1);
+    let resumed = handle.read(Query::all(), w1, None);
     let w2 = resumed.watermark();
     let tail: Vec<u64> = collect_positions(resumed);
     assert!(w2 > w1, "watermark should advance after more appends");

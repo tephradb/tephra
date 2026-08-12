@@ -39,7 +39,7 @@ fn embed_the_engine_directly() {
     let query = Query::item(QueryItem::with_tags(
         Tags::new([Tag::new("course:c1").expect("tag")]).expect("tags"),
     ));
-    let mut reads = handle.read(query, Position::ZERO);
+    let mut reads = handle.read(query, Position::ZERO, None);
     let mut count = 0usize;
     while let Some(item) = reads.next() {
         let seq = item.expect("decode");

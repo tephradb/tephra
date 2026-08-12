@@ -47,7 +47,7 @@ fn event(ty: &str, tag_strs: &[&str]) -> Event {
 
 /// Reads a query through the handle and collects just the matching positions.
 fn read_positions(handle: &WriteHandle, query: Query, after: Position) -> Vec<Position> {
-    let mut reads = handle.read(query, after);
+    let mut reads = handle.read(query, after, None);
     let mut out = Vec::new();
     while let Some(item) = reads.next() {
         out.push(item.expect("read failed").position);
