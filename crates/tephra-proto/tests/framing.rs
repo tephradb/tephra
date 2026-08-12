@@ -143,3 +143,82 @@ fn a_torn_frame_is_an_error_not_a_clean_eof() {
         other => panic!("expected Io(UnexpectedEof), got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Async framing (tokio)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tokio")]
+mod async_framing {
+    use tephra_proto::tephra::{AppendRequest, Request, request};
+    use tephra_proto::{
+        DEFAULT_MAX_FRAME_LEN, FrameError, read_frame_async, write_frame_async,
+    };
+
+    use super::sample_event;
+
+    #[tokio::test]
+    async fn request_round_trips_through_an_async_frame() {
+        let mut append = AppendRequest::new();
+        append
+            .events_mut()
+            .push(sample_event("Enrolled", &["course:c1"], b"{}"));
+        let mut req = Request::new();
+        req.set_request_id(9);
+        req.set_append(append);
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame_async(&mut buf, &req, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        let mut reader: &[u8] = &buf;
+        let got: Request = read_frame_async(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap()
+            .expect("one frame present");
+
+        assert_eq!(got.request_id(), 9);
+        assert!(matches!(got.kind(), request::KindOneof::Append(_)));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_at_a_boundary_reads_none() {
+        // No bytes at all: a clean close between frames yields None, not an error.
+        let mut reader: &[u8] = &[];
+        let got = read_frame_async::<Request, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_torn_async_frame_is_an_error() {
+        // A length prefix promising 100 bytes followed by only 3: unexpected EOF.
+        let mut bytes = 100u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"abc");
+        let mut reader: &[u8] = &bytes;
+        match read_frame_async::<Request, _>(&mut reader, DEFAULT_MAX_FRAME_LEN).await {
+            Err(FrameError::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof)
+            }
+            other => panic!("expected Io(UnexpectedEof), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_rejects_an_oversized_async_frame() {
+        let mut req = Request::new();
+        req.set_request_id(1);
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame_async(&mut buf, &req, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap();
+
+        let mut reader: &[u8] = &buf;
+        match read_frame_async::<Request, _>(&mut reader, 1).await {
+            Err(FrameError::TooLarge { max, .. }) => assert_eq!(max, 1),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+}

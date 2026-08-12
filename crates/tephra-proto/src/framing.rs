@@ -118,3 +118,117 @@ fn read_full_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
     }
     Ok(true)
 }
+
+// ---------------------------------------------------------------------------
+// Async framing (tokio)
+// ---------------------------------------------------------------------------
+
+/// The async counterpart of [`write_frame`]: serializes `msg` and writes it as one
+/// length-prefixed frame over an [`AsyncWrite`]. Does not flush; the caller flushes at a
+/// response boundary.
+#[cfg(feature = "tokio")]
+pub async fn write_frame_async<M, W>(
+    writer: &mut W,
+    msg: &M,
+    max_frame_len: u32,
+) -> Result<(), FrameError>
+where
+    M: Message,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let body = msg.serialize().map_err(FrameError::Serialize)?;
+    if body.len() as u64 > u64::from(max_frame_len) {
+        return Err(FrameError::TooLarge {
+            len: body.len().min(u32::MAX as usize) as u32,
+            max: max_frame_len,
+        });
+    }
+    writer.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    writer.write_all(&body).await?;
+    Ok(())
+}
+
+/// The async counterpart of [`read_frame`]: reads one length-prefixed frame from an
+/// [`AsyncRead`] and parses it as `M`. Returns `Ok(None)` on a clean EOF at a frame boundary
+/// (the peer closed between frames), mirroring the synchronous version.
+#[cfg(feature = "tokio")]
+pub async fn read_frame_async<M, R>(
+    reader: &mut R,
+    max_frame_len: u32,
+) -> Result<Option<M>, FrameError>
+where
+    M: Message,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    if !read_full_or_eof_async(reader, &mut len_buf).await? {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes(len_buf);
+    if len > max_frame_len {
+        return Err(FrameError::TooLarge {
+            len,
+            max: max_frame_len,
+        });
+    }
+    let mut body = vec![0u8; len as usize];
+    read_exact_async(reader, &mut body).await?;
+    let msg = M::parse(&body).map_err(FrameError::Parse)?;
+    Ok(Some(msg))
+}
+
+/// Async analog of [`read_full_or_eof`]: `Ok(false)` on a clean EOF before the first byte,
+/// `Ok(true)` once full, `UnexpectedEof` on a torn read. `tokio`'s own `read_exact` cannot
+/// distinguish a clean boundary from a torn one, so the length prefix is read here.
+#[cfg(feature = "tokio")]
+async fn read_full_or_eof_async<R>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "eof partway through a frame length prefix",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(true)
+}
+
+/// Fills `buf` completely from an [`AsyncRead`]; an early EOF (a torn frame body) is an
+/// `UnexpectedEof` error, since a length prefix already promised these bytes.
+#[cfg(feature = "tokio")]
+async fn read_exact_async<R>(reader: &mut R, buf: &mut [u8]) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "eof partway through a frame body",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}

@@ -48,6 +48,14 @@ message SubscribeRequest {
   uint64 after = 2;
 }
 
+// Cancels an in-flight request on the same connection, identified by its request id. Sent by
+// a multiplexed client to stop a streaming read or subscription without tearing down the
+// shared connection. Fire-and-forget: the server stops producing frames for `target` and
+// sends no response for the cancel itself.
+message CancelRequest {
+  uint64 target = 1;
+}
+
 message AppendResponse {
   uint64 first = 1;
   uint64 last = 2;
@@ -100,6 +108,7 @@ message Request {
     AppendRequest append = 2;
     ReadRequest read = 3;
     SubscribeRequest subscribe = 4;
+    CancelRequest cancel = 5;
   }
 }
 

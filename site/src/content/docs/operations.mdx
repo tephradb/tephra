@@ -35,10 +35,13 @@ condition_force_scan = false
 scan_bias = 4              # index only when the range is >= 4x the estimated result
 
 [server]
-max_frame_len = 16777216   # 16 MiB
+max_frame_len = 16777216           # 16 MiB
 read_batch_events = 1024
-read_batch_bytes = 524288  # 512 KiB
+read_batch_bytes = 524288           # 512 KiB
 subscribe_wait_tick_ms = 250
+max_inflight_requests_per_conn = 256 # appends + reads in flight per connection
+max_concurrent_subscriptions = 64   # live subscriptions per connection (excess is rejected)
+frame_queue_depth = 256             # buffered response frames before backpressure
 keepalive_idle_secs = 60
 keepalive_interval_secs = 15
 ```
@@ -89,6 +92,14 @@ The writer's request queue is bounded (`queue_capacity`). When it is full, `appe
 calling thread until there is room. Backpressure is not an error and not a dropped write: it is the
 caller slowing to the rate the store can make durable. Batch size grows automatically as fsync
 latency rises, because a slower disk lets more requests accumulate between syncs.
+
+The network server adds per-connection bounds. A connection serves its requests concurrently, and
+`max_inflight_requests_per_conn` caps how many appends and reads it runs at once; once reached, that
+connection stops reading new requests until one finishes, so a client that outruns the server is
+slowed rather than allowed to pile up unbounded work. `frame_queue_depth` bounds the response frames
+buffered toward a slow client, applying the same backpressure to the workers producing them.
+Subscriptions are budgeted separately by `max_concurrent_subscriptions`, and one over the limit is
+rejected with an error rather than blocking the connection.
 
 ## Shutdown
 

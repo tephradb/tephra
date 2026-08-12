@@ -57,6 +57,17 @@ pub struct ServerConfig {
     /// a subscription with no events flowing responsive to `shutdown` without a heartbeat
     /// frame.
     pub subscribe_wait_tick: Duration,
+    /// Most appends + reads a single connection may have in flight at once. Once reached, the
+    /// connection's reader blocks (backpressure) until one finishes, bounding both read worker
+    /// threads and the buffered append-reply backlog. Subscriptions are budgeted separately.
+    pub max_inflight_requests_per_conn: usize,
+    /// Most live subscriptions a single connection may hold at once. A subscription over the
+    /// limit is rejected with an error (rather than blocking the reader, since a long-lived
+    /// subscription's permit could only be freed by a cancel the blocked reader could not read).
+    pub max_concurrent_subscriptions: usize,
+    /// Depth of a connection's outbound frame queue. Bounds buffered response frames, so a slow
+    /// client applies backpressure to the workers producing them.
+    pub frame_queue_depth: usize,
     /// TCP keepalive idle time before the first probe on an accepted connection. The OS
     /// default (~2h on Linux) is too long to reap a silently-dead subscription promptly, so it
     /// is set explicitly.
@@ -72,6 +83,9 @@ impl Default for ServerConfig {
             read_batch_events: 1024,
             read_batch_bytes: 512 * 1024,
             subscribe_wait_tick: Duration::from_millis(250),
+            max_inflight_requests_per_conn: 256,
+            max_concurrent_subscriptions: 64,
+            frame_queue_depth: 256,
             keepalive_idle: Duration::from_secs(60),
             keepalive_interval: Duration::from_secs(15),
         }

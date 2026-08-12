@@ -14,6 +14,7 @@ tephra-proto.workspace = true
 argh.workspace = true
 config = { workspace = true, features = ["toml"] }
 ctrlc.workspace = true
+flume.workspace = true
 protobuf.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true
@@ -21,9 +22,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 socket2.workspace = true
 
 [dev-dependencies]
-tephra-client.workspace = true
+tephra-client = { workspace = true, features = ["async"] }
 
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream.workspace = true
 
 [[bin]]
 name = "tephra-server"

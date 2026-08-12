@@ -43,6 +43,15 @@ pub use tephra_types::{
 /// the primary API: prefer the clean types above ([`Event`], [`Query`], and friends).
 pub use tephra_proto::tephra as proto;
 
+/// The async, multiplexing client (behind the `async` feature). Unlike the blocking [`Client`],
+/// a single [`AsyncClient`] runs many requests concurrently over one connection.
+#[cfg(feature = "async")]
+mod asynchronous;
+#[cfg(feature = "async")]
+pub use asynchronous::{
+    AsyncClient, ReadStream as AsyncReadStream, SubscribeStream as AsyncSubscribeStream,
+};
+
 /// The request id the server uses for an error it cannot attribute to a specific request (an
 /// oversized or unparseable frame it rejected before decoding). Client request ids start at 1,
 /// so this sentinel never collides with a real one, and such an error is accepted as applying

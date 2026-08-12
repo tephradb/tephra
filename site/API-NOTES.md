@@ -676,6 +676,9 @@ pub struct ServerSettings {
     pub read_batch_events: usize,
     pub read_batch_bytes: usize,
     pub subscribe_wait_tick_ms: u64,
+    pub max_inflight_requests_per_conn: usize,
+    pub max_concurrent_subscriptions: usize,
+    pub frame_queue_depth: usize,
     pub keepalive_idle_secs: u64,
     pub keepalive_interval_secs: u64,
 }
@@ -686,6 +689,9 @@ impl Default for ServerSettings {
             read_batch_events: 1024,
             read_batch_bytes: 512 * 1024,           // 512 KiB
             subscribe_wait_tick_ms: 250,
+            max_inflight_requests_per_conn: 256,
+            max_concurrent_subscriptions: 64,
+            frame_queue_depth: 256,
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
         }

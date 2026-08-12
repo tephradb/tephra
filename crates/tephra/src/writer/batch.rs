@@ -39,6 +39,7 @@ pub(super) const MARKER_BYTES: usize = BATCH_OVERHEAD;
 struct Staged<'a> {
     reply: &'a Reply,
     range: PositionRange,
+    token: u64,
 }
 
 /// An in-flight batch borrowing from the drained requests.
@@ -91,7 +92,7 @@ impl<'a> Batch<'a> {
     /// Stages `events`, assigning them a dense position range, recording their tags into
     /// the staged tips, and remembering `reply` for the commit. The request must already
     /// have passed its condition check.
-    pub(super) fn stage(&mut self, events: &'a [Event], reply: &'a Reply) {
+    pub(super) fn stage(&mut self, events: &'a [Event], token: u64, reply: &'a Reply) {
         let first = self.next;
         let mut p = first;
         for event in events {
@@ -106,7 +107,11 @@ impl<'a> Batch<'a> {
             last: Position::new(p.get() - 1),
         };
         self.next = p;
-        self.staged.push(Staged { reply, range });
+        self.staged.push(Staged {
+            reply,
+            range,
+            token,
+        });
     }
 
     /// Called after `append_batch` succeeded. Absorbs the staged tags into `main` (now
@@ -126,7 +131,7 @@ impl<'a> Batch<'a> {
         main.absorb(self.tips, next_position);
         for s in self.staged {
             // A dropped receiver (caller gave up) is fine; the write is durable either way.
-            let _ = s.reply.send(Ok(s.range));
+            let _ = s.reply.send((s.token, Ok(s.range)));
         }
     }
 
@@ -134,7 +139,7 @@ impl<'a> Batch<'a> {
     /// request; nothing was committed and the staged tips are dropped.
     pub(super) fn commit_err(self, err: AppendError) {
         for s in self.staged {
-            let _ = s.reply.send(Err(err.clone()));
+            let _ = s.reply.send((s.token, Err(err.clone())));
         }
     }
 }
@@ -153,30 +158,32 @@ mod tests {
         Event::new(&EventType::new("E").unwrap(), &Tags::empty(), payload).unwrap()
     }
 
-    fn reply() -> (Reply, Receiver<Result<PositionRange, AppendError>>) {
+    type ReplyRx = Receiver<(u64, Result<PositionRange, AppendError>)>;
+
+    fn reply() -> (Reply, ReplyRx) {
         channel::unbounded()
     }
 
     #[test]
     fn commit_err_replies_every_staged_request() {
-        // Two staged requests; a batch failure must reach both.
+        // Two staged requests; a batch failure must reach both, each carrying its token.
         let e1 = vec![event(b"a")];
         let e2 = vec![event(b"b"), event(b"c")];
         let (tx1, rx1) = reply();
         let (tx2, rx2) = reply();
 
         let mut batch = Batch::new(Position::new(1));
-        batch.stage(&e1, &tx1);
-        batch.stage(&e2, &tx2);
+        batch.stage(&e1, 10, &tx1);
+        batch.stage(&e2, 20, &tx2);
         batch.commit_err(AppendError::TooLarge { size: 99 });
 
         assert!(matches!(
             rx1.try_recv(),
-            Ok(Err(AppendError::TooLarge { size: 99 }))
+            Ok((10, Err(AppendError::TooLarge { size: 99 })))
         ));
         assert!(matches!(
             rx2.try_recv(),
-            Ok(Err(AppendError::TooLarge { size: 99 }))
+            Ok((20, Err(AppendError::TooLarge { size: 99 })))
         ));
     }
 
@@ -188,8 +195,8 @@ mod tests {
         let (tx2, rx2) = reply();
 
         let mut batch = Batch::new(Position::new(1));
-        batch.stage(&e1, &tx1);
-        batch.stage(&e2, &tx2);
+        batch.stage(&e1, 10, &tx1);
+        batch.stage(&e2, 20, &tx2);
 
         let cfg = WriterConfig::default();
         let mut main = TagTips::new(Position::new(1), cfg.tips_window);
@@ -202,15 +209,19 @@ mod tests {
             Position::new(4),
         );
 
+        let (token1, res1) = rx1.try_recv().unwrap();
+        assert_eq!(token1, 10);
         assert_eq!(
-            rx1.try_recv().unwrap().unwrap(),
+            res1.unwrap(),
             PositionRange {
                 first: Position::new(1),
                 last: Position::new(2)
             }
         );
+        let (token2, res2) = rx2.try_recv().unwrap();
+        assert_eq!(token2, 20);
         assert_eq!(
-            rx2.try_recv().unwrap().unwrap(),
+            res2.unwrap(),
             PositionRange {
                 first: Position::new(3),
                 last: Position::new(3)

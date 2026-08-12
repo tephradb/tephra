@@ -118,8 +118,15 @@ pub enum AppendError {
     Shutdown,
 }
 
-/// The reply channel for one request (a per-call oneshot).
-type Reply = Sender<Result<PositionRange, AppendError>>;
+/// The sender half of an append reply channel: `(token, result)`. Each reply echoes the
+/// request's opaque `token` back untouched, so many in-flight appends can report their
+/// durable outcome over one shared channel and the receiver can attribute each result to
+/// its request. Handed to [`WriteHandle::append_submit`]; the blocking `append` path uses a
+/// private per-call channel with `token` 0.
+pub type AppendReply = Sender<(u64, Result<PositionRange, AppendError>)>;
+
+/// The reply channel for one request. An alias of [`AppendReply`] for use inside the writer.
+type Reply = AppendReply;
 
 /// One append request handed to the coordinator. Events are pre-encoded on the caller
 /// thread, so the coordinator does no encoding.
@@ -127,6 +134,9 @@ struct Request {
     events: Vec<Event>,
     condition: Option<AppendCondition>,
     reply: Reply,
+    /// Opaque value echoed back with the reply, meaningless to the coordinator. Lets a
+    /// shared reply channel attribute each result to its request. Zero for `append`.
+    token: u64,
 }
 
 /// What flows over the coordinator's channel: an append or the explicit shutdown sentinel

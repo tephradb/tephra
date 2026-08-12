@@ -13,6 +13,9 @@ mod framing;
 
 pub use framing::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame, write_frame};
 
+#[cfg(feature = "tokio")]
+pub use framing::{read_frame_async, write_frame_async};
+
 /// The generated protobuf message types (`package tephra.v1`).
 #[allow(clippy::all, clippy::pedantic, clippy::nursery)]
 pub mod tephra {

@@ -12,9 +12,10 @@ use tephra::writer::{WriteCoordinator, WriterConfig};
 
 use tempfile::TempDir;
 use tephra_client::{
-    AppendCondition, Client, ClientError, ErrorCode, Event, Position, Query, QueryItem,
-    SequencedEvent, SubEvent, Tag, Tags,
+    AppendCondition, AsyncClient, Client, ClientError, ErrorCode, Event, Position, Query,
+    QueryItem, SequencedEvent, SubEvent, Tag, Tags,
 };
+use tokio_stream::StreamExt as _;
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame, tephra as pb, write_frame};
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
 
@@ -681,4 +682,314 @@ fn send_raw_request(addr: SocketAddr, request: &pb::Request) -> pb::Response {
     read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
         .unwrap()
         .expect("server closed without responding")
+}
+
+// --- server-side concurrency (one connection, multiple in-flight requests) ---
+
+/// Builds an append request frame carrying one tagged event.
+fn append_frame(request_id: u64, ty: &str, tag: &str) -> pb::Request {
+    let mut event = pb::Event::new();
+    event.set_type(ty);
+    event.tags_mut().push(tag.to_string());
+    event.set_payload(b"p".to_vec());
+    let mut append = pb::AppendRequest::new();
+    append.events_mut().push(event);
+    let mut request = pb::Request::new();
+    request.set_request_id(request_id);
+    request.set_append(append);
+    request
+}
+
+/// Builds a catch-all subscribe request frame resuming after `after`.
+fn subscribe_all_frame(request_id: u64, after: u64) -> pb::Request {
+    let mut query = pb::Query::new();
+    query.set_all(true);
+    let mut subscribe = pb::SubscribeRequest::new();
+    subscribe.set_query(query);
+    subscribe.set_after(after);
+    let mut request = pb::Request::new();
+    request.set_request_id(request_id);
+    request.set_subscribe(subscribe);
+    request
+}
+
+#[test]
+fn pipelined_appends_all_succeed_with_dense_positions() {
+    // Fire several appends back-to-back on one connection without waiting, then read the
+    // responses. The server processes the pipeline and tags each response with its request id.
+    let ts = TestServer::start();
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(stream);
+
+    let n = 8u64;
+    for id in 1..=n {
+        write_frame(&mut writer, &append_frame(id, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+    }
+    writer.flush().unwrap();
+
+    // Collect one AppendResponse per request id.
+    let mut positions = std::collections::HashMap::new();
+    for _ in 0..n {
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("a response per pipelined append");
+        match resp.kind() {
+            pb::response::KindOneof::Append(append) => {
+                positions.insert(resp.request_id(), (append.first(), append.last()));
+            }
+            other => panic!("expected an append response, got {other:?}"),
+        }
+    }
+
+    // Every id answered; single-connection appends serialize at the coordinator in submission
+    // order, so id k lands at position k, dense and unique.
+    for id in 1..=n {
+        assert_eq!(positions.get(&id), Some(&(id, id)), "append {id} position");
+    }
+}
+
+#[test]
+fn a_subscription_does_not_block_a_concurrent_append() {
+    // The old server dedicated a connection to a subscription forever. Now a subscribe and an
+    // append share one connection: the append is answered while the subscription stays live,
+    // and the subscription then delivers the just-appended event.
+    let ts = TestServer::start();
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(stream);
+
+    // Open the subscription (id 1) over the empty store; it reaches the live edge immediately.
+    write_frame(&mut writer, &subscribe_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+    let first = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("subscription responds");
+    assert_eq!(first.request_id(), 1);
+    assert!(matches!(first.kind(), pb::response::KindOneof::CaughtUp(_)));
+
+    // With the subscription still live, append on the same connection (id 2).
+    write_frame(&mut writer, &append_frame(2, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+
+    // We must see both the append's own response (id 2) and the subscription (id 1) delivering
+    // the new event, proof the two ran concurrently over one connection.
+    let mut saw_append = false;
+    let mut saw_sub_event = false;
+    for _ in 0..8 {
+        if saw_append && saw_sub_event {
+            break;
+        }
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("more frames follow");
+        match (resp.request_id(), resp.kind()) {
+            (2, pb::response::KindOneof::Append(append)) => {
+                assert_eq!((append.first(), append.last()), (1, 1));
+                saw_append = true;
+            }
+            (1, pb::response::KindOneof::ReadEvents(events)) => {
+                assert_eq!(events.events().len(), 1);
+                assert_eq!(events.events().get(0).unwrap().position(), 1);
+                saw_sub_event = true;
+            }
+            (1, pb::response::KindOneof::CaughtUp(_)) => {} // a re-armed edge marker
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert!(saw_append, "the append was answered while subscribed");
+    assert!(saw_sub_event, "the subscription delivered the appended event");
+}
+
+#[test]
+fn cancel_stops_a_subscription_and_frees_the_connection() {
+    // A multiplexed client cancels one request by id without closing the socket. After the
+    // cancel, the connection still serves an append (the subscription worker has stopped).
+    let ts = TestServer::start();
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(stream);
+
+    write_frame(&mut writer, &subscribe_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+    let caught = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("subscription responds");
+    assert!(matches!(caught.kind(), pb::response::KindOneof::CaughtUp(_)));
+
+    // Cancel the subscription (id 1).
+    let mut cancel = pb::CancelRequest::new();
+    cancel.set_target(1);
+    let mut cancel_req = pb::Request::new();
+    cancel_req.set_request_id(99);
+    cancel_req.set_cancel(cancel);
+    write_frame(&mut writer, &cancel_req, DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+
+    // The connection is still usable: an append is answered normally.
+    write_frame(&mut writer, &append_frame(2, "E", "k:1"), DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+
+    // The next append response (id 2) arrives; the cancelled subscription may deliver the event
+    // once if it was mid-flight, but must not keep the connection from answering the append.
+    let mut saw_append = false;
+    for _ in 0..8 {
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("append is answered after a cancel");
+        if resp.request_id() == 2 {
+            assert!(matches!(resp.kind(), pb::response::KindOneof::Append(_)));
+            saw_append = true;
+            break;
+        }
+    }
+    assert!(saw_append, "append answered after the subscription was cancelled");
+}
+
+// --- async client: multiplexing over one connection ---
+
+#[tokio::test]
+async fn async_client_appends_and_reads_round_trip() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+
+    client
+        .append([ev("Enrolled", &["course:c1"], b"one")], None)
+        .await
+        .unwrap();
+    client
+        .append([ev("Enrolled", &["course:c2"], b"two")], None)
+        .await
+        .unwrap();
+
+    let (events, watermark) = client.read_all(Query::all(), Position::ZERO).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].position(), Position::new(1));
+    assert_eq!(events[1].position(), Position::new(2));
+    assert_eq!(watermark, Position::new(2));
+}
+
+#[tokio::test]
+async fn async_client_pipelines_concurrent_appends() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+
+    // Fire many appends concurrently through clones of the one client (one connection).
+    let n = 16u64;
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..n {
+        let client = client.clone();
+        set.spawn(async move {
+            client
+                .append([ev("E", &[&format!("k:{i}")], b"p")], None)
+                .await
+                .unwrap()
+        });
+    }
+
+    let mut firsts = std::collections::BTreeSet::new();
+    while let Some(joined) = set.join_next().await {
+        let range = joined.unwrap();
+        assert_eq!(range.first, range.last, "each append is a single event");
+        firsts.insert(range.first.get());
+    }
+
+    // All succeeded, and the assigned positions are exactly 1..=n, dense and unique.
+    let expected: std::collections::BTreeSet<u64> = (1..=n).collect();
+    assert_eq!(firsts, expected);
+}
+
+#[tokio::test]
+async fn async_client_subscribe_coexists_with_append() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+
+    // Subscribe over the empty store; the first item is the caught-up marker.
+    let mut sub = client.subscribe(Query::all(), Position::ZERO).await;
+    match sub.next().await.unwrap().unwrap() {
+        SubEvent::CaughtUp(_) => {}
+        other => panic!("expected a caught-up marker first, got {other:?}"),
+    }
+
+    // Append on the same client while subscribed: the append resolves, and the subscription
+    // then delivers the new event, both multiplexed over one connection.
+    let range = client
+        .append([ev("E", &["k:1"], b"p")], None)
+        .await
+        .unwrap();
+    assert_eq!(range.first, Position::new(1));
+
+    loop {
+        match sub.next().await.unwrap().unwrap() {
+            SubEvent::Event(event) => {
+                assert_eq!(event.position(), Position::new(1));
+                break;
+            }
+            SubEvent::CaughtUp(_) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn async_client_dropping_a_subscription_cancels_and_frees_the_connection() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+
+    {
+        let mut sub = client.subscribe(Query::all(), Position::ZERO).await;
+        match sub.next().await.unwrap().unwrap() {
+            SubEvent::CaughtUp(_) => {}
+            other => panic!("expected a caught-up marker, got {other:?}"),
+        }
+        // Dropping `sub` here sends a cancel; the shared connection stays usable.
+    }
+
+    let range = client
+        .append([ev("E", &["k:1"], b"p")], None)
+        .await
+        .unwrap();
+    assert_eq!(range.first, Position::new(1));
+}
+
+#[test]
+fn subscription_budget_rejects_excess_subscriptions() {
+    // With room for two subscriptions, a third on the same connection is rejected (not blocked),
+    // and the connection keeps working.
+    let config = ServerConfig {
+        max_concurrent_subscriptions: 2,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(config, 16 * 1024 * 1024, WriterConfig::default());
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(stream);
+
+    // Two subscriptions fit (each acquires a permit in the reader before spawning), so by the
+    // time the third is read both permits are held and it is rejected deterministically.
+    for id in 1..=3u64 {
+        write_frame(&mut writer, &subscribe_all_frame(id, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    }
+    writer.flush().unwrap();
+
+    let mut caught_up = 0;
+    let mut rejected = 0;
+    for _ in 0..3 {
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("three responses");
+        match resp.kind() {
+            pb::response::KindOneof::CaughtUp(_) => caught_up += 1,
+            pb::response::KindOneof::Error(_) => {
+                assert_eq!(resp.request_id(), 3, "the third subscription is the one rejected");
+                rejected += 1;
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(caught_up, 2, "two subscriptions were accepted");
+    assert_eq!(rejected, 1, "the third was rejected");
 }

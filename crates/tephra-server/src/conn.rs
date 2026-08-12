@@ -1,13 +1,36 @@
-//! Per-connection request handling: sequential request/response over one socket, with reads
-//! streamed as multiple frames.
+//! Per-connection request handling.
+//!
+//! A connection is served concurrently: its requests are read on one thread but processed on
+//! others, so responses for different requests can interleave and complete out of order (each
+//! frame carries its `request_id`, so the client demultiplexes). Per connection there are two
+//! fixed threads, a **reader** (this thread) and a **writer**, plus an append **completion
+//! pump**, a capped set of per-read worker threads, and one dedicated thread per subscription.
+//!
+//! - **Append** does no work here: [`WriteHandle::append_submit`] hands it to the single write
+//!   coordinator, and the pump turns the durable `(request_id, result)` reply into a frame. No
+//!   thread waits on an append.
+//! - **Read** runs on a worker thread (bounded by a per-connection semaphore) over a lock-free
+//!   snapshot, streaming `ReadEvents` frames then a `ReadEnd`.
+//! - **Subscribe** runs on its own dedicated thread until cancelled or the connection ends, so
+//!   it no longer monopolizes the connection.
+//!
+//! All producers push built [`pb::Response`]s into one bounded channel drained by the writer,
+//! so frames never tear and a slow client applies backpressure. A [`pb::CancelRequest`] flips a
+//! per-request flag that the read/subscribe loops observe.
 
+use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
+use flume::{Receiver, Sender};
+
+use tephra::log::set::PositionRange;
+use tephra::query::Query;
 use tephra::read::WaitOutcome;
-use tephra::writer::WriteHandle;
+use tephra::writer::{AppendError, WriteHandle};
 use tephra::{Event, Position};
 
 use tephra_proto::tephra as pb;
@@ -16,9 +39,12 @@ use tephra_proto::{FrameError, read_frame, write_frame};
 use crate::ServerConfig;
 use crate::convert;
 
-/// Serves one connection until the client disconnects, the socket is shut down, or a
-/// transport error occurs. Each request is answered fully (a read streams several frames)
-/// before the next is read.
+/// The reply payload the coordinator sends back for one append, tagged with its `request_id`.
+type AppendReply = (u64, Result<PositionRange, AppendError>);
+
+/// Serves one connection until the client disconnects, the socket is shut down, or a transport
+/// error occurs. Spawns the writer, the append pump, and per-request workers, then reads and
+/// dispatches requests until the stream ends, and finally tears everything down and joins.
 pub(crate) fn serve_connection(
     stream: TcpStream,
     handle: WriteHandle,
@@ -30,183 +56,329 @@ pub(crate) fn serve_connection(
         tracing::warn!(?peer, %err, "failed to set TCP_NODELAY");
     }
 
-    // A cloned handle for reading and the original for writing: the two halves address the
-    // same socket, and request/response is sequential, so they never race each other.
-    let read_stream = match stream.try_clone() {
+    let read_half = match stream.try_clone() {
         Ok(clone) => clone,
         Err(err) => {
             tracing::warn!(?peer, %err, "failed to clone connection stream");
             return;
         }
     };
-    let mut reader = BufReader::new(read_stream);
-    let mut writer = BufWriter::new(stream);
+    let write_half = match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => {
+            tracing::warn!(?peer, %err, "failed to clone connection stream");
+            return;
+        }
+    };
 
+    let alive = Arc::new(AtomicBool::new(true));
+    let (out_tx, out_rx) = flume::bounded::<pb::Response>(config.frame_queue_depth);
+    let (reply_tx, reply_rx) = flume::unbounded::<AppendReply>();
+    let cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::default();
+    // Appends and reads share one blocking budget; subscriptions get a separate rejecting one, so a
+    // long-lived subscription never holds a permit only a cancel could free (see `spawn_subscribe`).
+    let inflight = Arc::new(Semaphore::new(config.max_inflight_requests_per_conn));
+    let subscriptions = Arc::new(Semaphore::new(config.max_concurrent_subscriptions));
+    let workers = WaitGroup::default();
+
+    let writer_thread = {
+        let alive = Arc::clone(&alive);
+        let shutdown = stream.try_clone().ok();
+        let max = config.max_frame_len;
+        thread::Builder::new()
+            .name("tephra-conn-writer".to_string())
+            .spawn(move || writer_loop(write_half, out_rx, shutdown, alive, max))
+            .expect("spawn connection writer thread")
+    };
+
+    let pump_thread = {
+        let out_tx = out_tx.clone();
+        let inflight = Arc::clone(&inflight);
+        thread::Builder::new()
+            .name("tephra-conn-pump".to_string())
+            .spawn(move || pump_loop(reply_rx, out_tx, inflight))
+            .expect("spawn connection pump thread")
+    };
+
+    let conn = ConnCtx {
+        handle,
+        config,
+        running,
+        alive: Arc::clone(&alive),
+        out_tx: out_tx.clone(),
+        cancels: Arc::clone(&cancels),
+        workers: workers.clone(),
+        inflight,
+        subscriptions,
+    };
+
+    let mut reader = BufReader::new(read_half);
     loop {
         let request = match read_frame::<pb::Request, _>(&mut reader, config.max_frame_len) {
             Ok(Some(request)) => request,
             Ok(None) => break, // clean close at a frame boundary
             Err(err) => {
-                // Tell the client why before closing, when the failure is at a nameable frame
-                // boundary (oversized or unparseable). The request id is unknown (the frame
-                // never decoded), so it is reported as 0. A transport or encode error cannot be
-                // communicated (this also covers a socket shutdown during graceful stop), so
-                // just close.
+                // Name the failure to the client when the frame boundary allows it. The frame
+                // never decoded, so its id is unknown and reported as 0.
                 let error = match &err {
                     FrameError::TooLarge { .. } => Some(convert::too_large(err.to_string())),
                     FrameError::Parse(_) => Some(convert::bad_request(err.to_string())),
                     FrameError::Io(_) | FrameError::Serialize(_) => None,
                 };
                 if let Some(error) = error {
-                    let _ = send(
-                        &mut writer,
-                        0,
-                        ResponseKind::Error(error),
-                        config.max_frame_len,
-                    );
+                    let _ = out_tx.send(make_response(0, ResponseKind::Error(error)));
                 }
                 tracing::debug!(?peer, %err, "connection read ended");
                 break;
             }
         };
 
-        if let Err(err) = dispatch(&request, &handle, &config, &running, &mut writer) {
-            tracing::debug!(?peer, %err, "connection write ended");
-            break;
-        }
+        dispatch(&request, &conn, &reply_tx);
+    }
+
+    // Drain before closing so a queued response (e.g. a frame-error reply) still reaches the
+    // client: mark dead, drop this thread's channel handles, wait for workers, then join and close.
+    // The writer flushes the remainder on its own exit; a dead socket fails writes fast so the
+    // joins don't hang (a slow-but-alive client is bounded by TCP keepalive / server shutdown).
+    alive.store(false, Ordering::Release);
+    drop(conn);
+    drop(out_tx);
+    drop(reply_tx);
+    workers.wait();
+    let _ = pump_thread.join();
+    let _ = writer_thread.join();
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// The shared per-connection context handed to workers. Cheap to clone (handles and `Arc`s).
+#[derive(Clone)]
+struct ConnCtx {
+    handle: WriteHandle,
+    config: ServerConfig,
+    /// Server-wide shutdown signal (the accept loop clears it).
+    running: Arc<AtomicBool>,
+    /// This connection is being torn down (a transport failure on either half).
+    alive: Arc<AtomicBool>,
+    out_tx: Sender<pb::Response>,
+    cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    workers: WaitGroup,
+    /// Blocking budget shared by in-flight appends and reads.
+    inflight: Arc<Semaphore>,
+    /// Rejecting budget for concurrent subscriptions.
+    subscriptions: Arc<Semaphore>,
+}
+
+impl ConnCtx {
+    /// Whether a streaming worker should keep producing: the server is up, the connection is
+    /// alive, and this request has not been cancelled.
+    fn should_continue(&self, cancel: &AtomicBool) -> bool {
+        self.running.load(Ordering::Acquire)
+            && self.alive.load(Ordering::Acquire)
+            && !cancel.load(Ordering::Acquire)
     }
 }
 
-/// Handles one request, writing its full response (one frame for an append, several for a
-/// read). A transport error is returned so the caller drops the connection.
-fn dispatch(
-    request: &pb::Request,
-    handle: &WriteHandle,
-    config: &ServerConfig,
-    running: &AtomicBool,
-    writer: &mut BufWriter<TcpStream>,
-) -> Result<(), FrameError> {
+/// Routes one request. Appends submit and return; reads and subscribes spawn workers; a cancel
+/// flips the target's flag; anything unrecognized is a bad request.
+fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply>) {
     let request_id = request.request_id();
     match request.kind() {
         pb::request::KindOneof::Append(append) => {
-            handle_append(request_id, append, handle, config, writer)
+            handle_append(request_id, append, conn, reply_tx)
         }
-        pb::request::KindOneof::Read(read) => handle_read(request_id, read, handle, config, writer),
-        pb::request::KindOneof::Subscribe(subscribe) => {
-            handle_subscribe(request_id, subscribe, handle, config, running, writer)
+        pb::request::KindOneof::Read(read) => spawn_read(request_id, read, conn),
+        pb::request::KindOneof::Subscribe(subscribe) => spawn_subscribe(request_id, subscribe, conn),
+        pb::request::KindOneof::Cancel(cancel) => {
+            if let Some(flag) = conn.cancels.lock().unwrap().get(&cancel.target()) {
+                flag.store(true, Ordering::Release);
+            }
         }
         // No kind set, or a future kind this server does not understand.
         _ => {
-            let error = convert::bad_request("request has no append, read, or subscribe set");
-            send(
-                writer,
-                request_id,
-                ResponseKind::Error(error),
-                config.max_frame_len,
-            )
+            let error =
+                convert::bad_request("request has no append, read, subscribe, or cancel set");
+            let _ = conn
+                .out_tx
+                .send(make_response(request_id, ResponseKind::Error(error)));
         }
     }
 }
 
+/// Submits an append to the coordinator without blocking; the pump delivers its reply. Input
+/// errors (bad events or condition, empty, or a shut-down coordinator) reply immediately.
+///
+/// A permit from the in-flight budget is acquired before submitting (blocking the reader when the
+/// connection is saturated, which bounds the reply backlog) and released by the pump when the
+/// reply is forwarded, or here if the submit itself fails, since no reply will follow.
 fn handle_append(
     request_id: u64,
     append: pb::AppendRequestView<'_>,
-    handle: &WriteHandle,
-    config: &ServerConfig,
-    writer: &mut BufWriter<TcpStream>,
-) -> Result<(), FrameError> {
+    conn: &ConnCtx,
+    reply_tx: &Sender<AppendReply>,
+) {
     let events = match convert::events_from_proto(append) {
         Ok(events) => events,
         Err(err) => {
-            let error = convert::bad_request(err);
-            return send(
-                writer,
+            let _ = conn.out_tx.send(make_response(
                 request_id,
-                ResponseKind::Error(error),
-                config.max_frame_len,
-            );
+                ResponseKind::Error(convert::bad_request(err)),
+            ));
+            return;
         }
     };
     let condition = match append.condition_opt() {
         Some(condition) => match convert::condition_from_proto(condition) {
             Ok(condition) => Some(condition),
             Err(err) => {
-                let error = convert::bad_request(err);
-                return send(
-                    writer,
+                let _ = conn.out_tx.send(make_response(
                     request_id,
-                    ResponseKind::Error(error),
-                    config.max_frame_len,
-                );
+                    ResponseKind::Error(convert::bad_request(err)),
+                ));
+                return;
             }
         },
         None => None,
     };
 
-    match handle.append(events, condition) {
-        Ok(range) => {
-            let mut ok = pb::AppendResponse::new();
-            ok.set_first(range.first.get());
-            ok.set_last(range.last.get());
-            send(
-                writer,
-                request_id,
-                ResponseKind::Append(ok),
-                config.max_frame_len,
-            )
-        }
-        Err(err) => {
-            let error = convert::append_error_to_proto(&err);
-            send(
-                writer,
-                request_id,
-                ResponseKind::Error(error),
-                config.max_frame_len,
-            )
-        }
+    conn.inflight.acquire();
+    if let Err(err) = conn
+        .handle
+        .append_submit(events, condition, request_id, reply_tx.clone())
+    {
+        conn.inflight.release();
+        let _ = conn.out_tx.send(make_response(
+            request_id,
+            ResponseKind::Error(convert::append_error_to_proto(&err)),
+        ));
     }
 }
 
-fn handle_read(
+/// Validates the query, then spawns a worker to stream the read. Acquiring an in-flight permit
+/// here (shared with appends) caps read worker threads and applies backpressure to the reader.
+fn spawn_read(
     request_id: u64,
     read: pb::ReadRequestView<'_>,
-    handle: &WriteHandle,
-    config: &ServerConfig,
-    writer: &mut BufWriter<TcpStream>,
-) -> Result<(), FrameError> {
+    conn: &ConnCtx,
+) {
     let query = match convert::query_from_proto(read.query()) {
         Ok(query) => query,
         Err(err) => {
-            let error = convert::bad_request(err);
-            return send(
-                writer,
+            let _ = conn.out_tx.send(make_response(
                 request_id,
-                ResponseKind::Error(error),
-                config.max_frame_len,
-            );
+                ResponseKind::Error(convert::bad_request(err)),
+            ));
+            return;
         }
     };
     let after = Position::new(read.after());
 
-    let mut reads = handle.read(query, after);
+    let cancel = register_cancel(conn, request_id);
+    conn.inflight.acquire();
+    conn.workers.add();
+    let cleanup = WorkerCleanup {
+        cancels: Arc::clone(&conn.cancels),
+        sem: Some(Arc::clone(&conn.inflight)),
+        workers: conn.workers.clone(),
+        request_id,
+    };
+    let conn_owned = conn.clone();
+    if let Err(err) = thread::Builder::new()
+        .name("tephra-conn-read".to_string())
+        .spawn(move || {
+            let _cleanup = cleanup;
+            run_read(request_id, query, after, &conn_owned, &cancel);
+        })
+    {
+        tracing::warn!(%err, "failed to spawn read worker");
+        // `cleanup` dropped with the failed closure, releasing its permit/worker/cancel.
+        let _ = conn.out_tx.send(make_response(
+            request_id,
+            ResponseKind::Error(convert::bad_request("server could not start the read")),
+        ));
+    }
+}
+
+/// Validates the query, then spawns a dedicated thread for the subscription. Subscriptions do not
+/// share the appends/reads budget (they are long-lived); instead a full subscription budget
+/// *rejects* the request, so the reader never blocks waiting on a permit only a cancel could free.
+fn spawn_subscribe(request_id: u64, subscribe: pb::SubscribeRequestView<'_>, conn: &ConnCtx) {
+    let query = match convert::query_from_proto(subscribe.query()) {
+        Ok(query) => query,
+        Err(err) => {
+            let _ = conn.out_tx.send(make_response(
+                request_id,
+                ResponseKind::Error(convert::bad_request(err)),
+            ));
+            return;
+        }
+    };
+    let after = Position::new(subscribe.after());
+
+    if !conn.subscriptions.try_acquire() {
+        let _ = conn.out_tx.send(make_response(
+            request_id,
+            ResponseKind::Error(convert::bad_request(
+                "too many concurrent subscriptions on this connection",
+            )),
+        ));
+        return;
+    }
+    let cancel = register_cancel(conn, request_id);
+    conn.workers.add();
+    let cleanup = WorkerCleanup {
+        cancels: Arc::clone(&conn.cancels),
+        sem: Some(Arc::clone(&conn.subscriptions)),
+        workers: conn.workers.clone(),
+        request_id,
+    };
+    let conn_owned = conn.clone();
+    if let Err(err) = thread::Builder::new()
+        .name("tephra-conn-subscribe".to_string())
+        .spawn(move || {
+            let _cleanup = cleanup;
+            run_subscribe(request_id, query, after, &conn_owned, &cancel);
+        })
+    {
+        tracing::warn!(%err, "failed to spawn subscribe worker");
+        let _ = conn.out_tx.send(make_response(
+            request_id,
+            ResponseKind::Error(convert::bad_request("server could not start the subscription")),
+        ));
+    }
+}
+
+/// Registers a fresh cancel flag for `request_id` so a later `CancelRequest` can find it.
+fn register_cancel(conn: &ConnCtx, request_id: u64) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    conn.cancels
+        .lock()
+        .unwrap()
+        .insert(request_id, Arc::clone(&cancel));
+    cancel
+}
+
+/// Streams one read: `ReadEvents` batches then a terminating `ReadEnd`, framed on the same
+/// event-count / byte thresholds a subscription uses. Stops quietly if cancelled or the
+/// connection dies mid-stream. A log-integrity failure terminates with a single error frame.
+fn run_read(request_id: u64, query: Query, after: Position, conn: &ConnCtx, cancel: &AtomicBool) {
+    let mut reads = conn.handle.read(query, after);
     let watermark = reads.watermark();
 
     let mut batch = pb::ReadEvents::new();
     let mut batch_bytes = 0usize;
 
     while let Some(item) = reads.next() {
+        if !conn.should_continue(cancel) {
+            return;
+        }
         let sequenced = match item {
             Ok(sequenced) => sequenced,
             Err(err) => {
-                // Terminate the stream with a single error frame; the log is the source of
-                // truth, so this is an integrity failure, not a normal empty result.
-                let error = convert::internal_error(err);
-                return send(
-                    writer,
+                let _ = conn.out_tx.send(make_response(
                     request_id,
-                    ResponseKind::Error(error),
-                    config.max_frame_len,
-                );
+                    ResponseKind::Error(convert::internal_error(err)),
+                ));
+                return;
             }
         };
         batch_bytes += sequenced.event.as_bytes().len();
@@ -215,129 +387,100 @@ fn handle_read(
             sequenced.event,
         ));
 
-        if batch.events().len() >= config.read_batch_events
-            || batch_bytes >= config.read_batch_bytes
+        if batch.events().len() >= conn.config.read_batch_events
+            || batch_bytes >= conn.config.read_batch_bytes
         {
-            send(
-                writer,
-                request_id,
-                ResponseKind::ReadEvents(batch),
-                config.max_frame_len,
-            )?;
-            batch = pb::ReadEvents::new();
+            let full = std::mem::replace(&mut batch, pb::ReadEvents::new());
+            if conn
+                .out_tx
+                .send(make_response(request_id, ResponseKind::ReadEvents(full)))
+                .is_err()
+            {
+                return;
+            }
             batch_bytes = 0;
         }
     }
 
-    if !batch.events().is_empty() {
-        send(
-            writer,
-            request_id,
-            ResponseKind::ReadEvents(batch),
-            config.max_frame_len,
-        )?;
+    if !batch.events().is_empty()
+        && conn
+            .out_tx
+            .send(make_response(request_id, ResponseKind::ReadEvents(batch)))
+            .is_err()
+    {
+        return;
     }
 
     let mut end = pb::ReadEnd::new();
     end.set_watermark(watermark.get());
-    send(
-        writer,
-        request_id,
-        ResponseKind::ReadEnd(end),
-        config.max_frame_len,
-    )
+    let _ = conn
+        .out_tx
+        .send(make_response(request_id, ResponseKind::ReadEnd(end)));
 }
 
 /// Serves a live subscription: catch up on matching events after `after`, then tail new ones,
-/// framing events exactly like [`handle_read`]. Unlike a read it never sends a `ReadEnd`; it
-/// runs until the connection breaks, the store shuts down, or the server stops. The connection
-/// is dedicated to this subscription from here on (the request loop is not re-entered).
-fn handle_subscribe(
+/// framing events like a read but ending only on cancel, connection death, or store shutdown
+/// (never a `ReadEnd`). A `SubscribeCaughtUp` marker fires once per live-edge (re-armed).
+fn run_subscribe(
     request_id: u64,
-    subscribe: pb::SubscribeRequestView<'_>,
-    handle: &WriteHandle,
-    config: &ServerConfig,
-    running: &AtomicBool,
-    writer: &mut BufWriter<TcpStream>,
-) -> Result<(), FrameError> {
-    let query = match convert::query_from_proto(subscribe.query()) {
-        Ok(query) => query,
-        Err(err) => {
-            let error = convert::bad_request(err);
-            return send(
-                writer,
-                request_id,
-                ResponseKind::Error(error),
-                config.max_frame_len,
-            );
-        }
-    };
-    let after = Position::new(subscribe.after());
-    let mut sub = handle.subscribe(query, after);
-
-    // Whether a `SubscribeCaughtUp` has already been sent for the current live edge. It is set
-    // when we reach the edge and cleared the moment we deliver anything, so the marker fires
-    // exactly once per catch-up burst (re-armed) rather than once per wait tick: an idle
-    // subscription must not turn the bounded wait into a heartbeat frame.
+    query: Query,
+    after: Position,
+    conn: &ConnCtx,
+    cancel: &AtomicBool,
+) {
+    let mut sub = conn.handle.subscribe(query, after);
     let mut announced = false;
 
     loop {
-        // Observe server shutdown even mid-catch-up and between waits.
-        if !running.load(Ordering::Acquire) {
-            return Ok(());
+        if !conn.should_continue(cancel) {
+            return;
         }
         let batch = match sub.poll_batch() {
             Ok(batch) => batch,
             Err(err) => {
-                // An integrity failure reading the log: terminate with an error frame.
-                let error = convert::internal_error(err);
-                return send(
-                    writer,
+                let _ = conn.out_tx.send(make_response(
                     request_id,
-                    ResponseKind::Error(error),
-                    config.max_frame_len,
-                );
+                    ResponseKind::Error(convert::internal_error(err)),
+                ));
+                return;
             }
         };
 
         if batch.is_empty() {
-            // Reached the live edge. Announce caught-up once for this edge (non-decreasing
-            // watermark), then block for the next commit. A subsequent tick re-polls empty
-            // without re-announcing; the bounded wait only keeps the subscription responsive
-            // to `running`.
+            // Reached the live edge: announce caught-up once for this edge, then block for the
+            // next commit. A bounded wait keeps the subscription responsive to shutdown/cancel.
             if !announced {
                 let mut caught_up = pb::SubscribeCaughtUp::new();
                 caught_up.set_watermark(sub.position().get());
-                send(
-                    writer,
-                    request_id,
-                    ResponseKind::CaughtUp(caught_up),
-                    config.max_frame_len,
-                )?;
+                if conn
+                    .out_tx
+                    .send(make_response(request_id, ResponseKind::CaughtUp(caught_up)))
+                    .is_err()
+                {
+                    return;
+                }
                 announced = true;
             }
-            match sub.wait_timeout(config.subscribe_wait_tick) {
-                // New events, or just a tick: loop and re-poll (the top re-checks `running`).
+            match sub.wait_timeout(conn.config.subscribe_wait_tick) {
                 WaitOutcome::Advanced | WaitOutcome::TimedOut => {}
-                // The write coordinator shut down: no more events will ever arrive.
-                WaitOutcome::Closed => return Ok(()),
+                WaitOutcome::Closed => return,
             }
         } else {
-            send_event_batch(request_id, &batch, config, writer)?;
-            // Delivered events: the next time we reach the edge is a new one, re-arm.
+            if send_event_batch(request_id, &batch, conn).is_err() {
+                return;
+            }
             announced = false;
         }
     }
 }
 
-/// Frames a batch of subscription events into one or more `ReadEvents` responses, flushing on
-/// the same event-count / byte thresholds a streamed read uses.
+/// Frames a batch of subscription events into one or more `ReadEvents` responses on the same
+/// thresholds a streamed read uses. Returns `Err` if the frame channel closed (writer gone).
 fn send_event_batch(
     request_id: u64,
     events: &[(Position, Event)],
-    config: &ServerConfig,
-    writer: &mut BufWriter<TcpStream>,
-) -> Result<(), FrameError> {
+    conn: &ConnCtx,
+) -> Result<(), ()> {
     let mut batch = pb::ReadEvents::new();
     let mut batch_bytes = 0usize;
     for (position, event) in events {
@@ -345,28 +488,80 @@ fn send_event_batch(
         batch
             .events_mut()
             .push(convert::sequenced_to_proto(*position, event.as_ref()));
-        if batch.events().len() >= config.read_batch_events
-            || batch_bytes >= config.read_batch_bytes
+        if batch.events().len() >= conn.config.read_batch_events
+            || batch_bytes >= conn.config.read_batch_bytes
         {
-            send(
-                writer,
-                request_id,
-                ResponseKind::ReadEvents(batch),
-                config.max_frame_len,
-            )?;
-            batch = pb::ReadEvents::new();
+            let full = std::mem::replace(&mut batch, pb::ReadEvents::new());
+            conn.out_tx
+                .send(make_response(request_id, ResponseKind::ReadEvents(full)))
+                .map_err(|_| ())?;
             batch_bytes = 0;
         }
     }
     if !batch.events().is_empty() {
-        send(
-            writer,
-            request_id,
-            ResponseKind::ReadEvents(batch),
-            config.max_frame_len,
-        )?;
+        conn.out_tx
+            .send(make_response(request_id, ResponseKind::ReadEvents(batch)))
+            .map_err(|_| ())?;
     }
     Ok(())
+}
+
+/// The writer thread: drains built responses and writes them, flushing once per burst so a
+/// streamed read is delivered promptly without a syscall per frame. On a transport failure it
+/// marks the connection dead and shuts the socket, unblocking the reader and any parked worker.
+fn writer_loop(
+    write_half: TcpStream,
+    out_rx: Receiver<pb::Response>,
+    shutdown: Option<TcpStream>,
+    alive: Arc<AtomicBool>,
+    max_frame_len: u32,
+) {
+    let mut writer = BufWriter::new(write_half);
+    'outer: while let Ok(response) = out_rx.recv() {
+        if write_frame(&mut writer, &response, max_frame_len).is_err() {
+            break;
+        }
+        // Write anything already queued before paying for a flush.
+        while let Ok(response) = out_rx.try_recv() {
+            if write_frame(&mut writer, &response, max_frame_len).is_err() {
+                break 'outer;
+            }
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+    // Any exit means the output side is done: mark dead and wake the rest of the connection.
+    alive.store(false, Ordering::Release);
+    if let Some(stream) = shutdown {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// The append completion pump: turns each durable reply into a response frame and releases the
+/// append's in-flight permit. Exits when the reply channel closes (all appends done and the
+/// reader gone) or the writer has gone away.
+fn pump_loop(reply_rx: Receiver<AppendReply>, out_tx: Sender<pb::Response>, inflight: Arc<Semaphore>) {
+    while let Ok((request_id, result)) = reply_rx.recv() {
+        let response = match result {
+            Ok(range) => {
+                let mut ok = pb::AppendResponse::new();
+                ok.set_first(range.first.get());
+                ok.set_last(range.last.get());
+                make_response(request_id, ResponseKind::Append(ok))
+            }
+            Err(err) => make_response(
+                request_id,
+                ResponseKind::Error(convert::append_error_to_proto(&err)),
+            ),
+        };
+        // Send before releasing, so a full frame channel keeps the in-flight bound tight.
+        let sent = out_tx.send(response);
+        inflight.release();
+        if sent.is_err() {
+            break;
+        }
+    }
 }
 
 /// The payload of one response frame.
@@ -378,14 +573,8 @@ enum ResponseKind {
     Error(pb::ErrorResponse),
 }
 
-/// Frames one `Response` (with its `request_id` echoed) and flushes it, so a streamed read
-/// is delivered frame by frame rather than buffered until the end.
-fn send(
-    writer: &mut BufWriter<TcpStream>,
-    request_id: u64,
-    kind: ResponseKind,
-    max_frame_len: u32,
-) -> Result<(), FrameError> {
+/// Builds one `Response` with its `request_id` echoed.
+fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
     let mut response = pb::Response::new();
     response.set_request_id(request_id);
     match kind {
@@ -395,7 +584,98 @@ fn send(
         ResponseKind::CaughtUp(caught_up) => response.set_caught_up(caught_up),
         ResponseKind::Error(error) => response.set_error(error),
     }
-    write_frame(writer, &response, max_frame_len)?;
-    writer.flush()?;
-    Ok(())
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Small concurrency primitives
+// ---------------------------------------------------------------------------
+
+/// Releases a worker's resources when its thread ends (including on panic or a spawn failure):
+/// deregisters the cancel flag, returns the read permit (if any), and marks the worker done.
+struct WorkerCleanup {
+    cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    sem: Option<Arc<Semaphore>>,
+    workers: WaitGroup,
+    request_id: u64,
+}
+
+impl Drop for WorkerCleanup {
+    fn drop(&mut self) {
+        self.cancels.lock().unwrap().remove(&self.request_id);
+        if let Some(sem) = &self.sem {
+            sem.release();
+        }
+        self.workers.done();
+    }
+}
+
+/// A counting semaphore bounding a per-connection budget. Used two ways: `acquire` (blocking) for
+/// the appends/reads budget, and `try_acquire` (rejecting) for the subscriptions budget.
+struct Semaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Semaphore {
+        Semaphore {
+            // At least one, so a misconfigured zero cannot wedge the connection.
+            permits: Mutex::new(permits.max(1)),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let mut permits = self.permits.lock().unwrap();
+        while *permits == 0 {
+            permits = self.available.wait(permits).unwrap();
+        }
+        *permits -= 1;
+    }
+
+    /// Takes a permit if one is free, without blocking. Returns whether it was taken.
+    fn try_acquire(&self) -> bool {
+        let mut permits = self.permits.lock().unwrap();
+        if *permits == 0 {
+            false
+        } else {
+            *permits -= 1;
+            true
+        }
+    }
+
+    fn release(&self) {
+        *self.permits.lock().unwrap() += 1;
+        self.available.notify_one();
+    }
+}
+
+/// Tracks outstanding worker threads so teardown can wait for them without holding join
+/// handles (workers are detached; a long-lived subscription is joined via `wait` once it
+/// observes the connection is dead).
+#[derive(Clone, Default)]
+struct WaitGroup {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl WaitGroup {
+    fn add(&self) {
+        *self.inner.0.lock().unwrap() += 1;
+    }
+
+    fn done(&self) {
+        let mut count = self.inner.0.lock().unwrap();
+        *count -= 1;
+        if *count == 0 {
+            self.inner.1.notify_all();
+        }
+    }
+
+    fn wait(&self) {
+        let mut count = self.inner.0.lock().unwrap();
+        while *count > 0 {
+            count = self.inner.1.wait(count).unwrap();
+        }
+    }
 }

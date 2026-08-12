@@ -8,7 +8,7 @@ use crate::log::set::PositionRange;
 use crate::query::{AppendCondition, Query};
 use crate::read::{ReadHandle, Reads, Subscription};
 
-use super::{AppendError, Message, Request};
+use super::{AppendError, AppendReply, Message, Request};
 
 /// A cloneable, `Send` handle to the write coordinator. Every clone feeds the same
 /// single writer; dropping the last one (and the owning
@@ -49,6 +49,7 @@ impl WriteHandle {
             events,
             condition,
             reply,
+            token: 0,
         };
         // `send` on a full bounded channel blocks; an error means the coordinator is
         // gone (channel disconnected).
@@ -56,7 +57,38 @@ impl WriteHandle {
             .send(Message::Append(request))
             .map_err(|_| AppendError::Shutdown)?;
         // A dropped reply sender (coordinator died mid-flight) surfaces as shutdown.
-        response.recv().map_err(|_| AppendError::Shutdown)?
+        let (_token, result) = response.recv().map_err(|_| AppendError::Shutdown)?;
+        result
+    }
+
+    /// Submits an append without waiting for its durable reply: the outcome is delivered
+    /// later on `reply` as `(token, result)`, with `token` echoed back untouched.
+    ///
+    /// This is the non-blocking half of [`append`](Self::append), for a caller driving many
+    /// in-flight appends over one shared reply channel (each request distinguished by its
+    /// `token`). `send` still blocks if the request queue is full (backpressure). An empty
+    /// append is rejected here rather than on the writer thread, since a staged-but-empty
+    /// request would otherwise never be replied to.
+    pub fn append_submit(
+        &self,
+        events: Vec<Event>,
+        condition: Option<AppendCondition>,
+        token: u64,
+        reply: AppendReply,
+    ) -> Result<(), AppendError> {
+        if events.is_empty() {
+            return Err(AppendError::Empty);
+        }
+        let request = Request {
+            events,
+            condition,
+            reply,
+            token,
+        };
+        self.tx
+            .send(Message::Append(request))
+            .map_err(|_| AppendError::Shutdown)?;
+        Ok(())
     }
 
     /// Reads events matching `query`, ascending, strictly after `after`, up to the
@@ -100,6 +132,7 @@ impl WriteHandle {
             events,
             condition,
             reply,
+            token: 0,
         };
         // A full request queue awaits rather than blocks; an error means the coordinator
         // is gone (channel disconnected).
@@ -108,9 +141,43 @@ impl WriteHandle {
             .await
             .map_err(|_| AppendError::Shutdown)?;
         // A dropped reply sender (coordinator died mid-flight) surfaces as shutdown.
-        response
+        let (_token, result) = response
             .recv_async()
             .await
-            .map_err(|_| AppendError::Shutdown)?
+            .map_err(|_| AppendError::Shutdown)?;
+        result
+    }
+
+    /// The `async` counterpart of [`append_submit`](Self::append_submit): submits an append
+    /// without waiting for its durable reply, which is delivered later on `reply` as
+    /// `(token, result)` with `token` echoed back untouched. Unlike the blocking version, it
+    /// yields to the executor instead of blocking the thread while the request queue is full
+    /// (backpressure).
+    ///
+    /// For a caller driving many in-flight appends over one shared reply channel, each
+    /// distinguished by its `token`. An empty append is rejected here rather than on the writer
+    /// thread, since a staged-but-empty request would otherwise never be replied to.
+    #[cfg(feature = "async")]
+    pub async fn append_submit_async(
+        &self,
+        events: Vec<Event>,
+        condition: Option<AppendCondition>,
+        token: u64,
+        reply: AppendReply,
+    ) -> Result<(), AppendError> {
+        if events.is_empty() {
+            return Err(AppendError::Empty);
+        }
+        let request = Request {
+            events,
+            condition,
+            reply,
+            token,
+        };
+        self.tx
+            .send_async(Message::Append(request))
+            .await
+            .map_err(|_| AppendError::Shutdown)?;
+        Ok(())
     }
 }

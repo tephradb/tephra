@@ -223,10 +223,13 @@ impl Worker {
                 // The invariant that makes staged records unskippable by the `after`
                 // filter: a client cannot have observed a position past the durable tip.
                 if cond.after > tip {
-                    let _ = req.reply.send(Err(AppendError::AfterBeyondTip {
-                        after: cond.after,
-                        tip,
-                    }));
+                    let _ = req.reply.send((
+                        req.token,
+                        Err(AppendError::AfterBeyondTip {
+                            after: cond.after,
+                            tip,
+                        }),
+                    ));
                     continue;
                 }
                 match condition::evaluate(
@@ -239,17 +242,19 @@ impl Worker {
                     self.cfg.condition_force_scan,
                 ) {
                     Ok(Some(at)) => {
-                        let _ = req.reply.send(Err(AppendError::Conflict { at }));
+                        let _ = req
+                            .reply
+                            .send((req.token, Err(AppendError::Conflict { at })));
                         continue;
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        let _ = req.reply.send(Err(err));
+                        let _ = req.reply.send((req.token, Err(err)));
                         continue;
                     }
                 }
             }
-            batch.stage(&req.events, &req.reply);
+            batch.stage(&req.events, req.token, &req.reply);
         }
 
         if batch.is_empty() {
@@ -324,7 +329,7 @@ mod tests {
 
     use super::*;
 
-    type ReplyRx = Receiver<Result<PositionRange, AppendError>>;
+    type ReplyRx = Receiver<(u64, Result<PositionRange, AppendError>)>;
 
     const SEG_SIZE: usize = 1 << 16;
 
@@ -391,6 +396,7 @@ mod tests {
                 events,
                 condition,
                 reply,
+                token: 0,
             },
             rx,
         )
@@ -403,14 +409,14 @@ mod tests {
 
     fn assert_ok(rx: &ReplyRx) -> PositionRange {
         match rx.try_recv() {
-            Ok(Ok(range)) => range,
+            Ok((_token, Ok(range))) => range,
             other => panic!("expected Ok(range), got {other:?}"),
         }
     }
 
     fn assert_err(rx: &ReplyRx) -> AppendError {
         match rx.try_recv() {
-            Ok(Err(err)) => err,
+            Ok((_token, Err(err))) => err,
             other => panic!("expected Err, got {other:?}"),
         }
     }
@@ -449,6 +455,48 @@ mod tests {
         ));
         // Only the winner's event is durable.
         assert_eq!(w.set.last_position(), Position::new(1));
+    }
+
+    #[test]
+    fn shared_reply_attributes_results_by_token() {
+        // Two requests over one shared reply channel, one accepted and one rejected by a
+        // same-batch conflict. The rejection is sent inside the drain loop, before the
+        // acceptance replies at commit, so replies arrive out of submission order: the
+        // token is what attributes each result to its request.
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+
+        let (reply, rx) = channel::unbounded();
+        let e1 = vec![event("Reserved", &["unique:x"])];
+        let e2 = vec![event("Reserved", &["unique:x"])];
+        let r1 = Request {
+            events: e1,
+            condition: Some(guard(&["unique:x"], Position::ZERO)),
+            reply: reply.clone(),
+            token: 111,
+        };
+        let r2 = Request {
+            events: e2,
+            condition: Some(guard(&["unique:x"], Position::ZERO)),
+            reply,
+            token: 222,
+        };
+        w.process(&[r1, r2]);
+
+        // Drain both replies into a token-keyed map (arrival order is rejection-first).
+        let mut got = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let (token, res) = rx.try_recv().unwrap();
+            got.insert(token, res);
+        }
+        // r1 wins at position 1; r2 loses as a retryable same-batch conflict.
+        assert_eq!(got[&111].as_ref().unwrap().first, Position::new(1));
+        assert!(matches!(
+            got[&222].as_ref().unwrap_err(),
+            AppendError::Conflict {
+                at: ConflictSite::SameBatch
+            }
+        ));
     }
 
     #[test]
@@ -599,6 +647,7 @@ mod tests {
             events: vec![huge],
             condition: None,
             reply,
+            token: 0,
         };
         w.process(&[big]);
         assert!(matches!(assert_err(&rx_big), AppendError::TooLarge { .. }));
@@ -669,10 +718,11 @@ mod tests {
                 events: vec![ev],
                 condition,
                 reply,
+                token: 0,
             };
             w.process(&[req]);
 
-            match rx.try_recv().unwrap() {
+            match rx.try_recv().unwrap().1 {
                 Ok(range) => {
                     assert_eq!(range.first.get(), expected_last + 1);
                     expected_last = range.last.get();
@@ -810,6 +860,7 @@ mod tests {
             events: vec![big_event],
             condition: None,
             reply,
+            token: 0,
         };
         tx.send(Message::Append(r_small)).unwrap();
         tx.send(Message::Append(r_big)).unwrap();

@@ -156,6 +156,15 @@ pub struct ServerSettings {
     /// milliseconds. Keeps a subscription with no events flowing responsive to shutdown
     /// without a heartbeat frame.
     pub subscribe_wait_tick_ms: u64,
+    /// Most appends + reads a single connection may have in flight at once (backpressure and a
+    /// bound on read threads and the append-reply backlog).
+    pub max_inflight_requests_per_conn: usize,
+    /// Most live subscriptions a single connection may hold at once; one over the limit is
+    /// rejected.
+    pub max_concurrent_subscriptions: usize,
+    /// Depth of a connection's outbound frame queue (buffered response frames before a slow
+    /// client applies backpressure).
+    pub frame_queue_depth: usize,
     /// TCP keepalive idle time before the first probe on an accepted connection, in seconds.
     /// The OS default (~2h on Linux) is too long to reap a silently-dead subscription
     /// promptly.
@@ -171,6 +180,9 @@ impl Default for ServerSettings {
             read_batch_events: 1024,
             read_batch_bytes: 512 * 1024,
             subscribe_wait_tick_ms: 250,
+            max_inflight_requests_per_conn: 256,
+            max_concurrent_subscriptions: 64,
+            frame_queue_depth: 256,
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
         }
@@ -206,6 +218,9 @@ impl Settings {
             read_batch_events: self.server.read_batch_events,
             read_batch_bytes: self.server.read_batch_bytes,
             subscribe_wait_tick: Duration::from_millis(self.server.subscribe_wait_tick_ms),
+            max_inflight_requests_per_conn: self.server.max_inflight_requests_per_conn,
+            max_concurrent_subscriptions: self.server.max_concurrent_subscriptions,
+            frame_queue_depth: self.server.frame_queue_depth,
             keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
             keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
         }
@@ -227,6 +242,17 @@ impl Settings {
         // degrade silently.
         if self.server.subscribe_wait_tick_ms == 0 {
             return Err("server.subscribe_wait_tick_ms must be at least 1".to_string());
+        }
+        // A zero budget would wedge the connection (no request could ever acquire a permit); a
+        // zero frame queue is a rendezvous channel, not the intended bound. Reject both.
+        if self.server.max_inflight_requests_per_conn == 0 {
+            return Err("server.max_inflight_requests_per_conn must be at least 1".to_string());
+        }
+        if self.server.max_concurrent_subscriptions == 0 {
+            return Err("server.max_concurrent_subscriptions must be at least 1".to_string());
+        }
+        if self.server.frame_queue_depth == 0 {
+            return Err("server.frame_queue_depth must be at least 1".to_string());
         }
         if self.server.keepalive_idle_secs == 0 {
             return Err("server.keepalive_idle_secs must be at least 1".to_string());
@@ -306,6 +332,15 @@ mod tests {
             server.subscribe_wait_tick,
             server_default.subscribe_wait_tick
         );
+        assert_eq!(
+            server.max_inflight_requests_per_conn,
+            server_default.max_inflight_requests_per_conn
+        );
+        assert_eq!(
+            server.max_concurrent_subscriptions,
+            server_default.max_concurrent_subscriptions
+        );
+        assert_eq!(server.frame_queue_depth, server_default.frame_queue_depth);
         assert_eq!(server.keepalive_idle, server_default.keepalive_idle);
         assert_eq!(server.keepalive_interval, server_default.keepalive_interval);
 
@@ -370,6 +405,23 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.server.keepalive_interval_secs = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn zero_server_concurrency_counts_are_rejected() {
+        // A zero budget would wedge a connection; a zero frame queue changes channel semantics.
+        // Each must be rejected at load time rather than degrade at runtime.
+        let mut settings = Settings::default();
+        settings.server.max_inflight_requests_per_conn = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.server.max_concurrent_subscriptions = 0;
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.server.frame_queue_depth = 0;
         assert!(settings.validate().is_err());
     }
 }
