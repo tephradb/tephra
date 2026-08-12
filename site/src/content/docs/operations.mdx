@@ -41,6 +41,7 @@ read_batch_bytes = 524288           # 512 KiB
 subscribe_wait_tick_ms = 250
 max_inflight_requests_per_conn = 256 # appends + reads in flight per connection
 max_concurrent_subscriptions = 64   # live subscriptions per connection (excess is rejected)
+read_worker_threads = 0             # shared read pool size; 0 = one worker per logical CPU
 frame_queue_depth = 256             # buffered response frames before backpressure
 keepalive_idle_secs = 60
 keepalive_interval_secs = 15
@@ -100,6 +101,11 @@ slowed rather than allowed to pile up unbounded work. `frame_queue_depth` bounds
 buffered toward a slow client, applying the same backpressure to the workers producing them.
 Subscriptions are budgeted separately by `max_concurrent_subscriptions`, and one over the limit is
 rejected with an error rather than blocking the connection.
+
+Reads themselves run on a single shared, server-wide pool of reusable worker threads rather than a
+thread spawned per request, so a warm read pays no per-request thread-creation cost. `read_worker_threads`
+sets the pool size; `0` means one worker per logical CPU, which suits short, CPU-bound reads. A slow
+read still runs off the request loop, so it never blocks a connection's other in-flight requests.
 
 ## Shutdown
 

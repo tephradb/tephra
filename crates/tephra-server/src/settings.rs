@@ -162,6 +162,10 @@ pub struct ServerSettings {
     /// Most live subscriptions a single connection may hold at once; one over the limit is
     /// rejected.
     pub max_concurrent_subscriptions: usize,
+    /// Number of reusable worker threads in the shared read pool. 0 means auto: one per logical
+    /// CPU. Warm reads are short and CPU-bound, so one per core reaches the read-parallelism
+    /// ceiling; raise it for slow-client streaming-read workloads.
+    pub read_worker_threads: usize,
     /// Depth of a connection's outbound frame queue (buffered response frames before a slow
     /// client applies backpressure).
     pub frame_queue_depth: usize,
@@ -182,6 +186,7 @@ impl Default for ServerSettings {
             subscribe_wait_tick_ms: 250,
             max_inflight_requests_per_conn: 256,
             max_concurrent_subscriptions: 64,
+            read_worker_threads: 0,
             frame_queue_depth: 256,
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
@@ -220,6 +225,7 @@ impl Settings {
             subscribe_wait_tick: Duration::from_millis(self.server.subscribe_wait_tick_ms),
             max_inflight_requests_per_conn: self.server.max_inflight_requests_per_conn,
             max_concurrent_subscriptions: self.server.max_concurrent_subscriptions,
+            read_worker_threads: self.server.read_worker_threads,
             frame_queue_depth: self.server.frame_queue_depth,
             keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
             keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
@@ -339,6 +345,10 @@ mod tests {
         assert_eq!(
             server.max_concurrent_subscriptions,
             server_default.max_concurrent_subscriptions
+        );
+        assert_eq!(
+            server.read_worker_threads,
+            server_default.read_worker_threads
         );
         assert_eq!(server.frame_queue_depth, server_default.frame_queue_depth);
         assert_eq!(server.keepalive_idle, server_default.keepalive_idle);

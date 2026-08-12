@@ -4,13 +4,15 @@
 //! others, so responses for different requests can interleave and complete out of order (each
 //! frame carries its `request_id`, so the client demultiplexes). Per connection there are two
 //! fixed threads, a **reader** (this thread) and a **writer**, plus an append **completion
-//! pump**, a capped set of per-read worker threads, and one dedicated thread per subscription.
+//! pump** and one dedicated thread per subscription. Reads run on a shared, server-wide pool of
+//! reusable worker threads ([`ReadPool`]) rather than a thread spawned per request.
 //!
 //! - **Append** does no work here: [`WriteHandle::append_submit`] hands it to the single write
 //!   coordinator, and the pump turns the durable `(request_id, result)` reply into a frame. No
 //!   thread waits on an append.
-//! - **Read** runs on a worker thread (bounded by a per-connection semaphore) over a lock-free
-//!   snapshot, streaming `ReadEvents` frames then a `ReadEnd`.
+//! - **Read** is queued to the server-wide [`ReadPool`] (admission bounded by the
+//!   per-connection in-flight semaphore) and runs on a pool worker over a lock-free snapshot,
+//!   streaming `ReadEvents` frames then a `ReadEnd`.
 //! - **Subscribe** runs on its own dedicated thread until cancelled or the connection ends, so
 //!   it no longer monopolizes the connection.
 //!
@@ -21,6 +23,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -50,6 +53,7 @@ pub(crate) fn serve_connection(
     handle: WriteHandle,
     config: ServerConfig,
     running: Arc<AtomicBool>,
+    read_pool: Sender<ReadJob>,
 ) {
     let peer = stream.peer_addr().ok();
     if let Err(err) = stream.set_nodelay(true) {
@@ -110,6 +114,7 @@ pub(crate) fn serve_connection(
         workers: workers.clone(),
         inflight,
         subscriptions,
+        read_pool,
     };
 
     let mut reader = BufReader::new(read_half);
@@ -179,6 +184,8 @@ struct ConnCtx {
     inflight: Arc<Semaphore>,
     /// Rejecting budget for concurrent subscriptions.
     subscriptions: Arc<Semaphore>,
+    /// Sender into the shared, server-wide read-worker pool. Cloned per read job.
+    read_pool: Sender<ReadJob>,
 }
 
 impl ConnCtx {
@@ -266,8 +273,9 @@ fn handle_append(
     }
 }
 
-/// Validates the query, then spawns a worker to stream the read. Acquiring an in-flight permit
-/// here (shared with appends) caps read worker threads and applies backpressure to the reader.
+/// Validates the query, then queues the read onto the shared read pool. Acquiring an in-flight
+/// permit here (shared with appends) bounds a connection's outstanding reads and applies
+/// backpressure to the reader before the job is enqueued.
 fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
     let query = match convert::query_from_proto(read.query()) {
         Ok(query) => query,
@@ -292,20 +300,20 @@ fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
         workers: conn.workers.clone(),
         request_id,
     };
-    let conn_owned = conn.clone();
-    if let Err(err) = thread::Builder::new()
-        .name("tephra-conn-read".to_string())
-        .spawn(move || {
-            let _cleanup = cleanup;
-            run_read(request_id, query, after, limit, &conn_owned, &cancel);
-        })
-    {
-        tracing::warn!(%err, "failed to spawn read worker");
-        // `cleanup` dropped with the failed closure, releasing its permit/worker/cancel.
-        let _ = conn.out_tx.send(make_response(
-            request_id,
-            ResponseKind::Error(convert::bad_request("server could not start the read")),
-        ));
+    let job = ReadJob {
+        request_id,
+        query,
+        after,
+        limit,
+        conn: conn.clone(),
+        cancel,
+        cleanup,
+    };
+    if conn.read_pool.send(job).is_err() {
+        // The pool is gone, which only happens once the server is shutting down. The job (and
+        // with it `WorkerCleanup`) is dropped by the failed send, releasing its permit/worker/
+        // cancel. No error frame: teardown is already underway.
+        tracing::debug!(request_id, "read pool closed; dropping read");
     }
 }
 
@@ -623,6 +631,92 @@ fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
         ResponseKind::Error(error) => response.set_error(error),
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// Read-worker pool
+// ---------------------------------------------------------------------------
+
+/// One queued read, carrying everything [`run_read`] needs so a pool worker can run it without
+/// borrowing the connection. The `WorkerCleanup` guard rides along and drops when the job
+/// finishes (or if a worker unwinds), releasing the in-flight permit, the cancel entry, and the
+/// worker count exactly once.
+pub(crate) struct ReadJob {
+    request_id: u64,
+    query: Query,
+    after: Position,
+    limit: Option<u64>,
+    conn: ConnCtx,
+    cancel: Arc<AtomicBool>,
+    cleanup: WorkerCleanup,
+}
+
+impl ReadJob {
+    fn run(self) {
+        let ReadJob {
+            request_id,
+            query,
+            after,
+            limit,
+            conn,
+            cancel,
+            cleanup,
+        } = self;
+        run_read(request_id, query, after, limit, &conn, &cancel);
+        // Release the permit/cancel/worker only once the read's frames are all queued.
+        drop(cleanup);
+    }
+}
+
+/// A shared, server-wide pool of reusable worker threads that stream reads. Created once at
+/// startup, so a read pays no per-request thread-creation cost. One unbounded MPMC channel feeds
+/// all workers: a sent [`ReadJob`] wakes whichever worker is idle, which runs it to completion
+/// and returns for the next (the reads themselves, not the queue, are the bottleneck; the
+/// per-connection in-flight budget already bounds how many jobs can be outstanding). Subscriptions
+/// keep their own dedicated threads and never use this pool.
+pub(crate) struct ReadPool {
+    tx: Sender<ReadJob>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ReadPool {
+    /// Spawns `size` (at least one) reusable worker threads reading jobs off a shared queue.
+    pub(crate) fn new(size: usize) -> ReadPool {
+        let size = size.max(1);
+        let (tx, rx) = flume::unbounded::<ReadJob>();
+        let mut workers = Vec::with_capacity(size);
+        for _ in 0..size {
+            let rx = rx.clone();
+            let worker = thread::Builder::new()
+                .name("tephra-read-worker".to_string())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        // Isolate a panic in one read so a single bad request cannot tear down a
+                        // permanent worker and shrink the pool. `WorkerCleanup` lives inside the
+                        // job, so it still drops during the unwind.
+                        let _ = std::panic::catch_unwind(AssertUnwindSafe(move || job.run()));
+                    }
+                })
+                .expect("spawn read worker thread");
+            workers.push(worker);
+        }
+        ReadPool { tx, workers }
+    }
+
+    /// A sender a connection clones into its [`ConnCtx`] to enqueue reads.
+    pub(crate) fn sender(&self) -> Sender<ReadJob> {
+        self.tx.clone()
+    }
+
+    /// Drops the pool's own sender and joins the workers. Once every connection (and so every
+    /// cloned sender) is gone, the channel disconnects and each worker's `recv` returns `Err`,
+    /// ending its loop.
+    pub(crate) fn shutdown(self) {
+        drop(self.tx);
+        for worker in self.workers {
+            let _ = worker.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,10 @@ subscribe_wait_tick_ms = 250
 max_inflight_requests_per_conn = 256
 # Most live subscriptions a single connection may hold at once; one over the limit is rejected.
 max_concurrent_subscriptions = 64
+# Reusable worker threads in the shared read pool. 0 = auto (one per logical CPU). Warm reads are
+# short and CPU-bound, so one per core reaches the read-parallelism ceiling; raise it for
+# slow-client streaming-read workloads.
+read_worker_threads = 0
 # Depth of a connection's outbound frame queue (buffered response frames before backpressure).
 frame_queue_depth = 256
 # TCP keepalive idle time before the first probe on an accepted connection, in seconds. The OS
