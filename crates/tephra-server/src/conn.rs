@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -87,7 +87,7 @@ pub(crate) fn serve_connection(
         let max = config.max_frame_len;
         thread::Builder::new()
             .name("tephra-conn-writer".to_string())
-            .spawn(move || writer_loop(write_half, out_rx, shutdown, alive, max))
+            .spawn(move || writer_loop(write_half, out_rx, shutdown, alive, max, peer))
             .expect("spawn connection writer thread")
     };
 
@@ -116,7 +116,11 @@ pub(crate) fn serve_connection(
     loop {
         let request = match read_frame::<pb::Request, _>(&mut reader, config.max_frame_len) {
             Ok(Some(request)) => request,
-            Ok(None) => break, // clean close at a frame boundary
+            Ok(None) => {
+                // Clean close at a frame boundary (the peer closed between frames).
+                tracing::debug!(?peer, "connection closed by peer at a frame boundary");
+                break;
+            }
             Err(err) => {
                 // Name the failure to the client when the frame boundary allows it. The frame
                 // never decoded, so its id is unknown and reported as 0.
@@ -128,7 +132,16 @@ pub(crate) fn serve_connection(
                 if let Some(error) = error {
                     let _ = out_tx.send(make_response(0, ResponseKind::Error(error)));
                 }
-                tracing::debug!(?peer, %err, "connection read ended");
+                // A transport error (reset, broken pipe, torn frame) is not an orderly close;
+                // surface it so a load-induced drop is not silent. A plain end-of-stream still
+                // arrives as `Ok(None)` above, so this only fires on a genuine failure.
+                if alive.load(Ordering::Acquire) {
+                    tracing::warn!(?peer, %err, "closing connection: reader failed");
+                } else {
+                    // The writer already marked the connection dead (its own transport error, or
+                    // teardown), so this read error is just the reader observing that.
+                    tracing::debug!(?peer, %err, "reader ended after the connection was closed");
+                }
                 break;
             }
         };
@@ -522,20 +535,34 @@ fn writer_loop(
     shutdown: Option<TcpStream>,
     alive: Arc<AtomicBool>,
     max_frame_len: u32,
+    peer: Option<SocketAddr>,
 ) {
     let mut writer = BufWriter::new(write_half);
-    'outer: while let Ok(response) = out_rx.recv() {
-        if write_frame(&mut writer, &response, max_frame_len).is_err() {
-            break;
+    let outcome = 'outer: loop {
+        let Ok(response) = out_rx.recv() else {
+            // The channel closed: every producer is gone (orderly teardown). Not a failure.
+            break Ok(());
+        };
+        if let Err(err) = write_frame(&mut writer, &response, max_frame_len) {
+            break Err(err);
         }
         // Write anything already queued before paying for a flush.
         while let Ok(response) = out_rx.try_recv() {
-            if write_frame(&mut writer, &response, max_frame_len).is_err() {
-                break 'outer;
+            if let Err(err) = write_frame(&mut writer, &response, max_frame_len) {
+                break 'outer Err(err);
             }
         }
-        if writer.flush().is_err() {
-            break;
+        if let Err(err) = writer.flush() {
+            break Err(FrameError::Io(err));
+        }
+    };
+    // A write failure closes the connection under the client; name it so the drop is not silent.
+    // `alive` was still set here means the writer is the half that observed the failure first.
+    if let Err(err) = outcome {
+        if alive.load(Ordering::Acquire) {
+            tracing::warn!(?peer, %err, "closing connection: writer failed");
+        } else {
+            tracing::debug!(?peer, %err, "writer ended after the connection was closed");
         }
     }
     // Any exit means the output side is done: mark dead and wake the rest of the connection.

@@ -36,7 +36,7 @@ use futures_core::Stream;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_stream::StreamExt;
 
 use tephra_proto::convert as wire;
@@ -58,6 +58,14 @@ pub struct AsyncClientConfig {
     /// Depth of the outbound request queue. Once full, `append`/`read`/`subscribe` await room to
     /// send (backpressure), bounding how far a fast producer can outrun a slow socket.
     pub request_queue_depth: usize,
+    /// Most requests that may be outstanding (sent but not yet fully answered) at once on this
+    /// connection. A permit is taken before a request goes on the wire and released when its
+    /// reply arrives, the stream ends, or it is cancelled; when the limit is reached,
+    /// `append`/`read`/`subscribe` await a free permit (backpressure). This caps the unacked
+    /// backlog a fast producer can build up, so a flood applies backpressure end to end instead
+    /// of outrunning the connection. Many requests still run concurrently; only the total in
+    /// flight is bounded.
+    pub max_inflight_requests: usize,
 }
 
 impl Default for AsyncClientConfig {
@@ -65,15 +73,19 @@ impl Default for AsyncClientConfig {
         AsyncClientConfig {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             request_queue_depth: 256,
+            max_inflight_requests: 1024,
         }
     }
 }
 
-/// The connection actor's shared state: the id allocator and the registry mapping each in-flight
-/// `request_id` to the sink awaiting its response.
+/// The connection actor's shared state: the id allocator, the outstanding-request budget, and
+/// the registry mapping each in-flight `request_id` to the sink awaiting its response.
 struct Shared {
     next_id: AtomicU64,
-    requests: Mutex<HashMap<u64, Sink>>,
+    requests: Mutex<HashMap<u64, Registered>>,
+    /// Bounds outstanding (sent-but-unanswered) requests. A permit lives inside each
+    /// [`Registered`] entry, so it is released exactly when the request is finalized.
+    inflight: Arc<Semaphore>,
     max_frame_len: u32,
 }
 
@@ -81,6 +93,17 @@ impl Shared {
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+/// A registered in-flight request: the sink awaiting its response, plus the permit from the
+/// outstanding-request budget. The permit is released when this entry is dropped, which happens
+/// exactly once per request: when its terminal response is routed, when its stream is dropped or
+/// cancelled (the stream's `Drop` removes the entry), or when the connection fails and
+/// [`fail_all`] drains the registry. A streaming read/subscribe re-registers the same entry
+/// while it continues, so it holds its single permit for its whole life.
+struct Registered {
+    sink: Sink,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Where the reader task delivers a response for a given request.
@@ -129,6 +152,7 @@ impl AsyncClient {
             // Ids start at 1 so 0 stays reserved as the unattributed-error sentinel.
             next_id: AtomicU64::new(1),
             requests: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Semaphore::new(config.max_inflight_requests.max(1))),
             max_frame_len: config.max_frame_len,
         });
 
@@ -138,8 +162,20 @@ impl AsyncClient {
         Ok(AsyncClient { shared, out_tx })
     }
 
+    /// Acquires a permit from the outstanding-request budget, awaiting when the client is at its
+    /// in-flight limit (backpressure). The permit is held inside the request's [`Registered`]
+    /// entry for its whole life and released when that entry is dropped.
+    async fn acquire_inflight(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.shared.inflight)
+            .acquire_owned()
+            .await
+            // The semaphore is never closed, so acquisition cannot fail.
+            .expect("inflight semaphore is never closed")
+    }
+
     /// Appends `events` as one atomic batch, optionally guarded by `condition`, resolving to the
-    /// position range the batch was assigned. Many appends may be awaited concurrently.
+    /// position range the batch was assigned. Many appends may be awaited concurrently, bounded
+    /// by [`AsyncClientConfig::max_inflight_requests`].
     pub async fn append(
         &self,
         events: impl IntoIterator<Item = Event>,
@@ -157,12 +193,17 @@ impl AsyncClient {
         request.set_request_id(id);
         request.set_append(append);
 
+        // Take an outstanding-request permit before the request goes on the wire (backpressure at
+        // the in-flight limit); it rides in the registry entry and frees when the reply is routed.
+        let _permit = self.acquire_inflight().await;
         let (tx, rx) = oneshot::channel();
-        self.shared
-            .requests
-            .lock()
-            .unwrap()
-            .insert(id, Sink::Append(tx));
+        self.shared.requests.lock().unwrap().insert(
+            id,
+            Registered {
+                sink: Sink::Append(tx),
+                _permit,
+            },
+        );
         // Await room in the outbound queue (backpressure). An error means the writer task is gone.
         if self.out_tx.send(request).await.is_err() {
             self.shared.requests.lock().unwrap().remove(&id);
@@ -193,14 +234,21 @@ impl AsyncClient {
         request.set_request_id(id);
         request.set_read(read);
 
+        let _permit = self.acquire_inflight().await;
         let (tx, rx) = mpsc::unbounded_channel();
-        self.shared
-            .requests
-            .lock()
-            .unwrap()
-            .insert(id, Sink::Read(tx));
+        self.shared.requests.lock().unwrap().insert(
+            id,
+            Registered {
+                sink: Sink::Read(tx),
+                _permit,
+            },
+        );
         if self.out_tx.send(request).await.is_err() {
-            if let Some(Sink::Read(tx)) = self.shared.requests.lock().unwrap().remove(&id) {
+            if let Some(Registered {
+                sink: Sink::Read(tx),
+                ..
+            }) = self.shared.requests.lock().unwrap().remove(&id)
+            {
                 let _ = tx.send(ReadItem::Err(ClientError::UnexpectedEof));
             }
         }
@@ -247,14 +295,21 @@ impl AsyncClient {
         request.set_request_id(id);
         request.set_subscribe(subscribe);
 
+        let _permit = self.acquire_inflight().await;
         let (tx, rx) = mpsc::unbounded_channel();
-        self.shared
-            .requests
-            .lock()
-            .unwrap()
-            .insert(id, Sink::Subscribe(tx));
+        self.shared.requests.lock().unwrap().insert(
+            id,
+            Registered {
+                sink: Sink::Subscribe(tx),
+                _permit,
+            },
+        );
         if self.out_tx.send(request).await.is_err() {
-            if let Some(Sink::Subscribe(tx)) = self.shared.requests.lock().unwrap().remove(&id) {
+            if let Some(Registered {
+                sink: Sink::Subscribe(tx),
+                ..
+            }) = self.shared.requests.lock().unwrap().remove(&id)
+            {
                 let _ = tx.send(Err(ClientError::UnexpectedEof));
             }
         }
@@ -344,7 +399,7 @@ async fn reader_task(mut read_half: OwnedReadHalf, shared: Arc<Shared>) {
 fn route(response: pb::Response, shared: &Shared) {
     let id = response.request_id();
     let mut map = shared.requests.lock().unwrap();
-    let Some(sink) = map.remove(&id) else {
+    let Some(Registered { sink, _permit }) = map.remove(&id) else {
         return;
     };
     match sink {
@@ -360,15 +415,30 @@ fn route(response: pb::Response, shared: &Shared) {
                 ))),
             };
             let _ = tx.send(result);
+            // `_permit` drops here: the append is answered.
         }
         Sink::Read(tx) => {
+            // Re-register (carrying the same permit) while the read continues; a terminal frame
+            // leaves it removed, dropping the permit.
             if deliver_read(&tx, response) {
-                map.insert(id, Sink::Read(tx));
+                map.insert(
+                    id,
+                    Registered {
+                        sink: Sink::Read(tx),
+                        _permit,
+                    },
+                );
             }
         }
         Sink::Subscribe(tx) => {
             if deliver_subscribe(&tx, response) {
-                map.insert(id, Sink::Subscribe(tx));
+                map.insert(
+                    id,
+                    Registered {
+                        sink: Sink::Subscribe(tx),
+                        _permit,
+                    },
+                );
             }
         }
     }
@@ -453,7 +523,8 @@ fn deliver_subscribe(
 /// return an error rather than hang.
 fn fail_all(shared: &Shared, reason: &str) {
     let mut map = shared.requests.lock().unwrap();
-    for (_id, sink) in map.drain() {
+    // Draining drops each entry's permit as it is handled, freeing the whole in-flight budget.
+    for (_id, Registered { sink, _permit }) in map.drain() {
         match sink {
             Sink::Append(tx) => {
                 let _ = tx.send(Err(ClientError::Protocol(reason.to_string())));

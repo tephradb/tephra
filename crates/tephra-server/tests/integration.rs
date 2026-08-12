@@ -12,8 +12,8 @@ use tephra::writer::{WriteCoordinator, WriterConfig};
 
 use tempfile::TempDir;
 use tephra_client::{
-    AppendCondition, AsyncClient, Client, ClientError, ErrorCode, Event, Position, Query,
-    QueryItem, SequencedEvent, SubEvent, Tag, Tags,
+    AppendCondition, AsyncClient, AsyncClientConfig, Client, ClientError, ErrorCode, Event,
+    Position, Query, QueryItem, SequencedEvent, SubEvent, Tag, Tags,
 };
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame, tephra as pb, write_frame};
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
@@ -1122,4 +1122,227 @@ fn subscription_budget_rejects_excess_subscriptions() {
     }
     assert_eq!(caught_up, 2, "two subscriptions were accepted");
     assert_eq!(rejected, 1, "the third was rejected");
+}
+
+// A raw client that pipelines a flood of batch-1 append requests over each socket while draining
+// the responses concurrently on a second thread (like a real pipelining client). This is the
+// reporter's scenario without the AsyncClient's built-in flow control: many concurrent in-flight
+// appends per socket, across many sockets, at maximum rate. The server must backpressure via the
+// socket (blocking the writer when its queue is full), never close the connection. A write error
+// or a short read of responses means the server dropped the connection, which is the bug.
+#[test]
+fn raw_pipelined_append_flood_is_backpressured_not_dropped() {
+    let ts = TestServer::start();
+
+    const CONNS: usize = 16;
+    const APPENDS_PER_CONN: usize = 20_000;
+
+    // One prebuilt append frame reused for every request.
+    let frame = {
+        let mut append = pb::AppendRequest::new();
+        let mut pe = pb::Event::new();
+        pe.set_type("E".to_string());
+        pe.tags_mut().push("k:1".to_string());
+        pe.set_payload(b"payload".to_vec());
+        append.events_mut().push(pe);
+        let mut request = pb::Request::new();
+        request.set_request_id(1);
+        request.set_append(append);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &request, DEFAULT_MAX_FRAME_LEN).unwrap();
+        buf
+    };
+
+    let addr = ts.addr;
+    let mut conns = Vec::new();
+    for _ in 0..CONNS {
+        let frame = frame.clone();
+        conns.push(thread::spawn(move || -> Result<(), String> {
+            let stream = TcpStream::connect(addr).map_err(|err| format!("connect: {err}"))?;
+            stream.set_nodelay(true).ok();
+            let reader_stream = stream.try_clone().map_err(|err| format!("clone: {err}"))?;
+
+            // Drain responses concurrently so the socket never wedges: a well-behaved pipelining
+            // client always reads. Count the append acknowledgements it sees.
+            let reader = thread::spawn(move || -> Result<usize, String> {
+                let mut reader = BufReader::new(reader_stream);
+                let mut acked = 0usize;
+                while acked < APPENDS_PER_CONN {
+                    match read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN) {
+                        Ok(Some(resp)) => match resp.kind() {
+                            pb::response::KindOneof::Append(_) => acked += 1,
+                            pb::response::KindOneof::Error(err) => {
+                                return Err(format!("server error frame: {}", err.message()));
+                            }
+                            other => return Err(format!("unexpected frame: {other:?}")),
+                        },
+                        Ok(None) => {
+                            return Err(format!("server closed after {acked} acks"));
+                        }
+                        Err(err) => return Err(format!("read failed after {acked} acks: {err}")),
+                    }
+                }
+                Ok(acked)
+            });
+
+            let mut writer = BufWriter::new(stream);
+            for _ in 0..APPENDS_PER_CONN {
+                writer
+                    .write_all(&frame)
+                    .map_err(|err| format!("write: {err}"))?;
+            }
+            writer.flush().map_err(|err| format!("flush: {err}"))?;
+
+            let acked = reader.join().unwrap()?;
+            if acked != APPENDS_PER_CONN {
+                return Err(format!("only {acked} of {APPENDS_PER_CONN} appends acked"));
+            }
+            Ok(())
+        }));
+    }
+
+    let mut drops = Vec::new();
+    for conn in conns {
+        if let Err(err) = conn.join().unwrap() {
+            drops.push(err);
+        }
+    }
+    assert!(
+        drops.is_empty(),
+        "the server dropped {} of {CONNS} pipelining connections instead of backpressuring: {drops:?}",
+        drops.len()
+    );
+}
+
+// The failure mode the in-flight bound fixes: N workers each keeping K appends outstanding over
+// a pool of AsyncClients, flooding batch-1 appends as fast as they can. Each client is given a
+// deliberately small `max_inflight_requests` so the client's own outstanding-request budget (not
+// the socket) is the binding constraint: a worker wanting K > that budget makes the client
+// backpressure (await a free permit) rather than pile up an unbounded unacked backlog. The whole
+// flood must complete with zero connection drops, and every append must be acked exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_inflight_flood_backpressures_without_dropping() {
+    let ts = TestServer::start();
+
+    const CONNS: usize = 16;
+    const WORKERS: usize = 32;
+    const OUTSTANDING: usize = 64; // appends each worker keeps in flight at once
+    const APPENDS_PER_WORKER: usize = 2000;
+
+    // A small per-connection in-flight bound, far below what the workers try to keep outstanding,
+    // so the client's semaphore is exercised as backpressure under the flood.
+    let config = AsyncClientConfig {
+        max_inflight_requests: 16,
+        ..AsyncClientConfig::default()
+    };
+    let mut pool = Vec::with_capacity(CONNS);
+    for _ in 0..CONNS {
+        pool.push(AsyncClient::connect_with(ts.addr, config).await.unwrap());
+    }
+    let pool = std::sync::Arc::new(pool);
+
+    let mut workers = tokio::task::JoinSet::new();
+    for w in 0..WORKERS {
+        let pool = std::sync::Arc::clone(&pool);
+        workers.spawn(async move {
+            // Keep OUTSTANDING appends in flight at all times until the quota is met.
+            let mut inflight = tokio::task::JoinSet::new();
+            let mut launched = 0usize;
+            let mut failures = 0usize;
+            let mut sample_err = None;
+            while launched < APPENDS_PER_WORKER || !inflight.is_empty() {
+                while launched < APPENDS_PER_WORKER && inflight.len() < OUTSTANDING {
+                    let client = pool[(w + launched) % CONNS].clone();
+                    inflight.spawn(async move {
+                        client
+                            .append([ev("E", &["k:1"], b"p")], None)
+                            .await
+                            .map(|_| ())
+                            .map_err(|err| err.to_string())
+                    });
+                    launched += 1;
+                }
+                if let Some(joined) = inflight.join_next().await
+                    && let Err(err) = joined.unwrap()
+                {
+                    failures += 1;
+                    if sample_err.is_none() {
+                        sample_err = Some(err);
+                    }
+                }
+            }
+            (failures, sample_err)
+        });
+    }
+
+    let mut total_failures = 0usize;
+    let mut sample_err = None;
+    while let Some(joined) = workers.join_next().await {
+        let (failures, err) = joined.unwrap();
+        total_failures += failures;
+        if sample_err.is_none() {
+            sample_err = err;
+        }
+    }
+    assert_eq!(
+        total_failures, 0,
+        "the bounded flood dropped {total_failures} appends; sample error: {sample_err:?}"
+    );
+}
+
+// Reproduces the high-concurrency write flood: a pool of connections with worker appends
+// round-robined across them, each socket carrying many concurrent pipelined batch-1 appends
+// with no in-flight limit. Under the bug the server drops connections instead of applying
+// backpressure, so every append that lands on a dropped socket fails. This asserts zero
+// failures across the whole flood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_flood_over_a_connection_pool_never_drops() {
+    // Tiny per-connection queues so any path that errors-instead-of-blocks trips fast, and few
+    // runtime threads so the client's own reader task must contend with the flooding workers.
+    let server_config = ServerConfig {
+        max_inflight_requests_per_conn: 8,
+        frame_queue_depth: 8,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    const CONNS: usize = 16;
+    const TOTAL_APPENDS: usize = 200_000;
+
+    let mut pool = Vec::with_capacity(CONNS);
+    for _ in 0..CONNS {
+        pool.push(AsyncClient::connect(ts.addr).await.unwrap());
+    }
+    let pool = std::sync::Arc::new(pool);
+
+    // No in-flight limit: fire every append as its own task, round-robined across the pool, so
+    // each socket carries a huge number of concurrent pipelined appends at once.
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..TOTAL_APPENDS {
+        let pool = std::sync::Arc::clone(&pool);
+        set.spawn(async move {
+            let client = &pool[i % CONNS];
+            client
+                .append([ev("E", &["k:1"], b"p")], None)
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        });
+    }
+
+    let mut total_failures = 0usize;
+    let mut sample_err = None;
+    while let Some(joined) = set.join_next().await {
+        if let Err(err) = joined.unwrap() {
+            total_failures += 1;
+            if sample_err.is_none() {
+                sample_err = Some(err);
+            }
+        }
+    }
+
+    assert_eq!(
+        total_failures, 0,
+        "the write flood dropped {total_failures} appends; sample error: {sample_err:?}"
+    );
 }

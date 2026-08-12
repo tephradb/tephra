@@ -49,7 +49,8 @@ pub use tephra_proto::tephra as proto;
 mod asynchronous;
 #[cfg(feature = "async")]
 pub use asynchronous::{
-    AsyncClient, ReadStream as AsyncReadStream, SubscribeStream as AsyncSubscribeStream,
+    AsyncClient, AsyncClientConfig, ReadStream as AsyncReadStream,
+    SubscribeStream as AsyncSubscribeStream,
 };
 
 /// The request id the server uses for an error it cannot attribute to a specific request (an
