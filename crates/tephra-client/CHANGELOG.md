@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/tqwewe/tephra/compare/tephra-client-v0.2.0...tephra-client-v0.2.1) - 2026-08-12
+
+### Fixed
+
+- bound outstanding AsyncClient requests and log connection-close paths
+
 ## [0.2.0](https://github.com/tqwewe/tephra/compare/tephra-client-v0.1.1...tephra-client-v0.2.0) - 2026-08-12
 
 ### Added
