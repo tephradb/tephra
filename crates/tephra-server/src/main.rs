@@ -14,7 +14,9 @@
 mod settings;
 
 use std::error::Error;
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tephra::log::set::SegmentSet;
 use tephra::writer::WriteCoordinator;
@@ -22,6 +24,10 @@ use tephra_server::Server;
 use tracing_subscriber::EnvFilter;
 
 use settings::{Args, Settings};
+
+/// Exit code used when a second shutdown signal forces an immediate exit, bypassing the
+/// graceful path. Matches the conventional 128 + SIGTERM(15) for a termination by signal.
+const EXIT_FORCED: i32 = 143;
 
 fn main() -> ExitCode {
     let args: Args = argh::from_env();
@@ -81,10 +87,18 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
     let server = Server::bind(&settings.bind, handle, settings.server_config())?;
     let shutdown = server.shutdown_handle();
 
-    // Ctrl-C triggers a graceful shutdown: the accept loop stops and in-flight connections
-    // are unblocked, so `run` returns and the writer is joined below.
+    // SIGINT (Ctrl-C) and SIGTERM (the signal `docker stop`, systemd, and Kubernetes send)
+    // both trigger a graceful shutdown: the accept loop stops and in-flight connections are
+    // unblocked, so `run` returns and the writer is joined below, flushing and closing the log
+    // cleanly. A second signal means an operator gave up waiting on a stuck shutdown, so it
+    // force-exits immediately rather than being swallowed like the process default would.
+    let signalled = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler(move || {
-        tracing::info!("received interrupt, shutting down");
+        if signalled.swap(true, Ordering::SeqCst) {
+            tracing::warn!("received second signal, exiting immediately");
+            process::exit(EXIT_FORCED);
+        }
+        tracing::info!("received shutdown signal, shutting down");
         shutdown.shutdown();
     })?;
 

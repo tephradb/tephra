@@ -31,7 +31,7 @@ tephra-types = { path = "crates/tephra-types", version = "0.1.1" }
 argh = "0.1"
 config = { version = "0.15", default-features = false }
 crc32fast = "1.5"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 dashmap = "6"
 flume = { version = "0.12", default-features = false }
 fst = { version = "0.4.7", default-features = false }
