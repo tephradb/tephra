@@ -758,6 +758,19 @@ fn append_frame(request_id: u64, ty: &str, tag: &str) -> pb::Request {
     request
 }
 
+/// Builds a catch-all read request frame resuming after `after`.
+fn read_all_frame(request_id: u64, after: u64) -> pb::Request {
+    let mut query = pb::Query::new();
+    query.set_all(true);
+    let mut read = pb::ReadRequest::new();
+    read.set_query(query);
+    read.set_after(after);
+    let mut request = pb::Request::new();
+    request.set_request_id(request_id);
+    request.set_read(read);
+    request
+}
+
 /// Builds a catch-all subscribe request frame resuming after `after`.
 fn subscribe_all_frame(request_id: u64, after: u64) -> pb::Request {
     let mut query = pb::Query::new();
@@ -810,6 +823,107 @@ fn pipelined_appends_all_succeed_with_dense_positions() {
     // order, so id k lands at position k, dense and unique.
     for id in 1..=n {
         assert_eq!(positions.get(&id), Some(&(id, id)), "append {id} position");
+    }
+}
+
+#[test]
+fn teardown_with_reads_in_flight_keeps_the_pool_healthy() {
+    // A connection dying mid-read must stop its pooled read (not wedge a shared worker) and leave
+    // other connections' reads correct. Droppers on raw sockets start a full streamed read, read
+    // a few frames, then hard-close mid-stream; concurrent blocking clients read the whole corpus
+    // and must always get complete, gap-free results. One event per frame keeps a read genuinely
+    // in flight after only a few frames are consumed.
+    let server_config = ServerConfig {
+        read_batch_events: 1,
+        read_batch_bytes: 1,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+    let corpus = 300u64;
+    {
+        let mut client = ts.client();
+        for i in 0..corpus {
+            client
+                .append([ev("E", &[&format!("k:{i}")], b"p")], None)
+                .unwrap();
+        }
+    }
+    let addr = ts.addr;
+    let mut handles = Vec::new();
+
+    // Droppers: open a raw read, consume a few frames, then drop the socket (hard close) mid-stream.
+    for _ in 0..8 {
+        handles.push(thread::spawn(move || {
+            for _ in 0..10 {
+                let stream = TcpStream::connect(addr).unwrap();
+                stream.set_nodelay(true).unwrap();
+                let mut writer = BufWriter::new(stream.try_clone().unwrap());
+                write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+                writer.flush().unwrap();
+                let mut reader = BufReader::new(stream);
+                for _ in 0..3 {
+                    let _ = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN);
+                }
+                // `reader` and `writer` drop here, hard-closing the socket with the read in flight.
+            }
+        }));
+    }
+
+    // Survivors: full reads that must always return the complete, gap-free corpus.
+    for _ in 0..8 {
+        handles.push(thread::spawn(move || {
+            let mut client = Client::connect(addr).unwrap();
+            for _ in 0..10 {
+                let (events, watermark) =
+                    client.read_all(Query::all(), Position::ZERO, None).unwrap();
+                assert_eq!(watermark.get(), corpus);
+                assert_eq!(positions(&events), (1..=corpus).collect::<Vec<_>>());
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+#[test]
+fn concurrent_reads_across_connections_return_correct_results() {
+    // Many connections hammering small reads through the shared pool must all get correct results,
+    // a functional guard that pooling never reorders or drops a request's frames. Mirrors the
+    // warm, small, high-concurrency read shape the pool is meant to serve.
+    let ts = TestServer::start();
+    let corpus = 100u64;
+    {
+        let mut client = ts.client();
+        for i in 0..corpus {
+            client
+                .append([ev("E", &["k:same"], format!("e{i}").as_bytes())], None)
+                .unwrap();
+        }
+    }
+    let addr = ts.addr;
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        handles.push(thread::spawn(move || {
+            let mut client = Client::connect(addr).unwrap();
+            for _ in 0..50 {
+                // First page, then the next, both exact and gap-free.
+                let (page, _) = client
+                    .read_all(tag_query(&["k:same"]), Position::ZERO, Some(10))
+                    .unwrap();
+                assert_eq!(positions(&page), (1..=10).collect::<Vec<_>>());
+                let after = page.last().unwrap().position();
+                let (rest, watermark) = client
+                    .read_all(tag_query(&["k:same"]), after, Some(10))
+                    .unwrap();
+                assert_eq!(positions(&rest), (11..=20).collect::<Vec<_>>());
+                assert_eq!(watermark.get(), corpus);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
     }
 }
 
@@ -1052,6 +1166,46 @@ async fn async_client_subscribe_coexists_with_append() {
             SubEvent::CaughtUp(_) => {}
         }
     }
+}
+
+#[tokio::test]
+async fn async_cancelling_an_in_flight_read_frees_the_connection() {
+    // One event per frame keeps a large read in flight on a pool worker after the client pulls a
+    // single event. Dropping the stream sends a CancelRequest; the pooled read must stop promptly
+    // and the multiplexed connection must keep serving.
+    let server_config = ServerConfig {
+        read_batch_events: 1,
+        read_batch_bytes: 1,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+    for i in 0..200u64 {
+        client
+            .append([ev("E", &[&format!("k:{i}")], b"p")], None)
+            .await
+            .unwrap();
+    }
+
+    {
+        let mut stream = client.read(Query::all(), Position::ZERO, None).await;
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.position(), Position::new(1));
+        // `stream` drops here mid-read, cancelling the in-flight read on its pool worker.
+    }
+
+    // The connection still serves a fresh append and a full read.
+    let range = client
+        .append([ev("E", &["k:done"], b"p")], None)
+        .await
+        .unwrap();
+    assert_eq!(range.first, Position::new(201));
+    let (events, watermark) = client
+        .read_all(Query::all(), Position::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(watermark, Position::new(201));
+    assert_eq!(events.len(), 201);
 }
 
 #[tokio::test]

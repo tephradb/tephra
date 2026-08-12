@@ -65,6 +65,12 @@ pub struct ServerConfig {
     /// limit is rejected with an error (rather than blocking the reader, since a long-lived
     /// subscription's permit could only be freed by a cancel the blocked reader could not read).
     pub max_concurrent_subscriptions: usize,
+    /// Number of reusable worker threads in the shared, server-wide pool that streams reads.
+    /// `0` means auto: one worker per logical CPU ([`std::thread::available_parallelism`]).
+    /// Warm reads are short and CPU-bound, so one worker per core reaches the read-parallelism
+    /// ceiling without oversubscription; raise it for deployments dominated by slow-client
+    /// streaming reads, where workers can park on a backpressured send.
+    pub read_worker_threads: usize,
     /// Depth of a connection's outbound frame queue. Bounds buffered response frames, so a slow
     /// client applies backpressure to the workers producing them.
     pub frame_queue_depth: usize,
@@ -85,6 +91,7 @@ impl Default for ServerConfig {
             subscribe_wait_tick: Duration::from_millis(250),
             max_inflight_requests_per_conn: 256,
             max_concurrent_subscriptions: 64,
+            read_worker_threads: 0,
             frame_queue_depth: 256,
             keepalive_idle: Duration::from_secs(60),
             keepalive_interval: Duration::from_secs(15),
@@ -192,6 +199,19 @@ impl Server {
         let next_id = AtomicU64::new(0);
         let mut threads = Vec::new();
 
+        // One shared, server-wide pool of reusable worker threads streams every connection's
+        // reads, so a read pays no per-request thread-creation cost. `0` means one worker per
+        // logical CPU.
+        let read_workers = if self.config.read_worker_threads != 0 {
+            self.config.read_worker_threads
+        } else {
+            thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        };
+        let read_pool = conn::ReadPool::new(read_workers);
+        tracing::info!(read_workers, "read worker pool started");
+
         for stream in self.listener.incoming() {
             if !self.running.load(Ordering::Acquire) {
                 break;
@@ -239,10 +259,11 @@ impl Server {
             // subscription's bounded wait re-checks it each tick, so shutdown ends the stream
             // even when no events flow and the socket is idle.
             let running = Arc::clone(&self.running);
+            let read_pool = read_pool.sender();
             let thread = thread::Builder::new()
                 .name("tephra-conn".to_string())
                 .spawn(move || {
-                    conn::serve_connection(stream, handle, config, running);
+                    conn::serve_connection(stream, handle, config, running, read_pool);
                     connections.remove(id);
                 })?;
             threads.push(thread);
@@ -251,6 +272,8 @@ impl Server {
         for thread in threads {
             let _ = thread.join();
         }
+        // Every connection (and so every cloned sender) is gone; drain and join the pool workers.
+        read_pool.shutdown();
         tracing::info!("tephra server stopped");
         Ok(())
     }
