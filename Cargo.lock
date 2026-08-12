@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-core",
  "tephra-proto",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argh",
  "config",
