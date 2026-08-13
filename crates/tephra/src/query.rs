@@ -88,7 +88,7 @@ mod tests {
         Tags::new(
             items
                 .iter()
-                .map(|s| Tag::new(s).unwrap())
+                .map(|s| Tag::new(*s).unwrap())
                 .collect::<SmallVec<[Tag; 4]>>(),
         )
         .unwrap()

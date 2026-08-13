@@ -23,13 +23,13 @@ use tephra_client::{Client, Event, Position, Query, QueryItem, Tag, Tags};
 let mut client = Client::connect("127.0.0.1:9000")?;
 
 // Append an event: type, tags, and an opaque payload. `None` means no append condition.
-let event = Event::new("CourseOpened", &["course:c1"], br#"{"course":"c1","seats":30}"#.to_vec())?;
+let event = Event::new("CourseOpened", ["course:c1"], br#"{"course":"c1","seats":30}"#.to_vec())?;
 let result = client.append([event], None)?;
 println!("recorded positions {} to {}", result.first, result.last);
 
 // Read every event matching a query, from the beginning.
 let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
-let (events, _watermark) = client.read_all(query, Position::ZERO)?;
+let (events, _watermark) = client.read_all(query, Position::ZERO, None)?;
 for seq in &events {
     println!("{} {}", seq.position(), seq.event().event_type());
 }

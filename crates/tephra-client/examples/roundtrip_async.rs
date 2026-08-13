@@ -25,9 +25,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Three appends in flight at once over a single connection (the blocking client would run
     // these one after another). `join!` awaits them concurrently.
     let (a, b, c) = tokio::join!(
-        client.append([Event::new("Enrolled", &["course:c1"], b"{}")?], None),
-        client.append([Event::new("Enrolled", &["course:c2"], b"{}")?], None),
-        client.append([Event::new("Enrolled", &["course:c3"], b"{}")?], None),
+        client.append([Event::new("Enrolled", ["course:c1"], b"{}")?], None),
+        client.append([Event::new("Enrolled", ["course:c2"], b"{}")?], None),
+        client.append([Event::new("Enrolled", ["course:c3"], b"{}")?], None),
     );
     for range in [a?, b?, c?] {
         println!("appended at position {}", range.first);

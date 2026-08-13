@@ -87,7 +87,7 @@ println!("appended at {}", range.first);
 
 // Read every event carrying course:c1, ascending, from the beginning.
 let query = Query::item(QueryItem::with_tags(Tags::new(vec![Tag::new("course:c1")?])?));
-let mut reads = handle.read(query, Position::ZERO);
+let mut reads = handle.read(&query, Position::ZERO, None);
 while let Some(item) = reads.next() {
     let seq = item?;
     println!("{} {}", seq.position, seq.event.event_type());

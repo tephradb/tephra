@@ -33,8 +33,8 @@ fn reserve_seat(
     for _attempt in 0..MAX_ATTEMPTS {
         // Rebuild the decision model from the current tail on each attempt.
         let query = Query::items([
-            QueryItem::with_tags(Tags::new([Tag::new(&course_tag)?])?),
-            QueryItem::with_tags(Tags::new([Tag::new(&student_tag)?])?),
+            QueryItem::with_tags(Tags::new([Tag::new(course_tag.clone())?])?),
+            QueryItem::with_tags(Tags::new([Tag::new(student_tag.clone())?])?),
         ]);
         let (events, watermark) = client.read_all(query.clone(), Position::ZERO, None)?;
 
@@ -51,7 +51,7 @@ fn reserve_seat(
 
         let event = Event::new(
             "StudentEnrolled",
-            &[course_tag.as_str(), student_tag.as_str()],
+            [course_tag.as_str(), student_tag.as_str()],
             b"{}".to_vec(),
         )?;
         let guard = AppendCondition::new(query).after(watermark);

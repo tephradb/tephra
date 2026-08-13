@@ -16,7 +16,7 @@ fn quickstart(addr: &str) -> Result<(), Box<dyn Error>> {
     // ANCHOR: append
     let event = Event::new(
         "CourseOpened",
-        &["course:c1"],
+        ["course:c1"],
         br#"{"course":"c1","seats":30}"#.to_vec(),
     )?;
     let result = client.append([event], None)?;
@@ -37,7 +37,7 @@ fn quickstart(addr: &str) -> Result<(), Box<dyn Error>> {
     for seat in ["s1", "s2"] {
         let event = Event::new(
             "SeatReserved",
-            &["course:c1"],
+            ["course:c1"],
             format!("{{\"seat\":\"{seat}\"}}"),
         )?;
         client.append([event], None)?;

@@ -64,7 +64,7 @@ returns the position range the batch landed at.
 
 <Code code={anchor(gsRaw, 'append')} lang="rust" />
 
-The client's `Event` is a friendly owned type (built from `&str`, `&[&str]`, and bytes). The
+The client's `Event` is a friendly owned type (built from `&str`, an iterator of tag strings, and bytes). The
 engine has a second, packed `Event` used only when you embed the engine directly; the two do not
 interconvert, and the client type is the one you want here. See [Embedded](../embedded/) for the
 other one.

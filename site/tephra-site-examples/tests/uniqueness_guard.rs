@@ -12,12 +12,12 @@ use tephra_site_examples::TestServer;
 fn open_course(client: &mut Client, course: &str) -> Result<bool, Box<dyn Error>> {
     // ANCHOR: guard
     let course_tag = format!("course:{course}");
-    let event = Event::new("CourseOpened", &[course_tag.as_str()], b"{}".to_vec())?;
+    let event = Event::new("CourseOpened", [course_tag.as_str()], b"{}".to_vec())?;
 
     // No `after`: the guard means "fail if a CourseOpened for this course already exists".
     let guard = AppendCondition::new(Query::item(QueryItem::new(
         vec![EventType::new("CourseOpened")?],
-        Tags::new([Tag::new(&course_tag)?])?,
+        Tags::new([Tag::new(course_tag)?])?,
     )));
 
     match client.append([event], Some(guard)) {

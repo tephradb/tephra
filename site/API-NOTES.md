@@ -410,11 +410,11 @@ pub struct Event {                         // line 60-65 (fields private)
     // event_type: EventType, tags: Tags, payload: Vec<u8>
 }
 
-pub fn new(
-    event_type: impl AsRef<str>,
-    tags: &[&str],
+pub fn new<T: Into<Box<str>>>(
+    event_type: impl Into<Box<str>>,
+    tags: impl IntoIterator<Item = T>,
     payload: impl Into<Vec<u8>>,
-) -> Result<Event, BuildError>             // line 70-74
+) -> Result<Event, BuildError>
 
 pub fn event_type(&self) -> &str                                    // line 89
 pub fn tags(&self) -> impl ExactSizeIterator<Item = &str>           // line 94
@@ -953,7 +953,8 @@ hardware is named anywhere, because no results are recorded.
 - Two distinct types named `Event`. The engine's `tephra::Event` is the packed on-disk
   codec (constructed with `&EventType`, `&Tags`, `&[u8]`, returns `EncodeError`). The
   client's `tephra_client::Event` is a separate friendly owned type (constructed with
-  `impl AsRef<str>`, `&[&str]`, `impl Into<Vec<u8>>`, returns `BuildError`). They do not
+  `impl Into<Box<str>>`, `impl IntoIterator<Item: Into<Box<str>>>`, `impl Into<Vec<u8>>`,
+  returns `BuildError`). They do not
   interconvert directly; the client type serialises to wire protobuf.
 
 - Two distinct types named `ReadError`. `tephra::read::ReadError` (the engine read path,

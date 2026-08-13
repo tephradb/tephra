@@ -35,8 +35,8 @@ fn enrol(
     loop {
         // The boundary: everything tagged with this course, OR everything tagged with this student.
         let query = Query::items([
-            QueryItem::with_tags(Tags::new([Tag::new(&course_tag)?])?),
-            QueryItem::with_tags(Tags::new([Tag::new(&student_tag)?])?),
+            QueryItem::with_tags(Tags::new([Tag::new(course_tag.clone())?])?),
+            QueryItem::with_tags(Tags::new([Tag::new(student_tag.clone())?])?),
         ]);
 
         // Read once, fold both projections over the same pass.
@@ -66,7 +66,7 @@ fn enrol(
         // Append guarded by the same query, from the position the decision was made against.
         let event = Event::new(
             "StudentEnrolled",
-            &[course_tag.as_str(), student_tag.as_str()],
+            [course_tag.as_str(), student_tag.as_str()],
             format!(r#"{{"course":"{course}","student":"{student}"}}"#).into_bytes(),
         )?;
         let guard = AppendCondition::new(query).after(watermark);

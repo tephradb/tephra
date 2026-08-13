@@ -14,7 +14,7 @@
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = AsyncClient::connect("127.0.0.1:9000").await?;
 //! client
-//!     .append([Event::new("Enrolled", &["course:c1"], b"{}")?], None)
+//!     .append([Event::new("Enrolled", ["course:c1"], b"{}")?], None)
 //!     .await?;
 //!
 //! let mut stream = client.read(Query::all(), Position::ZERO, None).await;
