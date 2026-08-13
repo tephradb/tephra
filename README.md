@@ -62,39 +62,42 @@ cargo install tephra-server
 
 ## Usage
 
-```rust
+```rust,no_run
 use tephra::{
     AppendCondition, Event, EventType, Position, Query, QueryItem, Tag, Tags,
     WriteCoordinator, WriterConfig,
 };
 use tephra::log::set::{SegmentConfig, SegmentSet};
 
-// Open (or create) a log directory and start the single-writer coordinator.
-let set = SegmentSet::open("./data", SegmentConfig::new(1 << 26))?;
-let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default())?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open (or create) a log directory and start the single-writer coordinator.
+    let set = SegmentSet::open("./data", SegmentConfig::new(1 << 26))?;
+    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default())?;
 
-// Build an event: a type, a sorted set of tags, and an opaque payload.
-let ty = EventType::new("CourseRegistered")?;
-let tags = Tags::new(vec![Tag::new("course:c1")?, Tag::new("student:s1")?])?;
-let event = Event::new(&ty, &tags, b"{...payload...}")?;
+    // Build an event: a type, a sorted set of tags, and an opaque payload.
+    let ty = EventType::new("CourseRegistered")?;
+    let tags = Tags::new(vec![Tag::new("course:c1")?, Tag::new("student:s1")?])?;
+    let event = Event::new(&ty, &tags, b"{...payload...}")?;
 
-// Append, guarded so it fails if any event already carries course:c1.
-let guard = AppendCondition::new(Query::item(QueryItem::with_tags(
-    Tags::new(vec![Tag::new("course:c1")?])?,
-)));
-let range = handle.append(vec![event], Some(guard))?;
-println!("appended at {}", range.first);
+    // Append, guarded so it fails if any event already carries course:c1.
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(
+        Tags::new(vec![Tag::new("course:c1")?])?,
+    )));
+    let range = handle.append(vec![event], Some(guard))?;
+    println!("appended at {}", range.first);
 
-// Read every event carrying course:c1, ascending, from the beginning.
-let query = Query::item(QueryItem::with_tags(Tags::new(vec![Tag::new("course:c1")?])?));
-let mut reads = handle.read(&query, Position::ZERO, None);
-while let Some(item) = reads.next() {
-    let seq = item?;
-    println!("{} {}", seq.position, seq.event.event_type());
+    // Read every event carrying course:c1, ascending, from the beginning.
+    let query = Query::item(QueryItem::with_tags(Tags::new(vec![Tag::new("course:c1")?])?));
+    let mut reads = handle.read(&query, Position::ZERO, None);
+    while let Some(item) = reads.next() {
+        let seq = item?;
+        println!("{} {}", seq.position, seq.event.event_type());
+    }
+
+    // Shutdown joins the writer thread and returns the SegmentSet.
+    coordinator.shutdown();
+    Ok(())
 }
-
-// Shutdown joins the writer thread and returns the SegmentSet.
-coordinator.shutdown();
 ```
 
 Reads run on the caller's own thread over a snapshot the writer publishes at each commit,

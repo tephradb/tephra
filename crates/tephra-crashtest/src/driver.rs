@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use tephra_client::{AppendCondition, Client, ClientError, ErrorCode, Position, Query, QueryItem, SubEvent, Tag, Tags};
+use tephra_client::{
+    AppendCondition, Client, ClientError, ErrorCode, Position, Query, QueryItem, SubEvent, Tag,
+    Tags,
+};
 
 use crate::witness::Witness;
 use crate::workload::{self, client_event};
@@ -137,7 +140,10 @@ fn writer_loop(
         let condition = condition_for(workload, s);
         match client.append([event], condition) {
             Ok(result) => {
-                if witness.acked(s, result.first.get(), result.last.get()).is_err() {
+                if witness
+                    .acked(s, result.first.get(), result.last.get())
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -198,10 +204,9 @@ fn subscriber_loop(addr: SocketAddr, stop: &AtomicBool, violations: &Mutex<Vec<S
             Ok(SubEvent::Event(ev)) => {
                 let pos = ev.position().get();
                 if pos <= last {
-                    violations
-                        .lock()
-                        .unwrap()
-                        .push(format!("subscription delivered {pos} after {last} (not ascending)"));
+                    violations.lock().unwrap().push(format!(
+                        "subscription delivered {pos} after {last} (not ascending)"
+                    ));
                 } else if pos != last + 1 {
                     violations.lock().unwrap().push(format!(
                         "subscription gap: delivered {pos} after {last} (missing {})",

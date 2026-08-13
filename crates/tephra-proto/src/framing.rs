@@ -124,7 +124,7 @@ fn read_full_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
 // ---------------------------------------------------------------------------
 
 /// The async counterpart of [`write_frame`]: serializes `msg` and writes it as one
-/// length-prefixed frame over an [`AsyncWrite`]. Does not flush; the caller flushes at a
+/// length-prefixed frame over an [`AsyncWrite`](tokio::io::AsyncWrite). Does not flush; the caller flushes at a
 /// response boundary.
 #[cfg(feature = "tokio")]
 pub async fn write_frame_async<M, W>(
@@ -151,7 +151,7 @@ where
 }
 
 /// The async counterpart of [`read_frame`]: reads one length-prefixed frame from an
-/// [`AsyncRead`] and parses it as `M`. Returns `Ok(None)` on a clean EOF at a frame boundary
+/// [`AsyncRead`](tokio::io::AsyncRead) and parses it as `M`. Returns `Ok(None)` on a clean EOF at a frame boundary
 /// (the peer closed between frames), mirroring the synchronous version.
 #[cfg(feature = "tokio")]
 pub async fn read_frame_async<M, R>(
@@ -208,7 +208,7 @@ where
     Ok(true)
 }
 
-/// Fills `buf` completely from an [`AsyncRead`]; an early EOF (a torn frame body) is an
+/// Fills `buf` completely from an [`AsyncRead`](tokio::io::AsyncRead); an early EOF (a torn frame body) is an
 /// `UnexpectedEof` error, since a length prefix already promised these bytes.
 #[cfg(feature = "tokio")]
 async fn read_exact_async<R>(reader: &mut R, buf: &mut [u8]) -> io::Result<()>

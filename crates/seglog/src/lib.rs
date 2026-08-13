@@ -203,6 +203,12 @@ pub mod parse;
 pub mod read;
 pub mod write;
 
+/// The README, compiled as a doctest so its code samples cannot drift from the API. Present
+/// only during doctest builds (`cfg(doctest)`), so it never appears in the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadme;
+
 const LEN_SIZE: usize = mem::size_of::<u32>();
 const CRC32C_SIZE: usize = mem::size_of::<u32>();
 

@@ -1308,8 +1308,14 @@ mod tests {
         assert_eq!(fs::metadata(&stray1).unwrap().len(), 0);
 
         let set = open(dir.path(), 4096);
-        assert!(!stray1.exists(), "trailing 0-byte segment 6 should be deleted on open");
-        assert!(!stray2.exists(), "trailing 0-byte segment 7 should be deleted on open");
+        assert!(
+            !stray1.exists(),
+            "trailing 0-byte segment 6 should be deleted on open"
+        );
+        assert!(
+            !stray2.exists(),
+            "trailing 0-byte segment 7 should be deleted on open"
+        );
         assert_eq!(set.next_position(), Position::new(6));
         assert_eq!(set.last_position(), Position::new(5));
         for i in 1..=5u64 {

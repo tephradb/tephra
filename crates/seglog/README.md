@@ -15,30 +15,33 @@ A simple, high-performance segment log implementation for Rust.
 
 ## Quick Example
 
-```rust
+```rust,no_run
+use seglog::read::{ReadHint, Reader};
 use seglog::write::Writer;
-use seglog::read::{Reader, ReadHint};
 
-// Create a 1MB segment
-let mut writer = Writer::create("segment.log", 1024 * 1024, 0)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a 1 MiB segment with no per-record header (`Writer<0>`).
+    let mut writer = Writer::<0>::create("segment.log", 1024 * 1024, 0)?;
 
-// Append records
-let (offset, _) = writer.append(b"event data")?;
-writer.sync()?; // Flush to disk
+    // Append a record and flush it to disk.
+    let (offset, _) = writer.append_data(b"event data")?;
+    writer.sync()?;
 
-// Read concurrently
-let flushed = writer.flushed_offset();
-let mut reader = Reader::open("segment.log", Some(flushed))?;
-let data = reader.read_record(offset, ReadHint::Random)?;
+    // Read concurrently, bounded by the writer's flushed offset.
+    let flushed = writer.flushed_offset();
+    let mut reader = Reader::<0>::open("segment.log", Some(flushed))?;
+    let record = reader.read_record(offset, ReadHint::Random)?;
 
-assert_eq!(&*data, b"event data");
+    assert_eq!(record.data.as_ref(), b"event data");
+    Ok(())
+}
 ```
 
 ## Record Format
 
 Each record consists of an 8-byte header followed by variable-length data:
 
-```
+```text
 ┌─────────────┬─────────────┬────────────────┐
 │ Length (4B) │ CRC-32 (4B) │ Data (N bytes) │
 └─────────────┴─────────────┴────────────────┘
@@ -59,15 +62,22 @@ For random access, the reader performs a single syscall to read the header plus 
 
 Reserve space at the beginning of segments for application-specific headers:
 
-```rust
-const HEADER_SIZE: u64 = 64;
-let mut writer = Writer::create("segment.log", 1024 * 1024, HEADER_SIZE)?;
+```rust,no_run
+use seglog::write::Writer;
+use std::os::unix::fs::FileExt;
 
-// Write header data
-writer.file().write_all_at(b"MAGIC", 0)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reserve 64 bytes at the start of the file for an application header.
+    const START_OFFSET: u64 = 64;
+    let mut writer = Writer::<0>::create("segment.log", 1024 * 1024, START_OFFSET)?;
 
-// Records automatically start after header
-writer.append(b"data")?;
+    // Write the header into the reserved region, before the first record.
+    writer.file().write_all_at(b"MAGIC", 0)?;
+
+    // Records automatically start after the reserved header.
+    writer.append_data(b"data")?;
+    Ok(())
+}
 ```
 
 ## Concurrent Safety

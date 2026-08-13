@@ -23,12 +23,15 @@ It is the single source of truth for name and tag validation across the workspac
 ```rust
 use tephra_types::{AppendCondition, Query, QueryItem, Tag, Tags};
 
-// A query item matches events carrying all of the listed tags.
-let item = QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?);
-let query = Query::item(item);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A query item matches events carrying all of the listed tags.
+    let item = QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?);
+    let query = Query::item(item);
 
-// The same query guards an append: fail if any matching event already exists.
-let condition = AppendCondition::new(query);
+    // The same query guards an append: fail if any matching event already exists.
+    let _condition = AppendCondition::new(query);
+    Ok(())
+}
 ```
 
 ## Related crates

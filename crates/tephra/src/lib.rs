@@ -66,13 +66,24 @@ pub mod writer;
 pub use event::{Event, EventRef};
 pub use log::set::{PositionRange, SegmentConfig, SegmentSet};
 pub use query::Matches;
+#[cfg(feature = "async")]
+pub use read::pool::{ReadPool, ReadPoolConfig, ReadStream};
 pub use read::{
     DEFAULT_MAX_BATCH_EVENTS, ReadConfig, ReadError, ReadHandle, Subscription, WaitOutcome,
 };
-#[cfg(feature = "async")]
-pub use read::pool::{ReadPool, ReadPoolConfig, ReadStream};
 pub use tephra_types::{
     AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
     TagsError,
 };
 pub use writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};
+
+/// The crate README and the workspace README, compiled as doctests so their code samples
+/// cannot drift from the API. These items exist only during doctest builds (`cfg(doctest)`),
+/// so they never appear in the published documentation.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadme;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct WorkspaceReadme;
