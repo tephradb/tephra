@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "argh",
  "config",
