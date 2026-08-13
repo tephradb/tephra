@@ -14,7 +14,7 @@
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut client = Client::connect("127.0.0.1:9000")?;
-//!     client.append([Event::new("Enrolled", &["course:c1"], b"{}")?], None)?;
+//!     client.append([Event::new("Enrolled", ["course:c1"], b"{}")?], None)?;
 //!
 //!     let (events, _watermark) = client.read_all(Query::all(), Position::ZERO, None)?;
 //!     for sequenced in events {
@@ -77,15 +77,19 @@ pub struct Event {
 impl Event {
     /// Builds an event, validating the type and tags (non-empty, within the length limit,
     /// no duplicate tags).
-    pub fn new(
-        event_type: impl AsRef<str>,
-        tags: &[&str],
+    pub fn new<T>(
+        event_type: impl Into<Box<str>>,
+        tags: impl IntoIterator<Item = T>,
         payload: impl Into<Vec<u8>>,
-    ) -> Result<Event, BuildError> {
+    ) -> Result<Event, BuildError>
+    where
+        T: Into<Box<str>>,
+    {
         let event_type = EventType::new(event_type).map_err(BuildError::Name)?;
-        let mut collected: Vec<Tag> = Vec::with_capacity(tags.len());
+        let tags = tags.into_iter();
+        let mut collected: Vec<Tag> = Vec::with_capacity(tags.size_hint().0);
         for tag in tags {
-            collected.push(Tag::new(*tag).map_err(BuildError::Name)?);
+            collected.push(Tag::new(tag).map_err(BuildError::Name)?);
         }
         let tags = Tags::new(collected).map_err(BuildError::Tags)?;
         Ok(Event {

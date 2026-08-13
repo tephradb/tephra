@@ -79,7 +79,7 @@ impl Drop for TestServer {
 
 /// Builds a validated event.
 fn ev(ty: &str, tags: &[&str], payload: &[u8]) -> Event {
-    Event::new(ty, tags, payload).unwrap()
+    Event::new(ty, tags.iter().copied(), payload).unwrap()
 }
 
 /// A validated tag set.

@@ -318,7 +318,6 @@ fn classify(err: LogError) -> AppendError {
 
 #[cfg(test)]
 mod tests {
-    use smallvec::SmallVec;
     use tempfile::TempDir;
 
     use crate::Position;
@@ -371,13 +370,7 @@ mod tests {
     }
 
     fn tags(items: &[&str]) -> Tags {
-        Tags::new(
-            items
-                .iter()
-                .map(|s| Tag::new(s).unwrap())
-                .collect::<SmallVec<[Tag; 4]>>(),
-        )
-        .unwrap()
+        Tags::new(items.iter().map(|s| Tag::new(*s).unwrap())).unwrap()
     }
 
     fn event(ty: &str, tag_strs: &[&str]) -> Event {

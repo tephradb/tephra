@@ -42,7 +42,7 @@ fn decide(addr: &str) -> Result<(), Box<dyn Error>> {
     // Append guarded by the same query, from the position we read up to.
     let event = Event::new(
         "StudentEnrolled",
-        &["course:c1", "student:s1"],
+        ["course:c1", "student:s1"],
         br#"{"course":"c1","student":"s1"}"#.to_vec(),
     )?;
     let guard = AppendCondition::new(query).after(watermark);

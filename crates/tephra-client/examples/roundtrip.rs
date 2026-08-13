@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("connected to {addr}");
 
     let range = client.append(
-        [Event::new("Enrolled", &["course:c1", "student:s1"], b"{}")?],
+        [Event::new("Enrolled", ["course:c1", "student:s1"], b"{}")?],
         None,
     )?;
     println!("appended Enrolled at position {}", range.first);
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "username:alice",
     ])?)));
     let range = client.append(
-        [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
+        [Event::new("UsernameReserved", ["username:alice"], b"{}")?],
         Some(guard),
     )?;
     println!("reserved username:alice at position {}", range.first);
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "username:alice",
     ])?)));
     match client.append(
-        [Event::new("UsernameReserved", &["username:alice"], b"{}")?],
+        [Event::new("UsernameReserved", ["username:alice"], b"{}")?],
         Some(guard),
     ) {
         Ok(_) => println!("second reservation unexpectedly succeeded"),

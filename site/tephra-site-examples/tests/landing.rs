@@ -13,7 +13,7 @@ fn hero(addr: &str) -> Result<(), Box<dyn Error>> {
     // Record an enrolment, but only if this course has no enrolment recorded yet.
     let event = Event::new(
         "StudentEnrolled",
-        &["course:c1", "student:s1"],
+        ["course:c1", "student:s1"],
         br#"{"course":"c1","student":"s1"}"#.to_vec(),
     )?;
     let guard = AppendCondition::new(Query::item(QueryItem::with_tags(Tags::new([Tag::new(

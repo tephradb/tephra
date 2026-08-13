@@ -17,13 +17,13 @@ fn query_semantics() -> Result<(), Box<dyn Error>> {
 
     // A small history: one course opened, two enrolments across two courses for one student.
     client.append(
-        [Event::new("CourseOpened", &["course:c1"], b"{}".to_vec())?],
+        [Event::new("CourseOpened", ["course:c1"], b"{}".to_vec())?],
         None,
     )?;
     client.append(
         [Event::new(
             "StudentEnrolled",
-            &["course:c1", "student:s1"],
+            ["course:c1", "student:s1"],
             b"{}".to_vec(),
         )?],
         None,
@@ -31,7 +31,7 @@ fn query_semantics() -> Result<(), Box<dyn Error>> {
     client.append(
         [Event::new(
             "StudentEnrolled",
-            &["course:c2", "student:s1"],
+            ["course:c2", "student:s1"],
             b"{}".to_vec(),
         )?],
         None,

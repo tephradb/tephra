@@ -239,8 +239,10 @@ impl StagedTips {
 
 #[cfg(test)]
 mod tests {
+
+    use tephra_types::{QueryItem, Tag};
+
     use super::*;
-    use crate::query::QueryItem;
 
     fn ty(s: &str) -> crate::event::EventType {
         crate::event::EventType::new(s).unwrap()
@@ -251,7 +253,7 @@ mod tests {
         crate::event::Tags::new(
             items
                 .iter()
-                .map(|s| crate::event::Tag::new(s).unwrap())
+                .map(|s| Tag::new(*s).unwrap())
                 .collect::<SmallVec<[crate::event::Tag; 4]>>(),
         )
         .unwrap()

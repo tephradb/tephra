@@ -57,10 +57,10 @@ pub struct EventType(Box<str>);
 
 impl EventType {
     /// Constructs an event type, rejecting empty or over-long input.
-    pub fn new(s: impl AsRef<str>) -> Result<Self, NameError> {
-        let s = s.as_ref();
-        validate_name(s, "event type")?;
-        Ok(EventType(Box::from(s)))
+    pub fn new(s: impl Into<Box<str>>) -> Result<Self, NameError> {
+        let s = s.into();
+        validate_name(&s, "event type")?;
+        Ok(EventType(s))
     }
 
     pub fn as_str(&self) -> &str {
@@ -88,10 +88,10 @@ pub struct Tag(Box<str>);
 
 impl Tag {
     /// Constructs a tag, rejecting empty or over-long input.
-    pub fn new(s: impl AsRef<str>) -> Result<Self, NameError> {
-        let s = s.as_ref();
-        validate_name(s, "tag")?;
-        Ok(Tag(Box::from(s)))
+    pub fn new(s: impl Into<Box<str>>) -> Result<Self, NameError> {
+        let s = s.into();
+        validate_name(&s, "tag")?;
+        Ok(Tag(s))
     }
 
     pub fn as_str(&self) -> &str {
@@ -204,7 +204,7 @@ mod tests {
     fn name_rejects_over_long() {
         let big = "x".repeat(MAX_NAME_LEN + 1);
         assert_eq!(
-            EventType::new(&big),
+            EventType::new(big),
             Err(NameError::TooLong {
                 what: "event type",
                 len: MAX_NAME_LEN + 1,

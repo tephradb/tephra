@@ -46,10 +46,10 @@ fn a_read_model_resumes_from_its_cursor() {
     let mut writer = Client::connect(&addr).expect("connect writer");
 
     writer
-        .append([Event::new("A", &["k:1"], b"{}".to_vec()).unwrap()], None)
+        .append([Event::new("A", ["k:1"], b"{}".to_vec()).unwrap()], None)
         .unwrap();
     writer
-        .append([Event::new("B", &["k:1"], b"{}".to_vec()).unwrap()], None)
+        .append([Event::new("B", ["k:1"], b"{}".to_vec()).unwrap()], None)
         .unwrap();
 
     // Cold start: process everything, keep the cursor.
@@ -59,7 +59,7 @@ fn a_read_model_resumes_from_its_cursor() {
 
     // A new event arrives; resuming from the cursor delivers only that one.
     writer
-        .append([Event::new("C", &["k:1"], b"{}".to_vec()).unwrap()], None)
+        .append([Event::new("C", ["k:1"], b"{}".to_vec()).unwrap()], None)
         .unwrap();
     let mut seen_after = 0usize;
     let cursor2 = drain_read_model(&addr, cursor, |_| seen_after += 1).expect("resume");

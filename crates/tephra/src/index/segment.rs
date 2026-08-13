@@ -344,7 +344,7 @@ mod tests {
         Tags::new(
             items
                 .iter()
-                .map(|s| Tag::new(s).unwrap())
+                .map(|s| Tag::new(*s).unwrap())
                 .collect::<SmallVec<[Tag; 4]>>(),
         )
         .unwrap()
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(seg.type_at((n - 1) as u32), id);
 
         // A type-only query returns exactly the one event carrying that type.
-        let q = Query::item(QueryItem::of_types(vec![EventType::new(&last_ty).unwrap()]));
+        let q = Query::item(QueryItem::of_types(vec![EventType::new(last_ty).unwrap()]));
         let got: Vec<Position> = search(&seg, &q, Position::ZERO).collect();
         assert_eq!(got, vec![Position::new(n)]);
     }
