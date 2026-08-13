@@ -46,7 +46,7 @@ fn event(ty: &str, tag_strs: &[&str]) -> Event {
 }
 
 /// Reads a query through the handle and collects just the matching positions.
-fn read_positions(handle: &WriteHandle, query: Query, after: Position) -> Vec<Position> {
+fn read_positions(handle: &WriteHandle, query: &Query, after: Position) -> Vec<Position> {
     let mut reads = handle.read(query, after, None);
     let mut out = Vec::new();
     while let Some(item) = reads.next() {
@@ -240,7 +240,7 @@ fn index_search_sees_own_writes_across_rollovers() {
 
         let got = read_positions(
             &handle,
-            Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+            &Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
             Position::ZERO,
         );
         assert_eq!(got, expected, "read-your-writes after append {i}");
@@ -249,7 +249,7 @@ fn index_search_sees_own_writes_across_rollovers() {
     // A type filter and an `after` bound also compose across the sealed segments.
     let enrolled = read_positions(
         &handle,
-        Query::item(QueryItem::of_types(vec![
+        &Query::item(QueryItem::of_types(vec![
             EventType::new("Enrolled").unwrap(),
         ])),
         Position::new(40),
@@ -387,7 +387,7 @@ fn append_async_assigns_dense_positions_and_read_sees_own_writes() {
 
             let got = read_positions(
                 &handle,
-                Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+                &Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
                 Position::ZERO,
             );
             assert_eq!(got, expected, "read-your-writes after async append {i}");

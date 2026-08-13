@@ -383,7 +383,7 @@ fn register_cancel(conn: &ConnCtx, request_id: u64) -> Arc<AtomicBool> {
 /// connection dies mid-stream. A log-integrity failure terminates with a single error frame.
 fn run_read(
     request_id: u64,
-    query: Query,
+    query: &Query,
     after: Position,
     limit: Option<u64>,
     conn: &ConnCtx,
@@ -662,7 +662,7 @@ impl ReadJob {
             cancel,
             cleanup,
         } = self;
-        run_read(request_id, query, after, limit, &conn, &cancel);
+        run_read(request_id, &query, after, limit, &conn, &cancel);
         // Release the permit/cancel/worker only once the read's frames are all queued.
         drop(cleanup);
     }

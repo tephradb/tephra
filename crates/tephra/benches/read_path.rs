@@ -163,7 +163,7 @@ fn query_for(denom: u64) -> Query {
 }
 
 /// Runs one read to exhaustion and returns how many events it yielded.
-fn run_read(handle: &WriteHandle, query: Query, after: Position) -> u64 {
+fn run_read(handle: &WriteHandle, query: &Query, after: Position) -> u64 {
     let mut reads = handle.read(query, after, None);
     let mut count = 0u64;
     while let Some(item) = reads.next() {
@@ -192,7 +192,7 @@ fn bench_selectivity(c: &mut Criterion) {
             b.iter(|| {
                 black_box(run_read(
                     &index_store.handle,
-                    query_for(denom),
+                    &query_for(denom),
                     Position::ZERO,
                 ))
             });
@@ -201,7 +201,7 @@ fn bench_selectivity(c: &mut Criterion) {
             b.iter(|| {
                 black_box(run_read(
                     &scan_store.handle,
-                    query_for(denom),
+                    &query_for(denom),
                     Position::ZERO,
                 ))
             });
@@ -231,10 +231,10 @@ fn bench_range_width(c: &mut Criterion) {
         let after = Position::new(after);
 
         group.bench_with_input(BenchmarkId::new("index", label), &after, |b, &after| {
-            b.iter(|| black_box(run_read(&index_store.handle, query_for(DENOM), after)));
+            b.iter(|| black_box(run_read(&index_store.handle, &query_for(DENOM), after)));
         });
         group.bench_with_input(BenchmarkId::new("scan", label), &after, |b, &after| {
-            b.iter(|| black_box(run_read(&scan_store.handle, query_for(DENOM), after)));
+            b.iter(|| black_box(run_read(&scan_store.handle, &query_for(DENOM), after)));
         });
     }
     group.finish();
@@ -259,7 +259,7 @@ fn bench_payload_size(c: &mut Criterion) {
             b.iter(|| {
                 black_box(run_read(
                     &index_store.handle,
-                    query_for(DENOM),
+                    &query_for(DENOM),
                     Position::ZERO,
                 ))
             });
@@ -268,7 +268,7 @@ fn bench_payload_size(c: &mut Criterion) {
             b.iter(|| {
                 black_box(run_read(
                     &scan_store.handle,
-                    query_for(DENOM),
+                    &query_for(DENOM),
                     Position::ZERO,
                 ))
             });

@@ -358,9 +358,9 @@ impl ReadHandle {
     /// query's full result. Together with `after` (an exclusive lower bound) it forms a
     /// stateless pagination cursor: read a page, then read again with `after` set to the last
     /// position, with no gap and no duplicate at the seam.
-    pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> Reads {
+    pub fn read(&self, query: &Query, after: Position, limit: Option<u64>) -> Reads {
         let (watermark, snapshot) = self.core.load();
-        Reads::plan(snapshot, &query, after, watermark, &self.config, limit)
+        Reads::plan(snapshot, query, after, watermark, &self.config, limit)
     }
 
     /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up
