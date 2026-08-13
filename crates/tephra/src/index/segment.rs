@@ -201,8 +201,16 @@ impl IndexSegment {
 /// synced so the new name is durable too.
 pub fn write_segment_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
+    // Crash point: ENOSPC on index flush. The index is disposable, so this must degrade to a
+    // rebuild from the log, never corrupt the store or block the (already durable) write.
+    crash_points::crash_io!("index_flush");
     file.write_all(bytes)?;
+    // Crash point: the .idx content is written but not yet fsynced. A crash here must leave a
+    // store that rebuilds the missing or partial index from the log on open.
+    crash_points::crash_point!("index_after_write");
     file.sync_all()?;
+    // Crash point: the .idx file is fsynced but its directory entry is not yet durable.
+    crash_points::crash_point!("index_after_sync");
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

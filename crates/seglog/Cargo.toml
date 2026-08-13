@@ -11,6 +11,7 @@ rust-version = "1.95.0"
 repository.workspace = true
 
 [dependencies]
+crash-points.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
 tracing = { workspace = true, optional = true }
@@ -24,6 +25,8 @@ tempfile.workspace = true
 
 [features]
 tracing = ["dep:tracing"]
+# Turns on the gated crash and fault injection points. Off by default: zero cost.
+crash-points = ["crash-points/enabled"]
 
 [[bench]]
 name = "seglog_bench"

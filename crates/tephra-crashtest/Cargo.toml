@@ -1,0 +1,25 @@
+[package]
+name = "tephra-crashtest"
+description = "Crash consistency and fault injection test harness for Tephra."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+repository.workspace = true
+publish = false
+
+[dependencies]
+tephra-client.workspace = true
+
+argh.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+name = "tephra_crashtest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tephra-crashtest"
+path = "src/main.rs"
