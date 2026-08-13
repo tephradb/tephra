@@ -199,6 +199,8 @@ use std::{
     },
 };
 
+#[doc(hidden)]
+pub mod crash_points;
 pub mod parse;
 pub mod read;
 pub mod write;

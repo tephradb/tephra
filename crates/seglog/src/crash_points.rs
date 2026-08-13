@@ -1,9 +1,13 @@
-//! Gated crash and fault injection points.
+//! Gated crash and fault injection points for the crash-consistency suite.
 //!
-//! A named site in production code becomes a crash or a fault when this crate's `enabled`
-//! feature is on and the `TEPHRA_CRASH_POINT` environment variable selects it. With the
-//! feature off, every macro below expands to nothing: no branch, no symbol, no cost. That is
-//! what lets the same instrumented binary ship in release and drive the crash suite in test.
+//! A named site in seglog (or in tephra, which drives these through seglog) becomes a crash or a
+//! fault when the `crash-points` feature is on and the `TEPHRA_CRASH_POINT` environment variable
+//! selects it. With the feature off, every macro below expands to nothing: no branch, no symbol,
+//! no cost. That is what lets the same instrumented binary ship in release and drive the crash
+//! suite in test.
+//!
+//! This module used to be a separate `crash-points` crate; it lives here so the published seglog
+//! and tephra crates can carry the instrumentation without depending on an unpublished crate.
 //!
 //! ## Environment format
 //!
@@ -11,18 +15,20 @@
 //! TEPHRA_CRASH_POINT=<site>:<action>[:<skip>]
 //! ```
 //!
-//! - `site` is the string passed to [`crash_point!`](crate::crash_point) or [`crash_io!`](crate::crash_io).
+//! - `site` is the string passed to [`crash_point!`](crate::crash_point) or
+//!   [`crash_io!`](crate::crash_io).
 //! - `action` is one of `abort`, `eio`, `enospc`, `shortwrite`.
 //! - `skip` (default 0) is how many hits of that site to let pass before firing, so a narrow
 //!   window can be targeted deterministically (the writer thread hits these sites in a fixed
 //!   order, so the count is stable given a seed apart from thread scheduling above it).
 //!
-//! `abort` fires through [`crash_point!`](crate::crash_point) (a hard [`std::process::abort`], no unwinding, no
-//! flush, the closest in-process analogue to a power cut at that line). `eio`, `enospc`, and
-//! `shortwrite` fire through [`crash_io!`](crate::crash_io), which returns the corresponding [`std::io::Error`]
-//! from the enclosing function so the real error path is exercised.
+//! `abort` fires through [`crash_point!`](crate::crash_point) (a hard [`std::process::abort`], no
+//! unwinding, no flush, the closest in-process analogue to a power cut at that line). `eio`,
+//! `enospc`, and `shortwrite` fire through [`crash_io!`](crate::crash_io), which returns the
+//! corresponding [`std::io::Error`] from the enclosing function so the real error path is
+//! exercised.
 
-#[cfg(feature = "enabled")]
+#[cfg(feature = "crash-points")]
 mod imp {
     use std::io;
     use std::sync::OnceLock;
@@ -143,22 +149,25 @@ mod imp {
     }
 }
 
-#[cfg(feature = "enabled")]
+#[cfg(feature = "crash-points")]
 pub use imp::{armed, fire, io_fault};
 
 /// Aborts the process at `site` when configured with the `abort` action.
 ///
-/// Expands to nothing (and generates no code) when the crate's `enabled` feature is off.
-#[cfg(feature = "enabled")]
+/// Expands to nothing (and generates no code) when the `crash-points` feature is off.
+#[cfg(feature = "crash-points")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! crash_point {
     ($site:literal) => {
-        $crate::fire($site)
+        $crate::crash_points::fire($site)
     };
 }
 
-/// See [`crash_point!`](crate::crash_point). This is the compiled-out form used when the feature is off.
-#[cfg(not(feature = "enabled"))]
+/// See [`crash_point!`](crate::crash_point). This is the compiled-out form used when the feature
+/// is off.
+#[cfg(not(feature = "crash-points"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! crash_point {
     ($site:literal) => {{}};
@@ -168,19 +177,21 @@ macro_rules! crash_point {
 /// `eio`, `enospc`, or `shortwrite` action. The enclosing function's error type must implement
 /// `From<std::io::Error>`.
 ///
-/// Expands to nothing when the crate's `enabled` feature is off.
-#[cfg(feature = "enabled")]
+/// Expands to nothing when the `crash-points` feature is off.
+#[cfg(feature = "crash-points")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! crash_io {
     ($site:literal) => {
-        if let ::core::option::Option::Some(err) = $crate::io_fault($site) {
+        if let ::core::option::Option::Some(err) = $crate::crash_points::io_fault($site) {
             return ::core::result::Result::Err(::core::convert::From::from(err));
         }
     };
 }
 
 /// See [`crash_io!`](crate::crash_io). This is the compiled-out form used when the feature is off.
-#[cfg(not(feature = "enabled"))]
+#[cfg(not(feature = "crash-points"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! crash_io {
     ($site:literal) => {{}};

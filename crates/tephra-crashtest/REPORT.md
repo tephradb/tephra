@@ -5,8 +5,9 @@ report gives: the durability and ack points found in the code; every invariant v
 which seeded bugs the suite caught; the crash-cycle counts by failpoint; and an explicit list of
 what the suite does **not** cover.
 
-The harness lives in `crates/tephra-crashtest`; the gated instrumentation in `crates/crash-points`
-plus one-line call sites in `seglog` and `tephra`. Findings are in `FINDINGS.md`.
+The harness lives in `crates/tephra-crashtest`; the gated instrumentation in seglog's
+`crash_points` module plus one-line call sites in `seglog` and `tephra`. Findings are in
+`FINDINGS.md`.
 
 ---
 
