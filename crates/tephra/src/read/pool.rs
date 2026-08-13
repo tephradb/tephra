@@ -89,6 +89,12 @@ struct ReadJob {
     out: flume::Sender<ReadItem>,
     batch_events: usize,
     batch_bytes: usize,
+    /// Test-only hook: when set, the worker panics before scanning so the abort-reporting
+    /// path can be exercised. Per-job so parallel tests never interfere. Compiled only for
+    /// this crate's own tests, so it is absent from every normal build and from downstream
+    /// dependents.
+    #[cfg(test)]
+    inject_panic: bool,
 }
 
 /// A pool of worker threads that run blocking reads off the async caller's thread.
@@ -174,6 +180,8 @@ impl ReadPool {
             out: out_tx,
             batch_events: self.batch_events,
             batch_bytes: self.batch_bytes,
+            #[cfg(test)]
+            inject_panic: false,
         };
         match &self.tx {
             Some(tx) => {
@@ -212,6 +220,8 @@ impl ReadPool {
             out: out_tx,
             batch_events: self.batch_events,
             batch_bytes: self.batch_bytes,
+            #[cfg(test)]
+            inject_panic: false,
         };
         if let Some(tx) = &self.tx {
             // A closed queue (pool shut down) drops the job and its sender, so the loop below
@@ -235,6 +245,26 @@ impl ReadPool {
     /// [`SHUTDOWN_POLL`] and abandons its read.
     pub fn shutdown(self) {
         // `Drop` does the work.
+    }
+
+    /// Test-only: submit a read that panics inside its worker, returning the raw result
+    /// channel so a test can assert the abort is reported rather than silently swallowed.
+    #[cfg(test)]
+    fn submit_panicking(&self, query: Query) -> flume::Receiver<ReadItem> {
+        let (out_tx, out_rx) = flume::bounded::<ReadItem>(self.channel_depth);
+        let job = ReadJob {
+            query,
+            after: Position::ZERO,
+            limit: None,
+            out: out_tx,
+            batch_events: self.batch_events,
+            batch_bytes: self.batch_bytes,
+            inject_panic: true,
+        };
+        if let Some(tx) = &self.tx {
+            tx.send(job).expect("submit panicking read");
+        }
+        out_rx
     }
 }
 
@@ -277,7 +307,16 @@ fn run_job(handle: &ReadHandle, job: ReadJob, shutdown: &AtomicBool) {
         out,
         batch_events,
         batch_bytes,
+        #[cfg(test)]
+        inject_panic,
     } = job;
+
+    // Test-only: exercise the worker's abort-reporting path (see `worker_loop`). The retained
+    // sender there turns this panic into a `ReadError::Aborted` rather than a silent close.
+    #[cfg(test)]
+    if inject_panic {
+        panic!("injected read panic (test hook)");
+    }
 
     let mut reads = handle.read(&query, after, limit);
     let mut batch: Vec<(Position, Event)> = Vec::new();
@@ -589,6 +628,32 @@ mod tests {
         assert_eq!(a.len(), 25);
         assert_eq!(a.iter().map(|(p, _)| *p).collect::<Vec<_>>(), direct(&handle, &Query::all()));
         assert_eq!(a.len(), b.len());
+    }
+
+    #[test]
+    fn a_panicking_read_surfaces_as_aborted_not_a_clean_end() {
+        let (_dir, _coord, handle) = store();
+        for _ in 0..5 {
+            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+        }
+        let pool = ReadPool::new(handle.reader(), 1);
+
+        // The worker catches the injected panic and reports it. Without that, the result
+        // channel would just close, which a consumer cannot tell apart from a completed read.
+        // (An "injected read panic" line on stderr is expected here; the catch is deliberate.)
+        let rx = pool.submit_panicking(Query::all());
+        let first = block_on(rx.recv_async()).expect("channel closed without reporting an item");
+        match first {
+            Err(ReadError::Aborted) => {}
+            // `ReadItem` is not `Debug` (events are not), so report via `Display` / a literal.
+            Err(other) => panic!("expected ReadError::Aborted, got a different error: {other}"),
+            Ok(_) => panic!("expected ReadError::Aborted, got a successful batch"),
+        }
+        // Nothing follows the abort: the stream ends.
+        assert!(
+            block_on(rx.recv_async()).is_err(),
+            "expected the channel to close after the abort",
+        );
     }
 
     #[test]
