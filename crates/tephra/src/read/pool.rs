@@ -449,7 +449,7 @@ mod tests {
     }
 
     fn tags(items: &[&str]) -> Tags {
-        Tags::new(items.iter().map(|s| Tag::new(s).unwrap())).unwrap()
+        Tags::new(items.iter().map(|s| Tag::new(*s).unwrap())).unwrap()
     }
 
     fn event(ty: &str, tag_strs: &[&str]) -> Event {
@@ -478,15 +478,17 @@ mod tests {
         block_on(async {
             let mut positions = Vec::new();
             let mut batches = 0;
-            future::poll_fn(|cx| loop {
-                match Pin::new(&mut stream).poll_next(cx) {
-                    Poll::Ready(Some(item)) => {
-                        let batch = item.expect("read failed");
-                        batches += 1;
-                        positions.extend(batch.into_iter().map(|(p, _)| p));
+            future::poll_fn(|cx| {
+                loop {
+                    match Pin::new(&mut stream).poll_next(cx) {
+                        Poll::Ready(Some(item)) => {
+                            let batch = item.expect("read failed");
+                            batches += 1;
+                            positions.extend(batch.into_iter().map(|(p, _)| p));
+                        }
+                        Poll::Ready(None) => return Poll::Ready((positions.clone(), batches)),
+                        Poll::Pending => return Poll::Pending,
                     }
-                    Poll::Ready(None) => return Poll::Ready((positions.clone(), batches)),
-                    Poll::Pending => return Poll::Pending,
                 }
             })
             .await
@@ -498,7 +500,10 @@ mod tests {
         let (_dir, _coord, handle) = store();
         for i in 0..50 {
             handle
-                .append(vec![event("Enrolled", &[&format!("course:c{}", i % 5)])], None)
+                .append(
+                    vec![event("Enrolled", &[&format!("course:c{}", i % 5)])],
+                    None,
+                )
                 .unwrap();
         }
         let pool = ReadPool::new(handle.reader(), 4);
@@ -514,7 +519,9 @@ mod tests {
     fn streamed_batches_concatenate_to_read_all() {
         let (_dir, _coord, handle) = store();
         for _ in 0..30 {
-            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+            handle
+                .append(vec![event("Enrolled", &["course:c1"])], None)
+                .unwrap();
         }
         // Tiny batches so a 30-event read spans several of them.
         let pool = ReadPool::with_config(
@@ -536,8 +543,14 @@ mod tests {
     fn query_and_limit_are_honored() {
         let (_dir, _coord, handle) = store();
         for i in 0..20 {
-            let course = if i % 2 == 0 { "course:even" } else { "course:odd" };
-            handle.append(vec![event("Enrolled", &[course])], None).unwrap();
+            let course = if i % 2 == 0 {
+                "course:even"
+            } else {
+                "course:odd"
+            };
+            handle
+                .append(vec![event("Enrolled", &[course])], None)
+                .unwrap();
         }
         let pool = ReadPool::new(handle.reader(), 2);
 
@@ -559,7 +572,9 @@ mod tests {
 
         let (_dir, _coord, handle) = store();
         for _ in 0..40 {
-            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+            handle
+                .append(vec![event("Enrolled", &["course:c1"])], None)
+                .unwrap();
         }
         let pool = Arc::new(ReadPool::new(handle.reader(), 4));
 
@@ -568,7 +583,9 @@ mod tests {
             let handle = handle.clone();
             thread::spawn(move || {
                 for _ in 0..40 {
-                    handle.append(vec![event("Enrolled", &["course:c2"])], None).unwrap();
+                    handle
+                        .append(vec![event("Enrolled", &["course:c2"])], None)
+                        .unwrap();
                 }
             })
         };
@@ -595,7 +612,9 @@ mod tests {
     #[test]
     fn shutdown_joins_workers_and_a_later_read_is_empty() {
         let (_dir, _coord, handle) = store();
-        handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+        handle
+            .append(vec![event("Enrolled", &["course:c1"])], None)
+            .unwrap();
 
         let pool = ReadPool::new(handle.reader(), 2);
         let before = block_on(pool.read_all(Query::all(), Position::ZERO, None)).unwrap();
@@ -609,7 +628,9 @@ mod tests {
     fn a_tiny_bounded_queue_still_reads_correctly() {
         let (_dir, _coord, handle) = store();
         for _ in 0..25 {
-            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+            handle
+                .append(vec![event("Enrolled", &["course:c1"])], None)
+                .unwrap();
         }
         // queue_capacity 1 forces submissions to serialize through one slot.
         let pool = ReadPool::with_config(
@@ -626,7 +647,10 @@ mod tests {
         let a = block_on(pool.read_all(Query::all(), Position::ZERO, None)).unwrap();
         let b = block_on(pool.read_all(Query::all(), Position::ZERO, None)).unwrap();
         assert_eq!(a.len(), 25);
-        assert_eq!(a.iter().map(|(p, _)| *p).collect::<Vec<_>>(), direct(&handle, &Query::all()));
+        assert_eq!(
+            a.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            direct(&handle, &Query::all())
+        );
         assert_eq!(a.len(), b.len());
     }
 
@@ -634,7 +658,9 @@ mod tests {
     fn a_panicking_read_surfaces_as_aborted_not_a_clean_end() {
         let (_dir, _coord, handle) = store();
         for _ in 0..5 {
-            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+            handle
+                .append(vec![event("Enrolled", &["course:c1"])], None)
+                .unwrap();
         }
         let pool = ReadPool::new(handle.reader(), 1);
 
@@ -660,7 +686,9 @@ mod tests {
     fn dropping_the_pool_with_an_undrained_stream_does_not_hang() {
         let (_dir, _coord, handle) = store();
         for _ in 0..50 {
-            handle.append(vec![event("Enrolled", &["course:c1"])], None).unwrap();
+            handle
+                .append(vec![event("Enrolled", &["course:c1"])], None)
+                .unwrap();
         }
         // One worker, depth-1 channel, one-event batches: after the consumer takes a single
         // batch and stops, the worker fills the channel and parks on its next send.
