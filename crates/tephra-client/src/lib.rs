@@ -700,3 +700,9 @@ fn server_error(error: pb::ErrorResponseView<'_>) -> ClientError {
             .then(|| Position::new(error.conflict_position())),
     }
 }
+
+/// The README, compiled as a doctest so its code samples cannot drift from the API. Present
+/// only during doctest builds (`cfg(doctest)`), so it never appears in the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadme;

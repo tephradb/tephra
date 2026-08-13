@@ -151,9 +151,7 @@ fn a_torn_frame_is_an_error_not_a_clean_eof() {
 #[cfg(feature = "tokio")]
 mod async_framing {
     use tephra_proto::tephra::{AppendRequest, Request, request};
-    use tephra_proto::{
-        DEFAULT_MAX_FRAME_LEN, FrameError, read_frame_async, write_frame_async,
-    };
+    use tephra_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame_async, write_frame_async};
 
     use super::sample_event;
 

@@ -92,7 +92,9 @@ pub fn read_only_checks(
     let (recovered, read_err) = match read_prefix(addr) {
         Ok(pair) => pair,
         Err(err) => {
-            v.push(format!("could not connect to read the recovered log: {err}"));
+            v.push(format!(
+                "could not connect to read the recovered log: {err}"
+            ));
             return None;
         }
     };
@@ -301,7 +303,11 @@ fn present_entity_tag(recovered: &[SequencedEvent]) -> Option<String> {
 }
 
 /// Invariant 8: DCB conflict state survives recovery.
-fn check_dcb_integrity(addr: std::net::SocketAddr, existing_tag: Option<&str>, v: &mut Vec<String>) {
+fn check_dcb_integrity(
+    addr: std::net::SocketAddr,
+    existing_tag: Option<&str>,
+    v: &mut Vec<String>,
+) {
     // Guard on a tag known to be present in the recovered log, so the uniqueness guard must fire.
     let Some(existing_tag) = existing_tag else {
         return; // nothing present to conflict with
@@ -344,16 +350,15 @@ fn check_dcb_integrity(addr: std::net::SocketAddr, existing_tag: Option<&str>, v
 
 /// Invariant 7 (rebuild half): query answers are identical after deleting and rebuilding the
 /// index from the log.
-fn check_index_rebuild(
-    server: ServerProcess,
-    v: &mut Vec<String>,
-) -> io::Result<ServerProcess> {
+fn check_index_rebuild(server: ServerProcess, v: &mut Vec<String>) -> io::Result<ServerProcess> {
     let queries = query_battery();
     let before: Vec<BTreeSet<u64>> = {
         let mut client = match connect(server.addr) {
             Ok(client) => client,
             Err(err) => {
-                v.push(format!("index rebuild: could not connect before rebuild: {err}"));
+                v.push(format!(
+                    "index rebuild: could not connect before rebuild: {err}"
+                ));
                 return Ok(server);
             }
         };
@@ -368,7 +373,9 @@ fn check_index_rebuild(
     let mut client = match connect(server.addr) {
         Ok(client) => client,
         Err(err) => {
-            v.push(format!("index rebuild: could not connect after rebuild: {err}"));
+            v.push(format!(
+                "index rebuild: could not connect after rebuild: {err}"
+            ));
             return Ok(server);
         }
     };
@@ -380,7 +387,9 @@ fn check_index_rebuild(
                 before.len(),
                 after.len()
             )),
-            Err(err) => v.push(format!("index rebuild: query {query:?} failed after rebuild: {err}")),
+            Err(err) => v.push(format!(
+                "index rebuild: query {query:?} failed after rebuild: {err}"
+            )),
         }
     }
     Ok(server)

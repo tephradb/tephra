@@ -167,8 +167,14 @@ impl ServerProcess {
         // point firing, so this cycle exercised no crash during recovery.
         let listening = Arc::new(AtomicBool::new(false));
         for stream in [
-            child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-            child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
         ]
         .into_iter()
         .flatten()
@@ -226,7 +232,8 @@ impl ServerProcess {
 
     /// Restarts the server on the same data dir with no crash point (a clean recovery boot).
     pub fn restart_clean(self) -> io::Result<ServerProcess> {
-        let (bin, data_dir, config) = (self.bin.clone(), self.data_dir.clone(), self.config.clone());
+        let (bin, data_dir, config) =
+            (self.bin.clone(), self.data_dir.clone(), self.config.clone());
         // Dropping the old handle kills and reaps its child, so the data dir is free to reopen.
         drop(self);
         ServerProcess::spawn(&bin, &data_dir, &config, None)
@@ -245,7 +252,8 @@ impl ServerProcess {
     /// Kills the child, deletes the derived index directory, and restarts on the same log so the
     /// index is rebuilt from the log. Used by the index-vs-log invariant.
     pub fn restart_rebuilding_index(self) -> io::Result<ServerProcess> {
-        let (bin, data_dir, config) = (self.bin.clone(), self.data_dir.clone(), self.config.clone());
+        let (bin, data_dir, config) =
+            (self.bin.clone(), self.data_dir.clone(), self.config.clone());
         // Dropping the old handle kills and reaps its child before we touch the index dir.
         drop(self);
         let index_dir = data_dir.join("index");

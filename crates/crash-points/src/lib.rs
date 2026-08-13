@@ -11,15 +11,15 @@
 //! TEPHRA_CRASH_POINT=<site>:<action>[:<skip>]
 //! ```
 //!
-//! - `site` is the string passed to [`crash_point!`] or [`crash_io!`].
+//! - `site` is the string passed to [`crash_point!`](crate::crash_point) or [`crash_io!`](crate::crash_io).
 //! - `action` is one of `abort`, `eio`, `enospc`, `shortwrite`.
 //! - `skip` (default 0) is how many hits of that site to let pass before firing, so a narrow
 //!   window can be targeted deterministically (the writer thread hits these sites in a fixed
 //!   order, so the count is stable given a seed apart from thread scheduling above it).
 //!
-//! `abort` fires through [`crash_point!`] (a hard [`std::process::abort`], no unwinding, no
+//! `abort` fires through [`crash_point!`](crate::crash_point) (a hard [`std::process::abort`], no unwinding, no
 //! flush, the closest in-process analogue to a power cut at that line). `eio`, `enospc`, and
-//! `shortwrite` fire through [`crash_io!`], which returns the corresponding [`std::io::Error`]
+//! `shortwrite` fire through [`crash_io!`](crate::crash_io), which returns the corresponding [`std::io::Error`]
 //! from the enclosing function so the real error path is exercised.
 
 #[cfg(feature = "enabled")]
@@ -87,7 +87,7 @@ mod imp {
     }
 
     /// Aborts the process if `site` is configured with the `abort` action. Called by
-    /// [`crash_point!`].
+    /// [`crash_point!`](crate::crash_point).
     #[inline]
     pub fn fire(site: &str) {
         if let Some(plan) = plan()
@@ -102,7 +102,7 @@ mod imp {
 
     /// Returns true if `site` is configured with the `abort` action and this call is the one that
     /// should fire. Lets a call site do something custom (for example write a torn record) and
-    /// then abort, rather than the plain abort of [`crash_point!`].
+    /// then abort, rather than the plain abort of [`crash_point!`](crate::crash_point).
     #[inline]
     pub fn armed(site: &str) -> bool {
         match plan() {
@@ -112,7 +112,7 @@ mod imp {
     }
 
     /// Returns an injected error if `site` is configured with an I/O fault action. Called by
-    /// [`crash_io!`].
+    /// [`crash_io!`](crate::crash_io).
     #[inline]
     pub fn io_fault(site: &str) -> Option<io::Error> {
         let plan = plan()?;
@@ -157,7 +157,7 @@ macro_rules! crash_point {
     };
 }
 
-/// See [`crash_point!`]. This is the compiled-out form used when the feature is off.
+/// See [`crash_point!`](crate::crash_point). This is the compiled-out form used when the feature is off.
 #[cfg(not(feature = "enabled"))]
 #[macro_export]
 macro_rules! crash_point {
@@ -179,7 +179,7 @@ macro_rules! crash_io {
     };
 }
 
-/// See [`crash_io!`]. This is the compiled-out form used when the feature is off.
+/// See [`crash_io!`](crate::crash_io). This is the compiled-out form used when the feature is off.
 #[cfg(not(feature = "enabled"))]
 #[macro_export]
 macro_rules! crash_io {

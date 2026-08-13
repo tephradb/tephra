@@ -16,3 +16,9 @@ pub mod query;
 pub use name::{EventType, MAX_NAME_LEN, NameError, Tag, Tags, TagsError};
 pub use position::Position;
 pub use query::{AppendCondition, Query, QueryItem};
+
+/// The README, compiled as a doctest so its code samples cannot drift from the API. Present
+/// only during doctest builds (`cfg(doctest)`), so it never appears in the published docs.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadme;

@@ -241,8 +241,8 @@ impl ReadPool {
 
     /// Closes the job queue and joins every worker. Equivalent to dropping the pool, but
     /// explicit and blocking until the workers have exited. Bounded even if a consumer is
-    /// holding an undrained stream: a parked worker rechecks for shutdown every
-    /// [`SHUTDOWN_POLL`] and abandons its read.
+    /// holding an undrained stream: a parked worker rechecks for shutdown on a fixed poll
+    /// interval and abandons its read.
     pub fn shutdown(self) {
         // `Drop` does the work.
     }

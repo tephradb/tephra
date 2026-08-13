@@ -111,7 +111,11 @@ impl Ground {
 
     /// The highest position among all acked writes, or 0 if none were acked.
     pub fn max_acked_position(&self) -> u64 {
-        self.acked.values().map(|&(_, last)| last).max().unwrap_or(0)
+        self.acked
+            .values()
+            .map(|&(_, last)| last)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -142,7 +146,10 @@ mod tests {
             assert!(ground.sent.contains(&1));
             assert_eq!(ground.acked.get(&1), Some(&(1, 1)));
             // The torn ACKED 5 line is dropped; seq 5 is never recorded as acked.
-            assert!(!ground.acked.contains_key(&5), "torn ACKED must be dropped ({torn:?})");
+            assert!(
+                !ground.acked.contains_key(&5),
+                "torn ACKED must be dropped ({torn:?})"
+            );
         }
     }
 }

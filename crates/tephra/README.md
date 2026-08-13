@@ -28,35 +28,38 @@ rationale and the alternatives that were rejected.
 
 ## Example
 
-```rust
+```rust,no_run
 use tephra::{
     AppendCondition, Event, EventType, Position, Query, QueryItem, SegmentConfig,
     SegmentSet, Tag, Tags, WriteCoordinator, WriterConfig,
 };
 
-// Open (or create) a log directory and start the single-writer coordinator.
-let set = SegmentSet::open("tephra-data", SegmentConfig::new(256 * 1024 * 1024))?;
-let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default())?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Open (or create) a log directory and start the single-writer coordinator.
+    let set = SegmentSet::open("tephra-data", SegmentConfig::new(256 * 1024 * 1024))?;
+    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default())?;
 
-// Build a packed event, then append it guarded so it fails if course:c1 already exists.
-let ty = EventType::new("CourseOpened")?;
-let tags = Tags::new([Tag::new("course:c1")?])?;
-let event = Event::new(&ty, &tags, br#"{"course":"c1","seats":30}"#)?;
-let guard = AppendCondition::new(Query::item(QueryItem::with_tags(
-    Tags::new([Tag::new("course:c1")?])?,
-)));
-handle.append(vec![event], Some(guard))?;
+    // Build a packed event, then append it guarded so it fails if course:c1 already exists.
+    let ty = EventType::new("CourseOpened")?;
+    let tags = Tags::new([Tag::new("course:c1")?])?;
+    let event = Event::new(&ty, &tags, br#"{"course":"c1","seats":30}"#)?;
+    let guard = AppendCondition::new(Query::item(QueryItem::with_tags(
+        Tags::new([Tag::new("course:c1")?])?,
+    )));
+    handle.append(vec![event], Some(guard))?;
 
-// Reads run on the caller's thread over a snapshot. `read` returns a lending iterator, so it
-// is consumed with `while let`, not a `for` loop.
-let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
-let mut reads = handle.read(&query, Position::ZERO, None);
-while let Some(item) = reads.next() {
-    let seq = item?;
-    println!("{} {}", seq.position, seq.event.event_type());
+    // Reads run on the caller's thread over a snapshot. `read` returns a lending iterator, so it
+    // is consumed with `while let`, not a `for` loop.
+    let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
+    let mut reads = handle.read(&query, Position::ZERO, None);
+    while let Some(item) = reads.next() {
+        let seq = item?;
+        println!("{} {}", seq.position, seq.event.event_type());
+    }
+
+    coordinator.shutdown();
+    Ok(())
 }
-
-coordinator.shutdown();
 ```
 
 ## Related crates

@@ -222,7 +222,7 @@ fn main() -> ExitCode {
                 } else {
                     failures += 1;
                     for line in &result.violations {
-                        let key = line.splitn(2, ':').next().unwrap_or(line).to_string();
+                        let key = line.split(':').next().unwrap_or(line).to_string();
                         *violation_counts.entry(key).or_default() += 1;
                     }
                     println!(
@@ -286,7 +286,7 @@ fn main() -> ExitCode {
 /// Runs the Phase 2 battery: each instrumented abort site gets its own scenario, driven until the
 /// site fires, restarted, and checked against all invariants.
 fn run_phase2(base: &tephra_crashtest::HarnessConfig, cycles_per_site: u64) -> ExitCode {
-    use tephra_crashtest::{phase2_battery, run_cycle, HarnessConfig};
+    use tephra_crashtest::{HarnessConfig, phase2_battery, run_cycle};
 
     println!(
         "phase 2: targeted crash points, seed={} cycles_per_site={}\n",
@@ -355,7 +355,9 @@ fn run_phase2(base: &tephra_crashtest::HarnessConfig, cycles_per_site: u64) -> E
             println!(
                 "    cycle {cycle} FAIL (seed {}) artifact={}",
                 base.seed,
-                artifact.map(|p| p.display().to_string()).unwrap_or_default()
+                artifact
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
             );
             for line in lines.iter().take(8) {
                 println!("      - {line}");
@@ -381,7 +383,7 @@ fn run_phase2(base: &tephra_crashtest::HarnessConfig, cycles_per_site: u64) -> E
 /// write. Each scenario runs the fault while writing, then SIGKILLs and recovers, checking all
 /// invariants plus the fault-specific expectation on the acked count.
 fn run_phase3(base: &tephra_crashtest::HarnessConfig, cycles_per_site: u64) -> ExitCode {
-    use tephra_crashtest::{phase3_battery, run_cycle, HarnessConfig, Phase3Expect};
+    use tephra_crashtest::{HarnessConfig, Phase3Expect, phase3_battery, run_cycle};
 
     println!(
         "phase 3: lying storage, seed={} cycles_per_site={}\n",

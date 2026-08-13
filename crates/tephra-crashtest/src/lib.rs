@@ -125,7 +125,12 @@ pub fn phase2_battery() -> Vec<Phase2Site> {
             65536,
             Workload::PureAppend,
         ),
-        site("partial_ack", "partial_ack:abort:8", 65536, Workload::PureAppend),
+        site(
+            "partial_ack",
+            "partial_ack:abort:8",
+            65536,
+            Workload::PureAppend,
+        ),
         site(
             "segment_created_before_commit",
             "segment_created_before_commit:abort:2",
@@ -413,7 +418,8 @@ pub fn spawn_and_verify(
     segment_size: usize,
     witness_path: &Path,
 ) -> io::Result<Vec<String>> {
-    let config_path = std::env::temp_dir().join(format!("tephra-verify-{}.toml", std::process::id()));
+    let config_path =
+        std::env::temp_dir().join(format!("tephra-verify-{}.toml", std::process::id()));
     write_config(&config_path, segment_size)?;
     let server = ServerProcess::spawn(server_bin, data_dir, &config_path, None)?;
     let ground = Ground::read(witness_path)?;
