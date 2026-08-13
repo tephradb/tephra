@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/crash-points",
     "crates/seglog",
     "crates/tephra",
     "crates/tephra-client",
@@ -22,7 +21,6 @@ repository = "https://github.com/tqwewe/tephra"
 
 [workspace.dependencies]
 # Internal crates
-crash-points = { path = "crates/crash-points" }
 seglog = { path = "crates/seglog", version = "0.3.2" }
 tephra = { path = "crates/tephra", version = "0.3.0" }
 tephra-client = { path = "crates/tephra-client", version = "0.3.0" }

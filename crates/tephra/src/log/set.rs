@@ -609,7 +609,7 @@ impl SegmentSet {
         // but the batch that triggered the rollover has not been committed to it yet (there is
         // no separate manifest here: the filename plus header is the record of the segment).
         // Recovery must accept a trailing header-only segment with zero events.
-        crash_points::crash_point!("segment_created_before_commit");
+        seglog::crash_point!("segment_created_before_commit");
 
         let old_active = mem::replace(&mut self.active, new_active);
         self.sealed.push(old_active);

@@ -121,7 +121,7 @@ impl<const H: usize> Writer<H> {
         #[cfg(target_os = "linux")]
         {
             // Crash point: ENOSPC on segment extension (the fallocate that grows a new segment).
-            crash_points::crash_io!("segment_extend");
+            crate::crash_io!("segment_extend");
             nix::fcntl::fallocate(&file, nix::fcntl::FallocateFlags::empty(), 0, size as i64)?;
         }
 
@@ -275,7 +275,7 @@ impl<const H: usize> Writer<H> {
 
         // Crash point: a short write on the segment file (a data record that makes no
         // progress). Surfaces as an error so the batch rewinds and nothing is acked.
-        crash_points::crash_io!("commit_shortwrite");
+        crate::crash_io!("commit_shortwrite");
 
         // The length field is the total payload length (header + data); bit 30 (control) and
         // bit 31 (reserved) are always zero for a caller data record.
@@ -320,7 +320,7 @@ impl<const H: usize> Writer<H> {
         self.write_commit_marker(highest_position)?;
         // Crash point: batch assembled and the commit marker written, before the fsync. The
         // marker sits in the buffer or page cache; recovery must discard the whole batch.
-        crash_points::crash_point!("commit_before_fsync");
+        crate::crash_point!("commit_before_fsync");
         self.last_position = Some(highest_position);
         self.sync()
     }
@@ -352,7 +352,7 @@ impl<const H: usize> Writer<H> {
         // longer matches. Recovery must reject this run (the marker is invalid); a recovery that
         // skips the trailing-record CRC would wrongly adopt it.
         #[cfg(feature = "crash-points")]
-        if crash_points::armed("torn_marker") {
+        if crate::crash_points::armed("torn_marker") {
             let _ = self.writer.write_all(&payload[..1]);
             let _ = self.writer.flush();
             std::process::abort();
@@ -460,7 +460,7 @@ impl<const H: usize> Writer<H> {
             self.writer.flush()?;
             // Crash point: fsync returns EIO. Tephra must treat this as fatal for the batch
             // and ack nothing from it, never retry over a dropped dirty page.
-            crash_points::crash_io!("commit_fsync");
+            crate::crash_io!("commit_fsync");
             self.writer.get_ref().sync_data()?;
             self.flushed_offset.set(self.write_offset);
             self.dirty = false;
@@ -555,7 +555,7 @@ fn recover(file: &File, size: usize, start_offset: u64) -> Result<Recovered, Wri
             last_position = Some(u64::from_le_bytes(payload[1..].try_into().unwrap()));
             // Crash point: a crash during recovery itself, once a commit marker has been
             // accepted. The next open must reach the same committed point.
-            crash_points::crash_point!("recovery_midway");
+            crate::crash_point!("recovery_midway");
         }
         cursor = record_end;
     }

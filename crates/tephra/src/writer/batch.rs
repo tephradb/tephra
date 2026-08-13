@@ -132,7 +132,7 @@ impl<'a> Batch<'a> {
         for s in self.staged {
             // Crash point: some but not all clients in a durable batch have been acked. The
             // unacked ones are still durable, so they must be present after recovery too.
-            crash_points::crash_point!("partial_ack");
+            seglog::crash_point!("partial_ack");
             // A dropped receiver (caller gave up) is fine; the write is durable either way.
             let _ = s.reply.send((s.token, Ok(s.range)));
         }

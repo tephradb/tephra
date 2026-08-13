@@ -268,7 +268,7 @@ impl Worker {
             Ok(range) => {
                 // Crash point: the batch is durable (fsync returned) but no client in it has
                 // been acked yet. Every write in the batch must be present after recovery.
-                crash_points::crash_point!("after_fsync_before_ack");
+                seglog::crash_point!("after_fsync_before_ack");
                 // Feed the index before replying, so a caller that reads right after its
                 // append sees its own write (read-your-writes). The write is already
                 // durable here, so nothing below can turn it into a failure.
