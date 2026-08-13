@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/tqwewe/tephra/compare/seglog-v0.3.1...seglog-v0.3.2) - 2026-08-13
+
+### Fixed
+
+- *(tephra)* recover a short trailing segment left by a failed extension ([#7](https://github.com/tqwewe/tephra/pull/7))
+
+### Other
+
+- add workspace checks and make the tree pass them ([#12](https://github.com/tqwewe/tephra/pull/12))
+
 ## [0.3.1](https://github.com/tqwewe/tephra/compare/seglog-v0.3.0...seglog-v0.3.1) - 2026-08-11
 
 ### Other
