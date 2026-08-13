@@ -5,7 +5,7 @@
 //! duplicate-free set of tags. These are the addressable surface of an event: they drive
 //! queries and the append condition, and they become index keys in the engine.
 
-use std::fmt;
+use std::{fmt, slice};
 
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -66,6 +66,10 @@ impl EventType {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn into_inner(self) -> Box<str> {
+        self.0
+    }
 }
 
 impl AsRef<str> for EventType {
@@ -96,6 +100,10 @@ impl Tag {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_inner(self) -> Box<str> {
+        self.0
     }
 }
 
@@ -162,6 +170,10 @@ impl Tags {
         Tags(SmallVec::new())
     }
 
+    pub fn into_inner(self) -> SmallVec<[Tag; 4]> {
+        self.0
+    }
+
     pub fn as_slice(&self) -> &[Tag] {
         &self.0
     }
@@ -174,8 +186,17 @@ impl Tags {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Tag> {
+    pub fn iter(&self) -> slice::Iter<'_, Tag> {
         self.0.iter()
+    }
+}
+
+impl IntoIterator for Tags {
+    type Item = Tag;
+    type IntoIter = smallvec::IntoIter<[Tag; 4]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 

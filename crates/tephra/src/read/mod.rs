@@ -62,6 +62,8 @@ use crate::query::{Matches, Query};
 
 use crate::index::IndexSet;
 
+#[cfg(feature = "async")]
+pub mod pool;
 mod subscribe;
 
 pub use subscribe::{DEFAULT_MAX_BATCH_EVENTS, Subscription};
@@ -379,14 +381,18 @@ pub struct Sequenced<'a> {
     pub event: EventRef<'a>,
 }
 
-/// Why a read failed. Every variant is an integrity or I/O failure; a query that simply
-/// matches nothing yields an empty stream, not an error.
+/// Why a read failed. `Log` and `Corrupt` are integrity or I/O failures; a query that simply
+/// matches nothing yields an empty stream, not an error. `Aborted` is raised only by the
+/// async [`pool`] when the worker running a read panics, so a truncated result cannot be
+/// mistaken for a completed one.
 #[derive(Debug, Error)]
 pub enum ReadError {
     #[error("log error during read: {0}")]
     Log(Arc<LogError>),
     #[error("corrupt event during read: {0}")]
     Corrupt(DecodeError),
+    #[error("read aborted before completion: the worker running it panicked")]
+    Aborted,
 }
 
 /// A lending iterator over the events matching a read, in ascending position order.

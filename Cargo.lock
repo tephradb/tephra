@@ -938,6 +938,7 @@ dependencies = [
  "dashmap",
  "flume",
  "fst",
+ "futures-core",
  "seglog",
  "smallvec",
  "tempfile",

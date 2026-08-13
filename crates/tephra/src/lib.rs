@@ -69,6 +69,8 @@ pub use query::Matches;
 pub use read::{
     DEFAULT_MAX_BATCH_EVENTS, ReadConfig, ReadError, ReadHandle, Subscription, WaitOutcome,
 };
+#[cfg(feature = "async")]
+pub use read::pool::{ReadPool, ReadPoolConfig, ReadStream};
 pub use tephra_types::{
     AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
     TagsError,
