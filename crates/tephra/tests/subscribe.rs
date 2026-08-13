@@ -212,7 +212,7 @@ fn subscribe_at_watermark_then_receives_next_append() {
     for _ in 0..10 {
         append(&handle, "k:1");
     }
-    let tip = handle.read(Query::all(), Position::ZERO, None).watermark();
+    let tip = handle.read(&Query::all(), Position::ZERO, None).watermark();
     assert_eq!(tip, Position::new(10));
 
     let mut sub = handle.subscribe(Query::all(), tip);

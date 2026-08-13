@@ -44,7 +44,7 @@
 //! // Reads run on the caller's thread over a snapshot published at each commit. `read` returns
 //! // a lending iterator, so it is consumed with `while let`, not a `for` loop.
 //! let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
-//! let mut reads = handle.read(query, Position::ZERO, None);
+//! let mut reads = handle.read(&query, Position::ZERO, None);
 //! while let Some(item) = reads.next() {
 //!     let seq = item?;
 //!     println!("{} {}", seq.position, seq.event.event_type());

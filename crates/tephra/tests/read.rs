@@ -139,7 +139,7 @@ fn coordinator_with_scan_bias(scan_bias: u32) -> (WriteCoordinator, WriteHandle,
 
 fn read_owned(
     handle: &WriteHandle,
-    query: Query,
+    query: &Query,
     after: Position,
 ) -> Result<Vec<(Position, Event)>, ReadError> {
     handle.read(query, after, None).collect_owned()
@@ -180,7 +180,7 @@ fn read_matches_scan_over_random_workload_across_segments() {
     for _ in 0..2000 {
         let query = random_query(&mut qrng);
         let after = Position::new(qrng.below(last + 1));
-        let got = read_owned(&handle, query.clone(), after).unwrap();
+        let got = read_owned(&handle, &query, after).unwrap();
         cases.push((query, after, got));
     }
 
@@ -237,7 +237,7 @@ fn the_planner_never_changes_the_answer() {
         let results: Vec<Vec<Position>> = cases
             .iter()
             .map(|(query, after)| {
-                read_owned(&handle, query.clone(), *after)
+                read_owned(&handle, query, *after)
                     .unwrap()
                     .into_iter()
                     .map(|(p, _)| p)
@@ -299,7 +299,7 @@ fn a_limit_truncates_the_result_identically_on_every_path() {
             .iter()
             .map(|(query, after, limit)| {
                 handle
-                    .read(query.clone(), *after, Some(*limit))
+                    .read(query, *after, Some(*limit))
                     .collect_owned()
                     .unwrap()
                     .into_iter()
@@ -337,7 +337,7 @@ fn concurrent_reads_see_a_consistent_prefix_under_heavy_appends() {
             thread::spawn(move || {
                 let mut observed = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let mut reads = reader.read(Query::all(), Position::ZERO, None);
+                    let mut reads = reader.read(&Query::all(), Position::ZERO, None);
                     let watermark = reads.watermark().get();
                     let mut positions = Vec::new();
                     while let Some(item) = reads.next() {
@@ -390,7 +390,7 @@ fn concurrent_reads_of_the_active_index_see_a_consistent_prefix() {
                 let mut max_seen = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
-                    let mut reads = reader.read(query, Position::ZERO, None);
+                    let mut reads = reader.read(&query, Position::ZERO, None);
                     let watermark = reads.watermark().get();
                     let mut positions = Vec::new();
                     while let Some(item) = reads.next() {
@@ -435,7 +435,7 @@ fn watermark_resume_has_no_gap_or_duplicate() {
         handle.append(vec![random_event(&mut rng)], None).unwrap();
     }
 
-    let first = handle.read(Query::all(), Position::ZERO, None);
+    let first = handle.read(&Query::all(), Position::ZERO, None);
     let w1 = first.watermark();
     let prefix: Vec<u64> = collect_positions(first);
     assert_eq!(prefix, (1..=w1.get()).collect::<Vec<_>>());
@@ -444,7 +444,7 @@ fn watermark_resume_has_no_gap_or_duplicate() {
         handle.append(vec![random_event(&mut rng)], None).unwrap();
     }
 
-    let resumed = handle.read(Query::all(), w1, None);
+    let resumed = handle.read(&Query::all(), w1, None);
     let w2 = resumed.watermark();
     let tail: Vec<u64> = collect_positions(resumed);
     assert!(w2 > w1, "watermark should advance after more appends");
