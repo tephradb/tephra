@@ -11,6 +11,7 @@ repository.workspace = true
 seglog.workspace = true
 tephra-types.workspace = true
 
+crash-points.workspace = true
 crc32fast.workspace = true
 dashmap.workspace = true
 flume.workspace = true
@@ -26,6 +27,8 @@ tempfile.workspace = true
 [features]
 async = ["flume/async"]
 tracing = ["dep:tracing", "seglog/tracing"]
+# Turns on the gated crash and fault injection points across the engine and seglog.
+crash-points = ["crash-points/enabled", "seglog/crash-points"]
 
 [[bench]]
 name = "write_path"

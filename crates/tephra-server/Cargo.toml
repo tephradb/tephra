@@ -28,6 +28,10 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 
+[features]
+# Turns on the gated crash and fault injection points in the engine. Off by default.
+crash-points = ["tephra/crash-points"]
+
 [[bin]]
 name = "tephra-server"
 path = "src/main.rs"

@@ -341,42 +341,54 @@ impl SegmentSet {
         }
         entries.sort_by_key(|(base, _)| *base);
 
-        // 3. Read each header. An unwritten (all-zero) header is a crash between
-        //    create and header write; it is only legal on the last file.
-        let n = entries.len();
-        let mut valid: Vec<(Position, PathBuf)> = Vec::new();
+        // 3. Classify each segment. A segment is "unwritten" if its file is shorter than a full
+        //    header (creation crashed or hit ENOSPC before the fallocate or header write) or its
+        //    header is all zeros (created and fallocated but not yet header-written). Either way its
+        //    creation did not finish, so it holds no committed data. Unwritten segments are legal
+        //    only as a trailing run (a failed rollover can leave more than one, for example ENOSPC
+        //    creating the next segment on each retry); each trailing unwritten segment is deleted.
+        //    An unwritten segment *before* a valid one is a real gap and a hard error.
+        let mut unwritten = vec![false; entries.len()];
         for (i, (name_base, path)) in entries.iter().enumerate() {
-            let buf = read_header(path)?;
-            match SegmentHeader::from_bytes(&buf) {
-                Ok(header) => {
-                    if header.base_position != *name_base {
-                        return Err(LogError::BasePositionMismatch {
+            match read_header(path)? {
+                None => unwritten[i] = true,
+                Some(buf) => match SegmentHeader::from_bytes(&buf) {
+                    Ok(header) => {
+                        if header.base_position != *name_base {
+                            return Err(LogError::BasePositionMismatch {
+                                path: path.clone(),
+                                header: header.base_position,
+                                name: *name_base,
+                            });
+                        }
+                    }
+                    Err(HeaderError::Unwritten) => unwritten[i] = true,
+                    Err(source) => {
+                        return Err(LogError::Header {
                             path: path.clone(),
-                            header: header.base_position,
-                            name: *name_base,
+                            source,
                         });
                     }
-                    valid.push((*name_base, path.clone()));
-                }
-                Err(HeaderError::Unwritten) if i == n - 1 => {
-                    // A segment created but never header-written. Legal only as the
-                    // trailing file; drop it and continue.
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(
-                        "deleting unwritten trailing segment {path:?} (crash between create and header write)"
-                    );
-                    fs::remove_file(path).map_err(|source| LogError::io(path, source))?;
-                    sync_dir(&dir).map_err(|source| LogError::io(&dir, source))?;
-                }
-                Err(HeaderError::Unwritten) => {
-                    return Err(LogError::UnwrittenNonLast { path: path.clone() });
-                }
-                Err(source) => {
-                    return Err(LogError::Header {
-                        path: path.clone(),
-                        source,
-                    });
-                }
+                },
+            }
+        }
+
+        // The last segment that is written; everything unwritten after it is a trailing run.
+        let last_written = (0..entries.len()).rev().find(|&i| !unwritten[i]);
+        let mut valid: Vec<(Position, PathBuf)> = Vec::new();
+        for (i, (name_base, path)) in entries.iter().enumerate() {
+            if !unwritten[i] {
+                valid.push((*name_base, path.clone()));
+            } else if last_written.is_none_or(|lw| i > lw) {
+                // Trailing unwritten segment: drop it and continue.
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "deleting unwritten trailing segment {path:?} (creation did not finish)"
+                );
+                fs::remove_file(path).map_err(|source| LogError::io(path, source))?;
+                sync_dir(&dir).map_err(|source| LogError::io(&dir, source))?;
+            } else {
+                return Err(LogError::UnwrittenNonLast { path: path.clone() });
             }
         }
 
@@ -592,6 +604,12 @@ impl SegmentSet {
 
         let (writer, new_active) =
             Self::create_segment(&self.dir, &self.config, self.next_position)?;
+
+        // Crash point: mid rollover. The new segment file exists and its header is fsynced,
+        // but the batch that triggered the rollover has not been committed to it yet (there is
+        // no separate manifest here: the filename plus header is the record of the segment).
+        // Recovery must accept a trailing header-only segment with zero events.
+        crash_points::crash_point!("segment_created_before_commit");
 
         let old_active = mem::replace(&mut self.active, new_active);
         self.sealed.push(old_active);
@@ -1135,13 +1153,18 @@ fn parse_base_position(name: &str) -> Option<Position> {
     stem.parse::<u64>().ok().map(Position::new)
 }
 
-/// Reads the first [`SEGMENT_HEADER_SIZE`] bytes of a segment file.
-fn read_header(path: &Path) -> Result<[u8; SEGMENT_HEADER_SIZE], LogError> {
+/// Reads the first [`SEGMENT_HEADER_SIZE`] bytes of a segment file, or `None` if the file is
+/// shorter than a full header. A short file is a segment whose creation did not finish (the
+/// `create_new` succeeded but the `fallocate` or the header write did not, as on a crash or an
+/// `ENOSPC` during rollover), which the caller treats as unwritten.
+fn read_header(path: &Path) -> Result<Option<[u8; SEGMENT_HEADER_SIZE]>, LogError> {
     let file = File::open(path).map_err(|source| LogError::io(path, source))?;
     let mut buf = [0u8; SEGMENT_HEADER_SIZE];
-    file.read_exact_at(&mut buf, 0)
-        .map_err(|source| LogError::io(path, source))?;
-    Ok(buf)
+    match file.read_exact_at(&mut buf, 0) {
+        Ok(()) => Ok(Some(buf)),
+        Err(source) if source.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(source) => Err(LogError::io(path, source)),
+    }
 }
 
 /// Scans a segment for its data-record byte offsets, indexed by local position.
@@ -1258,6 +1281,42 @@ mod tests {
             let record = set.read_at(Position::new(i)).unwrap();
             assert_eq!(record.position, Position::new(i));
             assert_eq!(record.data, format!("event-{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn open_deletes_short_trailing_segment_and_recovers() {
+        // A rollover whose `create_new` succeeded but whose `fallocate` or header write did not (a
+        // crash or ENOSPC during extension) leaves a segment file shorter than a header, commonly
+        // zero bytes. Opening must treat that trailing short file as unwritten: delete it and
+        // recover the committed data, not refuse to open on a short header read.
+        let dir = TempDir::new().unwrap();
+        {
+            let mut set = open(dir.path(), 4096);
+            for i in 1..=5u64 {
+                append_one(&mut set, format!("event-{i}").as_bytes());
+            }
+        }
+
+        // Stray 0-byte segments left by failed extensions. A retrying rollover under ENOSPC can
+        // leave more than one, so cover a trailing run of two: both sort after the real segment
+        // and both must be deleted.
+        let stray1 = dir.path().join(segment_file_name(Position::new(6)));
+        let stray2 = dir.path().join(segment_file_name(Position::new(7)));
+        File::create(&stray1).unwrap();
+        File::create(&stray2).unwrap();
+        assert_eq!(fs::metadata(&stray1).unwrap().len(), 0);
+
+        let set = open(dir.path(), 4096);
+        assert!(!stray1.exists(), "trailing 0-byte segment 6 should be deleted on open");
+        assert!(!stray2.exists(), "trailing 0-byte segment 7 should be deleted on open");
+        assert_eq!(set.next_position(), Position::new(6));
+        assert_eq!(set.last_position(), Position::new(5));
+        for i in 1..=5u64 {
+            assert_eq!(
+                set.read_at(Position::new(i)).unwrap().data,
+                format!("event-{i}").into_bytes()
+            );
         }
     }
 
