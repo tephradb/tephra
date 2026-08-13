@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/tqwewe/tephra/compare/tephra-client-v0.2.1...tephra-client-v0.3.0) - 2026-08-13
+
+### Other
+
+- accept owned strings (Into<Box<str>>) in event, tag, and type constructors
+
 ## [0.2.1](https://github.com/tqwewe/tephra/compare/tephra-client-v0.2.0...tephra-client-v0.2.1) - 2026-08-12
 
 ### Fixed
