@@ -36,7 +36,40 @@ pub fn search<'a, I: SegmentIndex>(
     query: &Query,
     after: Position,
 ) -> impl Iterator<Item = Position> + 'a {
-    let locals = match query {
+    let base = index.base().get();
+    local_matches(index, query)
+        .into_iter()
+        .map(move |local| Position::new(base + local as u64))
+        .filter(move |global| *global > after)
+}
+
+/// Positions of events matching `query`, **descending**, deduped, strictly before `before`.
+///
+/// The reverse counterpart to [`search`]: the identical match set, but yielded high-to-low and
+/// bounded above rather than below. `before` is the exclusive **upper** bound (the dual of
+/// `search`'s exclusive lower `after`), so `search_back(index, query, Position::MAX)` walks the
+/// whole segment newest-first. Used by the backwards read path; the descending-per-segment
+/// contract composes across segments by concatenating them high-to-low (the mirror of
+/// [`search`]'s ascending concatenation).
+pub fn search_back<'a, I: SegmentIndex>(
+    index: &'a I,
+    query: &Query,
+    before: Position,
+) -> impl Iterator<Item = Position> + 'a {
+    let base = index.base().get();
+    // `local_matches` is ascending; reversing it makes the globals descending.
+    local_matches(index, query)
+        .into_iter()
+        .rev()
+        .map(move |local| Position::new(base + local as u64))
+        .filter(move |global| *global < before)
+}
+
+/// The ascending, deduped local positions matching `query` in this segment. The single
+/// definition of the query semantics, shared by [`search`] and [`search_back`] so the forward
+/// and backward evaluators can never disagree on *which* events match.
+fn local_matches<I: SegmentIndex>(index: &I, query: &Query) -> Vec<u32> {
+    match query {
         Query::All => (0..index.len()).collect(),
         Query::Items(items) => {
             // Union across items, then sort + dedup so the output is ascending with no
@@ -52,13 +85,7 @@ pub fn search<'a, I: SegmentIndex>(
             locals.dedup();
             locals
         }
-    };
-
-    let base = index.base().get();
-    locals
-        .into_iter()
-        .map(move |local| Position::new(base + local as u64))
-        .filter(move |global| *global > after)
+    }
 }
 
 /// Appends the local positions matching `item` (ascending) to `out`.
@@ -178,6 +205,12 @@ mod tests {
             .collect()
     }
 
+    fn run_back(index: &ActiveTail, query: &Query, before: u64) -> Vec<u64> {
+        search_back(&index.view_full(), query, Position::new(before))
+            .map(|p| p.get())
+            .collect()
+    }
+
     // --- spec-anchored expectations (answers derived from the DCB spec, not the code) ---
 
     #[test]
@@ -290,5 +323,46 @@ mod tests {
             QueryItem::with_tags(tags(&["student:s1"])), // 3, 4
         ]);
         assert_eq!(run(&index, &q, 0), vec![2, 3, 4, 5]);
+    }
+
+    // --- backwards search ---
+
+    /// The reverse evaluator returns exactly the forward match set, descending. Checked across
+    /// every query shape above so `search_back` can never disagree with `search` on *which*
+    /// events match, only on order and bound.
+    #[test]
+    fn search_back_is_search_reversed() {
+        let index = fixture();
+        let queries = [
+            Query::all(),
+            Query::item(QueryItem::default()),
+            Query::item(QueryItem::with_tags(tags(&["course:c1"]))),
+            Query::item(QueryItem::with_tags(tags(&["course:c1", "student:s1"]))),
+            Query::item(QueryItem::of_types(vec![ty("Registered")])),
+            Query::item(QueryItem::new(vec![ty("Enrolled")], tags(&["course:c1"]))),
+            Query::items(vec![
+                QueryItem::of_types(vec![ty("Renamed")]),
+                QueryItem::with_tags(tags(&["course:c1"])),
+            ]),
+            Query::items(Vec::new()),
+        ];
+        for q in &queries {
+            let mut forward = run(&index, q, 0);
+            forward.reverse();
+            assert_eq!(run_back(&index, q, u64::MAX), forward, "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn before_is_exclusive_upper_bound() {
+        let index = fixture();
+        let q = Query::item(QueryItem::with_tags(tags(&["course:c1"]))); // at 2, 3, 5
+        // `before` excludes at-or-after, descending.
+        assert_eq!(run_back(&index, &q, u64::MAX), vec![5, 3, 2]);
+        assert_eq!(run_back(&index, &q, 5), vec![3, 2]);
+        assert_eq!(run_back(&index, &q, 3), vec![2]);
+        assert_eq!(run_back(&index, &q, 2), Vec::<u64>::new());
+        // All, bounded above mid-log.
+        assert_eq!(run_back(&index, &Query::all(), 4), vec![3, 2, 1]);
     }
 }

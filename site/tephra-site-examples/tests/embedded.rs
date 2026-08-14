@@ -51,6 +51,31 @@ fn embed_the_engine_directly() {
     assert_eq!(range.first, Position::new(1));
     assert_eq!(count, 1);
 
+    // ANCHOR: read_back
+    // Append a little history so there is something to page through.
+    for seats in [40u32, 50] {
+        let payload = format!(r#"{{"course":"c1","seats":{seats}}}"#);
+        let more = Event::new(&ty, &tags, payload.as_bytes()).expect("encode");
+        handle.append(vec![more], None).expect("append");
+    }
+
+    // Read newest-first: `read_back` yields matching events in descending position order.
+    // `before` is an exclusive upper bound, so `Position::MAX` starts at the durable tip. Pair it
+    // with a `limit` and pass the oldest position of a page back as the next `before` to drive an
+    // event explorer one newest-first page at a time.
+    let mut newest_first = Vec::new();
+    let mut reads = handle.read_back(&query, Position::MAX, Some(10));
+    while let Some(item) = reads.next() {
+        let seq = item.expect("decode");
+        newest_first.push(seq.position);
+    }
+    // ANCHOR_END: read_back
+
+    assert_eq!(
+        newest_first,
+        vec![Position::new(3), Position::new(2), Position::new(1)]
+    );
+
     // Shutdown joins the writer thread and returns the SegmentSet.
     coordinator.shutdown();
 }

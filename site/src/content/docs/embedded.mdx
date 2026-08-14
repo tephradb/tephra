@@ -58,6 +58,22 @@ yield a borrow of itself per item, and yielding an owned value would force an al
 copy on the highest-volume read path. The client's read stream, by contrast, is a plain
 `Iterator`, because it hands back owned events decoded off the wire.
 
+## Read backwards
+
+`read_back` is the newest-first dual of `read`: it returns matching events in descending position
+order. Where `read` takes `after` (an exclusive lower bound), `read_back` takes `before` (an
+exclusive upper bound), so `Position::MAX` starts at the durable tip. It is the natural fit for an
+event-explorer UI that shows recent events first.
+
+<Code code={anchor(embRaw, 'read_back')} lang="rust" />
+
+Pagination is symmetric to a forward read: pass a `limit` for the page size, then set the next
+`before` to the oldest position the page returned, and the pages tile the whole history with no
+gap and no duplicate at any seam. The read is still pinned to the watermark at call time, and it
+stays fast without reading the whole log backward: it reads records in windows and only reverses
+their order within each window, so a page near the tip touches only a page's worth of data. See
+[Architecture](../architecture/) for how the reverse scan preserves read-ahead.
+
 ## Shutdown
 
 `WriteCoordinator::shutdown` signals the writer thread, joins it, and returns the `SegmentSet`.

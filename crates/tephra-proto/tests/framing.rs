@@ -2,7 +2,7 @@
 
 use std::io::{self, Cursor};
 
-use tephra_proto::tephra::{AppendRequest, Event, Request, Response, request};
+use tephra_proto::tephra::{AppendRequest, Event, ReadRequest, Request, Response, request};
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame, write_frame};
 
 fn sample_event(ty: &str, tags: &[&str], payload: &[u8]) -> Event {
@@ -52,6 +52,39 @@ fn request_round_trips_through_a_frame() {
         }
         other => panic!("expected append, got {other:?}"),
     }
+}
+
+#[test]
+fn read_request_reverse_field_round_trips_through_a_frame() {
+    // A backward read: reverse set, `after` reused as the exclusive upper cursor, with a limit.
+    let mut read = ReadRequest::new();
+    read.set_after(42);
+    read.set_reverse(true);
+    read.set_limit(10);
+    let mut req = Request::new();
+    req.set_request_id(3);
+    req.set_read(read);
+
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &req, DEFAULT_MAX_FRAME_LEN).unwrap();
+    let mut cursor = Cursor::new(buf);
+    let got: Request = read_frame(&mut cursor, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("one frame present");
+
+    match got.kind() {
+        request::KindOneof::Read(read) => {
+            assert_eq!(read.after(), 42);
+            assert!(read.reverse());
+            assert_eq!(read.limit_opt(), Some(10));
+        }
+        other => panic!("expected read, got {other:?}"),
+    }
+
+    // A forward read never sets the field, so it decodes as false (backward compatibility).
+    let mut fwd = ReadRequest::new();
+    fwd.set_after(1);
+    assert!(!fwd.as_view().reverse());
 }
 
 #[test]

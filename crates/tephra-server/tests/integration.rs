@@ -254,6 +254,69 @@ fn read_limit_caps_the_result_and_paginates() {
 }
 
 #[test]
+fn read_back_streams_newest_first_and_paginates() {
+    let ts = TestServer::start();
+    let mut client = ts.client();
+
+    // A selective history interleaved with noise, so a reverse read exercises the filter, not
+    // just a dense suffix.
+    let total = 25u64;
+    for i in 0..total {
+        client
+            .append(
+                [ev("Enrolled", &["student:s0"], format!("e{i}").as_bytes())],
+                None,
+            )
+            .unwrap();
+        client
+            .append([ev("Enrolled", &["student:s1"], b"noise")], None)
+            .unwrap();
+    }
+    let query = || tag_query(&["student:s0"]);
+
+    // read_all_back over the whole history equals read_all reversed, strictly descending.
+    let (forward, _) = client.read_all(query(), Position::ZERO, None).unwrap();
+    let mut want = positions(&forward);
+    want.reverse();
+    let (back, _) = client.read_all_back(query(), Position::MAX, None).unwrap();
+    assert_eq!(positions(&back), want);
+    assert!(
+        positions(&back).windows(2).all(|w| w[0] > w[1]),
+        "descending by position"
+    );
+
+    // A limit takes the newest N.
+    let (page, _) = client
+        .read_all_back(query(), Position::MAX, Some(10))
+        .unwrap();
+    assert_eq!(positions(&page), want[..10].to_vec());
+
+    // Paginate newest-first with `before` + `limit`: the concatenation equals the full reverse,
+    // with no gap and no duplicate at any seam.
+    let page_size = 7;
+    let mut before = Position::MAX;
+    let mut tiled: Vec<u64> = Vec::new();
+    loop {
+        let (chunk, _) = client
+            .read_all_back(query(), before, Some(page_size))
+            .unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        before = chunk.last().unwrap().position(); // the oldest position in this page
+        tiled.extend(positions(&chunk));
+    }
+    assert_eq!(tiled, want);
+
+    // `before = Position::ZERO` is the exclusive-upper "before everything" bound, so it returns
+    // nothing over the wire, exactly as the embedded `read_back(Position::ZERO)` does. This pins
+    // that the transport does not reinterpret a zero cursor as "from the tip".
+    let (empty, watermark) = client.read_all_back(query(), Position::ZERO, None).unwrap();
+    assert!(empty.is_empty());
+    assert_eq!(watermark.get(), 2 * total);
+}
+
+#[test]
 fn durable_append_conflict_is_reported_and_not_retryable() {
     let ts = TestServer::start();
     let mut client = ts.client();

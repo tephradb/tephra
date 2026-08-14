@@ -224,10 +224,38 @@ impl AsyncClient {
     /// server-side during planning. With `after` it forms a stateless pagination cursor: read
     /// a page, then read again with `after` set to the last position, with no gap or duplicate.
     pub async fn read(&self, query: Query, after: Position, limit: Option<u64>) -> ReadStream {
+        self.start_read(query, after, false, limit).await
+    }
+
+    /// The newest-first dual of [`read`](Self::read): a [`Stream`] over the matching events in
+    /// **descending** position order, strictly before `before`. `before` is an exclusive upper
+    /// bound, so `read_back(query, Position::MAX, limit)` streams from the tip. `limit` caps the
+    /// events from the tip down; with `before` it paginates newest-first.
+    pub async fn read_back(
+        &self,
+        query: Query,
+        before: Position,
+        limit: Option<u64>,
+    ) -> ReadStream {
+        self.start_read(query, before, true, limit).await
+    }
+
+    /// Shared submission for [`read`](Self::read) and [`read_back`](Self::read_back). `cursor` is
+    /// the exclusive lower bound forward, the exclusive upper bound backward.
+    async fn start_read(
+        &self,
+        query: Query,
+        cursor: Position,
+        reverse: bool,
+        limit: Option<u64>,
+    ) -> ReadStream {
         let id = self.shared.next_id();
         let mut read = pb::ReadRequest::new();
         read.set_query(wire::query_to_pb(&query));
-        read.set_after(after.get());
+        read.set_after(cursor.get());
+        if reverse {
+            read.set_reverse(true);
+        }
         if let Some(limit) = limit {
             read.set_limit(limit);
         }
@@ -272,15 +300,19 @@ impl AsyncClient {
         after: Position,
         limit: Option<u64>,
     ) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
-        let mut stream = self.read(query, after, limit).await;
-        let mut events = Vec::new();
-        while let Some(item) = stream.next().await {
-            events.push(item?);
-        }
-        let watermark = stream
-            .watermark()
-            .ok_or_else(|| ClientError::Protocol("read ended without a watermark".to_string()))?;
-        Ok((events, watermark))
+        drain_read(self.read(query, after, limit).await).await
+    }
+
+    /// The newest-first dual of [`read_all`](Self::read_all): drains a backward read, returning
+    /// the events (descending by position) and the watermark it was pinned to. See
+    /// [`read_back`](Self::read_back).
+    pub async fn read_all_back(
+        &self,
+        query: Query,
+        before: Position,
+        limit: Option<u64>,
+    ) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
+        drain_read(self.read_back(query, before, limit).await).await
     }
 
     /// Opens a live subscription over `query`, resuming strictly after `after`: matching durable
@@ -566,6 +598,21 @@ pub struct ReadStream {
     rx: mpsc::UnboundedReceiver<ReadItem>,
     watermark: Option<Position>,
     done: bool,
+}
+
+/// Drains a [`ReadStream`] fully, returning the events and the watermark the read was pinned
+/// to. Shared by [`Client::read_all`] and [`Client::read_all_back`].
+async fn drain_read(
+    mut stream: ReadStream,
+) -> Result<(Vec<SequencedEvent>, Position), ClientError> {
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        events.push(item?);
+    }
+    let watermark = stream
+        .watermark()
+        .ok_or_else(|| ClientError::Protocol("read ended without a watermark".to_string()))?;
+    Ok((events, watermark))
 }
 
 impl ReadStream {

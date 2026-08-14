@@ -40,7 +40,9 @@ order, and they are the only key the store has. There is no separate primary key
 over positions, because a dense monotonic key needs neither.
 
 Positions are 1-based. `Position::ZERO` is the "before everything" sentinel, which is what an
-`after` bound of "I have read nothing" means, so a read from the start passes `Position::ZERO`.
+`after` bound of "I have read nothing" means, so a read from the start passes `Position::ZERO`. A
+backward read (`read_back`) mirrors this with `before`, an exclusive upper bound whose "from the
+tip" sentinel is `Position::MAX`; it returns the same matches, descending.
 
 The log is stored as a chain of segments, each covering a contiguous, non-overlapping range of
 positions. That disjointness is what lets an `after: p` bound discard whole segments by comparing

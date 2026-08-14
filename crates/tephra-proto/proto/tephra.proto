@@ -36,12 +36,21 @@ message AppendRequest {
 
 message ReadRequest {
   Query query = 1;
+  // The pagination cursor, taken verbatim in both directions. For a forward read (`reverse` =
+  // false) it is an exclusive lower bound: return matches after this position, ascending, and
+  // `0` reads from the start. For a backward read (`reverse` = true) it is an exclusive upper
+  // bound: return matches before this position, descending; read from the tip by sending the
+  // maximum position (`u64::MAX`), and `0` therefore returns nothing (before the first position).
   uint64 after = 2;
   // Caps the number of matched events returned. Absent means unlimited (an old client, which
   // never sets it, keeps the full-history behavior); explicit presence distinguishes a real
   // cap of 0 (return nothing) from "no cap". Composes with `after` as a stateless pagination
-  // cursor: read a page, then read again with `after` set to the last position.
+  // cursor: read a page, then read again with `after` set to the last position returned (the
+  // oldest, for a backward read).
   optional uint64 limit = 3;
+  // Read backwards: matched events descending by position, before the `after` cursor. Defaults
+  // to false, so an old client that never sets it keeps the forward, ascending behavior.
+  bool reverse = 4;
 }
 
 // Opens a live subscription: catch up on all events matching `query` after `after`, then
