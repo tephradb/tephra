@@ -3,7 +3,7 @@ name = "tephra-server"
 description = "Synchronous, thread-per-connection TCP server exposing a tephra event store over the length-prefixed protobuf protocol"
 edition = "2024"
 license = "Apache-2.0"
-version = "0.3.2"
+version = "0.3.3"
 rust-version = "1.95.0"
 repository.workspace = true
 

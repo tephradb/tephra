@@ -1,7 +1,7 @@
 [package]
 name = "tephra"
 description = "A DCB-compliant, immutable event store with global ordering."
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.95.0"
 license = "Apache-2.0"
