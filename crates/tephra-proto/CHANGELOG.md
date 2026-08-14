@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/tqwewe/tephra/compare/tephra-proto-v0.1.3...tephra-proto-v0.1.4) - 2026-08-14
+
+### Other
+
+- import std items instead of inlining full paths
+
 ## [0.1.3](https://github.com/tqwewe/tephra/compare/tephra-proto-v0.1.2...tephra-proto-v0.1.3) - 2026-08-13
 
 ### Other
