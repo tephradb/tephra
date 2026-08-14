@@ -1,10 +1,13 @@
 name: site
 
-# Build and test the documentation examples, build the static site, and deploy it to GitHub
-# Pages on push to the default branch.
+# Build and test the documentation examples and the static site on every push to main and every
+# pull request, but publish to GitHub Pages only on a release: the `v*.*.*` tag release-plz pushes
+# when a release PR is merged (the same tag that fires the docker build). A manual run
+# (workflow_dispatch) also deploys, as an on-demand redeploy.
 on:
   push:
     branches: [main]
+    tags: ["v*.*.*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -58,11 +61,15 @@ jobs:
         with:
           path: site/dist
 
-  # Deploy only on a push to the default branch, not on pull requests.
+  # Publish only on a release tag (v*.*.*, pushed by release-plz when a release PR merges) or a
+  # manual run. Regular pushes to main and pull requests build and test the site above but never
+  # deploy.
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
