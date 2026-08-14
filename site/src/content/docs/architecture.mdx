@@ -124,6 +124,22 @@ read three ways, forcing the index, forcing the scan, and using the default, and
 results are identical. That invariant is what lets the estimate be a rough upper bound and carry no
 correctness risk.
 
+## Reading backwards
+
+A backward read (`read_back`) returns the same matches newest-first. The index path reverses for
+free: the same estimate and verdict apply, and the planned positions are simply walked descending
+and fetched by position, since a random fetch does not care about order. The scan path is the only
+one that differs. A forward scan streams through the read-ahead buffer front-to-back, which cannot
+run backward; instead the reverse scan reads a segment's records in roughly 64 KB windows using the
+offset sidecar (byte offset per position, already kept for random reads) to find record boundaries,
+then yields the records within each window high-to-low. The I/O stays large-block sequential; only
+the emit order within a window reverses, so read-ahead throughput is preserved and a page near the
+tip touches only a page's worth of bytes rather than reading the whole log backward. Crucially the
+reverse scan is a separate path built on the read-only offset sidecar and a borrowing parser: the
+forward scan, its read-ahead reader, and the estimate are untouched, so supporting backwards reads
+cannot slow forward reads down. The same three-way differential test pins a backward read against
+the forward read reversed.
+
 ## Subscriptions, without a handoff
 
 A subscription is catch-up followed by live tailing, which is where event stores usually have a

@@ -100,6 +100,16 @@ impl WriteHandle {
         self.reader.read(query, after, limit)
     }
 
+    /// Reads events matching `query`, **descending**, strictly before `before`, up to the
+    /// watermark pinned now, yielding at most `limit` matched events (`None` = unlimited). The
+    /// newest-first dual of [`read`](Self::read); `before` is an exclusive upper bound, so
+    /// `read_back(query, Position::MAX, limit)` starts at the durable tip. Runs on the caller's
+    /// own thread over the published read snapshot, like [`read`](Self::read). See
+    /// [`ReadHandle::read_back`] and [`Reads`].
+    pub fn read_back(&self, query: &Query, before: Position, limit: Option<u64>) -> Reads {
+        self.reader.read_back(query, before, limit)
+    }
+
     /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up
     /// on all durable events, then tails live ones with no gap and no duplicate at the
     /// boundary. Runs on the caller's thread over the published read state, like

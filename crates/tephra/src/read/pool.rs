@@ -84,8 +84,12 @@ impl Default for ReadPoolConfig {
 /// A job handed to a worker: one read to run and the channel to stream its batches over.
 struct ReadJob {
     query: Query,
-    after: Position,
+    /// The pagination cursor: an exclusive lower bound (`after`) for a forward read, or an
+    /// exclusive upper bound (`before`) for a backward one. Which it means is set by `reverse`.
+    cursor: Position,
     limit: Option<u64>,
+    /// Run the read backwards (descending from `cursor`) rather than forwards.
+    reverse: bool,
     out: flume::Sender<ReadItem>,
     batch_events: usize,
     batch_bytes: usize,
@@ -172,11 +176,33 @@ impl ReadPool {
     /// observe the closed channel and stop early. If the pool has been shut down the stream is
     /// empty.
     pub fn read(&self, query: Query, after: Position, limit: Option<u64>) -> ReadStream {
+        self.stream(query, after, false, limit)
+    }
+
+    /// The newest-first dual of [`read`](Self::read): streams the matched events **descending**
+    /// by position, strictly before `before`, up to `limit`. `before` is an exclusive upper
+    /// bound, so `read_back(query, Position::MAX, limit)` streams from the tip. Same laziness,
+    /// backpressure, and shutdown behavior as [`read`](Self::read). See
+    /// [`ReadHandle::read_back`].
+    pub fn read_back(&self, query: Query, before: Position, limit: Option<u64>) -> ReadStream {
+        self.stream(query, before, true, limit)
+    }
+
+    /// Shared submission for [`read`](Self::read) and [`read_back`](Self::read_back): builds the
+    /// job (forward or reverse) and returns a lazily-submitted stream.
+    fn stream(
+        &self,
+        query: Query,
+        cursor: Position,
+        reverse: bool,
+        limit: Option<u64>,
+    ) -> ReadStream {
         let (out_tx, out_rx) = flume::bounded::<ReadItem>(self.channel_depth);
         let job = ReadJob {
             query,
-            after,
+            cursor,
             limit,
+            reverse,
             out: out_tx,
             batch_events: self.batch_events,
             batch_bytes: self.batch_bytes,
@@ -212,11 +238,37 @@ impl ReadPool {
         after: Position,
         limit: Option<u64>,
     ) -> Result<Vec<(Position, Event)>, ReadError> {
+        self.collect(query, after, false, limit).await
+    }
+
+    /// The newest-first dual of [`read_all`](Self::read_all): collects every matched event
+    /// **descending** by position, strictly before `before`, into one `Vec`. Prefer
+    /// [`read_back`](Self::read_back) when the result may be large. See
+    /// [`ReadHandle::read_back`].
+    pub async fn read_all_back(
+        &self,
+        query: Query,
+        before: Position,
+        limit: Option<u64>,
+    ) -> Result<Vec<(Position, Event)>, ReadError> {
+        self.collect(query, before, true, limit).await
+    }
+
+    /// Shared collection for [`read_all`](Self::read_all) and
+    /// [`read_all_back`](Self::read_all_back).
+    async fn collect(
+        &self,
+        query: Query,
+        cursor: Position,
+        reverse: bool,
+        limit: Option<u64>,
+    ) -> Result<Vec<(Position, Event)>, ReadError> {
         let (out_tx, out_rx) = flume::bounded::<ReadItem>(self.channel_depth);
         let job = ReadJob {
             query,
-            after,
+            cursor,
             limit,
+            reverse,
             out: out_tx,
             batch_events: self.batch_events,
             batch_bytes: self.batch_bytes,
@@ -254,8 +306,9 @@ impl ReadPool {
         let (out_tx, out_rx) = flume::bounded::<ReadItem>(self.channel_depth);
         let job = ReadJob {
             query,
-            after: Position::ZERO,
+            cursor: Position::ZERO,
             limit: None,
+            reverse: false,
             out: out_tx,
             batch_events: self.batch_events,
             batch_bytes: self.batch_bytes,
@@ -302,8 +355,9 @@ fn worker_loop(handle: ReadHandle, rx: flume::Receiver<ReadJob>, shutdown: Arc<A
 fn run_job(handle: &ReadHandle, job: ReadJob, shutdown: &AtomicBool) {
     let ReadJob {
         query,
-        after,
+        cursor,
         limit,
+        reverse,
         out,
         batch_events,
         batch_bytes,
@@ -318,7 +372,11 @@ fn run_job(handle: &ReadHandle, job: ReadJob, shutdown: &AtomicBool) {
         panic!("injected read panic (test hook)");
     }
 
-    let mut reads = handle.read(&query, after, limit);
+    let mut reads = if reverse {
+        handle.read_back(&query, cursor, limit)
+    } else {
+        handle.read(&query, cursor, limit)
+    };
     let mut batch: Vec<(Position, Event)> = Vec::new();
     let mut batch_bytes_seen = 0usize;
 
@@ -514,6 +572,35 @@ mod tests {
 
         assert_eq!(positions, direct(&handle, &Query::all()));
         assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn read_back_streams_newest_first_and_matches_read_all_reversed() {
+        let (_dir, _coord, handle) = store();
+        for i in 0..50 {
+            handle
+                .append(
+                    vec![event("Enrolled", &[&format!("course:c{}", i % 5)])],
+                    None,
+                )
+                .unwrap();
+        }
+        let pool = ReadPool::new(handle.reader(), 4);
+
+        // read_all_back over the whole log equals read_all reversed.
+        let forward = block_on(pool.read_all(Query::all(), Position::ZERO, None)).unwrap();
+        let back = block_on(pool.read_all_back(Query::all(), Position::MAX, None)).unwrap();
+        let want: Vec<Position> = forward.iter().rev().map(|(p, _)| *p).collect();
+        let got: Vec<Position> = back.iter().map(|(p, _)| *p).collect();
+        assert_eq!(got, want);
+        assert!(got.windows(2).all(|w| w[0] > w[1]), "descending");
+
+        // The streaming form agrees with the collected form, and a limit takes the newest N.
+        let (streamed, _) = drain(pool.read_back(Query::all(), Position::MAX, None));
+        assert_eq!(streamed, got);
+        let capped = block_on(pool.read_all_back(Query::all(), Position::MAX, Some(5))).unwrap();
+        let capped: Vec<Position> = capped.iter().map(|(p, _)| *p).collect();
+        assert_eq!(capped, want[..5]);
     }
 
     #[test]

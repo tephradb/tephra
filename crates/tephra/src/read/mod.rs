@@ -56,9 +56,11 @@ use seglog::read::Reader;
 use crate::Position;
 use crate::event::{DecodeError, Event, EventRef};
 use crate::index::{
-    Access, ActiveTail, IndexSegment, SegmentIndex, choose, estimate_matches, search,
+    Access, ActiveTail, IndexSegment, SegmentIndex, choose, estimate_matches, search, search_back,
 };
-use crate::log::set::{LogError, Record, Scan, Segment, SegmentSet, SegmentSource};
+use crate::log::set::{
+    LogError, Record, RecordRef, Scan, ScanBack, Segment, SegmentSet, SegmentSource,
+};
 use crate::query::{Matches, Query};
 
 use crate::index::IndexSet;
@@ -426,6 +428,26 @@ impl ReadHandle {
         Reads::plan(snapshot, query, after, watermark, &self.config, limit)
     }
 
+    /// Reads events matching `query` in **descending** position order, strictly before
+    /// `before`, up to the watermark pinned now, capped at `limit`. The newest-first dual of
+    /// [`read`](Self::read): `before` is an exclusive **upper** bound (as `after` is an
+    /// exclusive lower one), so `read_back(query, Position::MAX, limit)` starts at the durable
+    /// tip. The result is the same lending iterator; consume it with `while let Some(item) =
+    /// reads.next()`.
+    ///
+    /// `limit` caps the events yielded, counting from the tip down, so a newest-first page does
+    /// work proportional to `limit`. Together with `before` it is a stateless pagination
+    /// cursor: read a page, then read again with `before` set to the oldest position returned,
+    /// with no gap and no duplicate at the seam. Ideal for an event explorer showing recent
+    /// events first, one page at a time.
+    pub fn read_back(&self, query: &Query, before: Position, limit: Option<u64>) -> Reads {
+        let (watermark, snapshot) = self.core.load();
+        // The top of the reverse range: strictly below `before`, and never past the pinned
+        // tip. `saturating_sub` makes `before <= 1` (nothing below it) an empty read.
+        let upto = Position::new(before.get().saturating_sub(1).min(watermark.get()));
+        Reads::plan_back(snapshot, query, upto, watermark, &self.config, limit)
+    }
+
     /// The current durable tip: the last position any read may see, as published at the most
     /// recent commit. A single atomic load, so a caller sampling it often (a lag gauge
     /// computing `head - cursor` per module) pays no planning cost. Point-in-time like a
@@ -464,15 +486,17 @@ pub enum ReadError {
     Aborted,
 }
 
-/// A lending iterator over the events matching a read, in ascending position order.
+/// A lending iterator over the events matching a read, in ascending position order for a
+/// forward read ([`ReadHandle::read`]) or descending for a backward one
+/// ([`ReadHandle::read_back`]).
 ///
-/// Three internal shapes (chosen by `Reads::plan` via the cost model): the bypass path
-/// streams a log scan, either unfiltered (`Query::all`, zero-copy) or filtered (a broad
-/// query, copying one matched record at a time); the indexed path plans the ascending
-/// *positions* (a `Vec<Position>`, cheap `u64`s, small for a selective query) and fetches
-/// each event on demand into a single-record buffer it lends from. None buffers a growing
-/// *event* result; only the indexed path materializes a position list, and the planner routes
-/// broad results to the streaming bypass path instead.
+/// Internal shapes (chosen by `Reads::plan` via the cost model): the bypass path streams a log
+/// scan, either unfiltered (`Query::all`, zero-copy) or filtered (a broad query, copying one
+/// matched record at a time), with a forward ([`Scan`]) and a backward ([`ScanBack`]) variant;
+/// the indexed path plans the *positions* (a `Vec<Position>`, cheap `u64`s, small for a
+/// selective query, ascending or descending) and fetches each event on demand into a
+/// single-record buffer it lends from. Only the indexed path materializes a position list, and
+/// the planner routes broad results to the streaming bypass path instead.
 pub struct Reads {
     watermark: Position,
     pending_err: Option<ReadError>,
@@ -518,6 +542,14 @@ struct ScanFilteredState {
     buf: Option<(Position, Event)>,
 }
 
+/// The backward counterpart of [`ScanFilteredState`]: the same filtered-scan state over a
+/// reverse [`ScanBack`] instead of a forward [`Scan`].
+struct ScanBackFilteredState {
+    scan: ScanBack<Arc<Snapshot>>,
+    query: Query,
+    buf: Option<(Position, Event)>,
+}
+
 enum Mode {
     /// Bypass, unfiltered: a zero-copy streaming scan of the whole `(after, watermark]`
     /// range, yielding every record. This is the `Query::all` projection-catch-up path, the
@@ -529,11 +561,27 @@ enum Mode {
     /// lending iterator cannot conditionally return its borrow from a loop on stable Rust; the
     /// copy is paid only per *matched* event, the same as the indexed path's per-event buffer.
     ScanFiltered(Box<ScanFilteredState>),
-    /// Indexed: a pre-planned ascending position list (already clamped to the watermark),
-    /// each event fetched on demand and lent from `buf`, reusing one reader per segment.
+    /// Backward bypass, unfiltered: the reverse of [`Scan`](Mode::Scan), a zero-copy descending
+    /// window scan of `(after, upto]` yielding every record newest-first.
+    ScanBack { scan: Box<ScanBack<Arc<Snapshot>>> },
+    /// Backward bypass, filtered: the reverse of [`ScanFiltered`](Mode::ScanFiltered), a broad
+    /// query streamed descending, each matched record copied out of the window buffer.
+    ScanBackFiltered(Box<ScanBackFilteredState>),
+    /// Indexed: a pre-planned position list (already clamped to the range), ascending for a
+    /// forward read or descending for a backward one, each event fetched on demand and lent
+    /// from `buf`, reusing one reader per segment.
     Indexed(Box<IndexedState>),
     /// Nothing to yield (empty range, or a leading planning error carried in `pending_err`).
     Done,
+}
+
+/// The direction a [`Reads`] runs in: forward yields ascending from an exclusive lower bound,
+/// backward yields descending from an exclusive upper bound. Chosen once at planning; the
+/// forward path is exactly as it was, so backwards reads add no cost to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
 }
 
 impl Reads {
@@ -552,11 +600,9 @@ impl Reads {
         !self.hit_limit
     }
 
-    /// Plans the read. Estimates the result size from exact posting lengths and
-    /// picks the cheaper mode: a broad query streams a filtered log scan
-    /// ([`Access::Scan`]), a selective one gathers positions from the index and fetches
-    /// events on demand ([`Access::Index`]). The choice only ever changes which correct path
-    /// runs: both return the identical positions.
+    /// Plans a forward read over `(after, watermark]`, ascending. A thin wrapper over
+    /// [`plan_directional`](Self::plan_directional) that keeps the exact signature the read
+    /// handle and subscriptions already call.
     fn plan(
         snapshot: Arc<Snapshot>,
         query: &Query,
@@ -565,8 +611,62 @@ impl Reads {
         config: &ReadConfig,
         limit: Option<u64>,
     ) -> Reads {
+        Reads::plan_directional(
+            Direction::Forward,
+            snapshot,
+            query,
+            after,
+            watermark,
+            watermark,
+            config,
+            limit,
+        )
+    }
+
+    /// Plans a backward read over `(ZERO, upto]`, descending, pinned to `watermark`. `upto` is
+    /// the top of the range (the caller clamps it below the exclusive `before` and to the
+    /// pinned tip); the range's lower bound is always the start of the log.
+    fn plan_back(
+        snapshot: Arc<Snapshot>,
+        query: &Query,
+        upto: Position,
+        watermark: Position,
+        config: &ReadConfig,
+        limit: Option<u64>,
+    ) -> Reads {
+        Reads::plan_directional(
+            Direction::Backward,
+            snapshot,
+            query,
+            Position::ZERO,
+            upto,
+            watermark,
+            config,
+            limit,
+        )
+    }
+
+    /// Plans the read in either direction. Estimates the result size from exact posting lengths
+    /// over the range `(after, upto]` and picks the cheaper mode: a broad query streams a
+    /// filtered log scan ([`Access::Scan`]), a selective one gathers positions from the index
+    /// and fetches events on demand ([`Access::Index`]). The `direction` selects the forward
+    /// ([`Scan`]) or backward ([`ScanBack`]) streaming variant and whether the indexed
+    /// positions are ascending or descending; the estimate and verdict are identical either
+    /// way (the match set does not depend on order). `watermark` is stored for
+    /// [`Reads::watermark`] and equals `upto` for a forward read.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_directional(
+        direction: Direction,
+        snapshot: Arc<Snapshot>,
+        query: &Query,
+        after: Position,
+        upto: Position,
+        watermark: Position,
+        config: &ReadConfig,
+        limit: Option<u64>,
+    ) -> Reads {
         // Nothing to read: an empty range, or an explicit zero cap.
-        if after >= watermark || limit == Some(0) {
+        if after >= upto || limit == Some(0) {
             return Reads {
                 watermark,
                 pending_err: None,
@@ -576,11 +676,12 @@ impl Reads {
             };
         }
 
-        let (estimate, width) = estimate_read(&snapshot, query, after, watermark);
+        let (estimate, width) = estimate_read(&snapshot, query, after, upto);
         let access = choose(estimate, width, config.scan_bias);
         #[cfg(feature = "tracing")]
         tracing::debug!(
             ?access,
+            ?direction,
             estimate,
             width,
             scan_bias = config.scan_bias,
@@ -592,23 +693,43 @@ impl Reads {
             // full-log query needs no filter and stays zero-copy; any other broad query
             // filters (and copies) per matched event. The `Query::all` check picks the
             // cheaper scan *implementation*; it does not bypass the cost model, which already
-            // routed the query here.
+            // routed the query here. `ScanBack` is the exact reverse of `Scan`, so the forward
+            // scan path is untouched by the backward one.
             Access::Scan => {
-                let scan = Scan::start(Arc::clone(&snapshot), after.next(), watermark);
-                // Only the filtered-scan mode retains the query, so it is the one path that
-                // clones; the zero-copy full-log scan and the indexed path borrow it and drop
+                // Only the filtered-scan modes retain the query, so they are the paths that
+                // clone; the zero-copy full-log scans and the indexed path borrow it and drop
                 // the borrow here. This keeps a repeated caller (a subscription polling every
                 // round) from re-allocating the query on the index and full-scan paths.
-                let mode = if matches!(*query, Query::All) {
-                    Mode::Scan {
-                        scan: Box::new(scan),
+                let is_all = matches!(*query, Query::All);
+                let mode = match direction {
+                    Direction::Forward => {
+                        let scan = Scan::start(Arc::clone(&snapshot), after.next(), upto);
+                        if is_all {
+                            Mode::Scan {
+                                scan: Box::new(scan),
+                            }
+                        } else {
+                            Mode::ScanFiltered(Box::new(ScanFilteredState {
+                                scan,
+                                query: query.clone(),
+                                buf: None,
+                            }))
+                        }
                     }
-                } else {
-                    Mode::ScanFiltered(Box::new(ScanFilteredState {
-                        scan,
-                        query: query.clone(),
-                        buf: None,
-                    }))
+                    Direction::Backward => {
+                        let scan = ScanBack::start(Arc::clone(&snapshot), after.next(), upto);
+                        if is_all {
+                            Mode::ScanBack {
+                                scan: Box::new(scan),
+                            }
+                        } else {
+                            Mode::ScanBackFiltered(Box::new(ScanBackFilteredState {
+                                scan,
+                                query: query.clone(),
+                                buf: None,
+                            }))
+                        }
+                    }
                 };
                 Reads {
                     watermark,
@@ -618,30 +739,38 @@ impl Reads {
                     mode,
                 }
             }
-            // Selective: plan the ascending positions from the index, fetch on demand. The
-            // position list is truncated to `limit` here, so the fetch loop and the list's
-            // memory are both bounded by the cap, not by the query's full result.
-            Access::Index => match plan_positions(&snapshot, query, after, watermark, limit) {
-                Ok(positions) => Reads {
-                    watermark,
-                    pending_err: None,
-                    remaining: limit,
-                    hit_limit: false,
-                    mode: Mode::Indexed(Box::new(IndexedState {
-                        snapshot,
-                        positions: positions.into_iter(),
-                        reader: None,
-                        buf: None,
-                    })),
-                },
-                Err(err) => Reads {
-                    watermark,
-                    pending_err: Some(err),
-                    remaining: limit,
-                    hit_limit: false,
-                    mode: Mode::Done,
-                },
-            },
+            // Selective: plan the positions from the index (ascending forward, descending
+            // backward), fetch on demand. The position list is truncated to `limit`, so the
+            // fetch loop and the list's memory are both bounded by the cap, not by the query's
+            // full result. The `Mode::Indexed` fetch loop is direction-agnostic: it fetches by
+            // arbitrary position, and a descending list still clusters by segment.
+            Access::Index => {
+                let planned = match direction {
+                    Direction::Forward => plan_positions(&snapshot, query, after, upto, limit),
+                    Direction::Backward => plan_positions_back(&snapshot, query, upto, limit),
+                };
+                match planned {
+                    Ok(positions) => Reads {
+                        watermark,
+                        pending_err: None,
+                        remaining: limit,
+                        hit_limit: false,
+                        mode: Mode::Indexed(Box::new(IndexedState {
+                            snapshot,
+                            positions: positions.into_iter(),
+                            reader: None,
+                            buf: None,
+                        })),
+                    },
+                    Err(err) => Reads {
+                        watermark,
+                        pending_err: Some(err),
+                        remaining: limit,
+                        hit_limit: false,
+                        mode: Mode::Done,
+                    },
+                }
+            }
         }
     }
 
@@ -668,45 +797,20 @@ impl Reads {
         }
         match &mut self.mode {
             Mode::Done => None,
-            // Unfiltered: yield every record, zero-copy (the event borrows the scan buffer).
-            Mode::Scan { scan } => match scan.next()? {
-                Ok(record) => {
-                    let position = record.position;
-                    match EventRef::from_bytes(record.data) {
-                        Ok(event) => Some(Ok(Sequenced { position, event })),
-                        Err(err) => Some(Err(ReadError::Corrupt(err))),
-                    }
-                }
-                Err(err) => Some(Err(ReadError::Log(Arc::new(err)))),
-            },
-            // Filtered: advance to the next record matching `query`, copying the match into an
-            // owned `Event` so the yielded event borrows `buf` (a lending iterator cannot
-            // conditionally return its borrow of the scan from a loop). Decoding happens once:
-            // the filter decode's offset is preserved by `to_owned`, so `as_ref` on the way out
-            // reparses nothing. The filter is the same `Query::matches` the scan oracle uses, so
-            // this yields exactly the indexed path's positions.
+            // Unfiltered: yield every record, zero-copy (the event borrows the scan buffer). The
+            // backward arm is the reverse of the forward one, newest-first from the window buffer;
+            // both decode through the one shared helper. The filter is the same `Query::matches`
+            // the scan oracle uses, so the filtered arms yield exactly the indexed path's
+            // positions.
+            Mode::Scan { scan } => scan.next().map(decode_record),
+            Mode::ScanBack { scan } => scan.next().map(decode_record),
             Mode::ScanFiltered(state) => {
                 let ScanFilteredState { scan, query, buf } = state.as_mut();
-                loop {
-                    match scan.next()? {
-                        Ok(record) => {
-                            let event = match EventRef::from_bytes(record.data) {
-                                Ok(event) => event,
-                                Err(err) => return Some(Err(ReadError::Corrupt(err))),
-                            };
-                            if query.matches(event) {
-                                *buf = Some((record.position, event.to_owned()));
-                                break;
-                            }
-                        }
-                        Err(err) => return Some(Err(ReadError::Log(Arc::new(err)))),
-                    }
-                }
-                let (position, event) = buf.as_ref().unwrap();
-                Some(Ok(Sequenced {
-                    position: *position,
-                    event: event.as_ref(),
-                }))
+                next_filtered(scan, query, buf)
+            }
+            Mode::ScanBackFiltered(state) => {
+                let ScanBackFilteredState { scan, query, buf } = state.as_mut();
+                next_filtered(scan, query, buf)
             }
             Mode::Indexed(state) => {
                 let IndexedState {
@@ -884,10 +988,7 @@ fn plan_positions(
             // still allows.
             Some(index_seg) => {
                 let iter = search(index_seg.as_ref(), query, after).take_while(|p| p.get() <= wm);
-                match cap {
-                    Some(k) => out.extend(iter.take(k - out.len())),
-                    None => out.extend(iter),
-                }
+                extend_capped(&mut out, iter, cap);
             }
             // Unindexable sealed segment: scan its own (watermark-clamped) range rather
             // than answer short.
@@ -934,11 +1035,7 @@ fn plan_positions(
             )?;
         } else {
             let view = snapshot.active_index.view(watermark);
-            let iter = search(&view, query, after);
-            match cap {
-                Some(k) => out.extend(iter.take(k.saturating_sub(out.len()))),
-                None => out.extend(iter),
-            }
+            extend_capped(&mut out, search(&view, query, after), cap);
         }
     }
 
@@ -957,9 +1054,116 @@ fn first_after(after: Position, base: Position) -> Position {
     Position::new(after.get().max(base.get().saturating_sub(1)) + 1)
 }
 
-/// Scans `first..=upto` and appends the positions of matching events (ascending) to `out`,
-/// stopping once `out` reaches `cap` total positions (`None` = no cap). `cap` is an absolute
-/// target length, since `out` may already hold positions from earlier segments.
+/// The shared lending-iterator shape of a forward [`Scan`] and a backward [`ScanBack`]: one data
+/// record at a time, borrowing an internal buffer. Lets the read-path helpers below drive either
+/// direction from one body, so the forward and backward paths cannot drift.
+trait RecordScan {
+    fn next_record(&mut self) -> Option<Result<RecordRef<'_>, LogError>>;
+}
+
+impl RecordScan for Scan<Arc<Snapshot>> {
+    fn next_record(&mut self) -> Option<Result<RecordRef<'_>, LogError>> {
+        self.next()
+    }
+}
+
+impl RecordScan for ScanBack<Arc<Snapshot>> {
+    fn next_record(&mut self) -> Option<Result<RecordRef<'_>, LogError>> {
+        self.next()
+    }
+}
+
+/// Extends `out` with positions from `iter`, respecting the absolute `cap` (an already-gathered
+/// prefix may fill part of it). The one definition of the capped take used by every indexed
+/// segment arm in both planning directions; `saturating_sub` keeps it correct even if a caller
+/// ever overshoots the cap.
+fn extend_capped(
+    out: &mut Vec<Position>,
+    iter: impl Iterator<Item = Position>,
+    cap: Option<usize>,
+) {
+    match cap {
+        Some(k) => out.extend(iter.take(k.saturating_sub(out.len()))),
+        None => out.extend(iter),
+    }
+}
+
+/// Appends the positions of events matching `query` from a lending scan to `out`, stopping once
+/// `out` reaches `cap`. Shared by the forward and backward unindexable-segment fallbacks; the
+/// caller supplies the scan (and so the direction). `cap` is an absolute target length, since
+/// `out` may already hold positions from earlier segments. Callers gate on the cap before
+/// constructing the scan, so this is only entered with `out.len() < cap`.
+fn scan_positions_matching<S: RecordScan>(
+    mut scan: S,
+    query: &Query,
+    out: &mut Vec<Position>,
+    cap: Option<usize>,
+) -> Result<(), ReadError> {
+    while let Some(item) = scan.next_record() {
+        let record = item.map_err(|err| ReadError::Log(Arc::new(err)))?;
+        let event = EventRef::from_bytes(record.data).map_err(ReadError::Corrupt)?;
+        if query.matches(event) {
+            out.push(record.position);
+            if let Some(k) = cap
+                && out.len() >= k
+            {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes one raw scanned record into a [`Sequenced`], mapping a log or decode failure to the
+/// read error. Shared by the forward and backward unfiltered arms of [`Reads::next`].
+fn decode_record(item: Result<RecordRef<'_>, LogError>) -> Result<Sequenced<'_>, ReadError> {
+    match item {
+        Ok(record) => match EventRef::from_bytes(record.data) {
+            Ok(event) => Ok(Sequenced {
+                position: record.position,
+                event,
+            }),
+            Err(err) => Err(ReadError::Corrupt(err)),
+        },
+        Err(err) => Err(ReadError::Log(Arc::new(err))),
+    }
+}
+
+/// Advances a lending scan to the next record matching `query`, copies it into `buf` (owned, so
+/// the yielded event borrows `buf` rather than the scan), and returns it. Shared by the forward
+/// and backward filtered arms of [`Reads::next`]: a lending iterator cannot conditionally return
+/// its borrow of the scan from a loop, so the one matched record is buffered. Decoding happens
+/// once; `to_owned` preserves the filter decode's offset, so `as_ref` on the way out reparses
+/// nothing.
+fn next_filtered<'a, S: RecordScan>(
+    scan: &mut S,
+    query: &Query,
+    buf: &'a mut Option<(Position, Event)>,
+) -> Option<Result<Sequenced<'a>, ReadError>> {
+    loop {
+        match scan.next_record()? {
+            Ok(record) => {
+                let event = match EventRef::from_bytes(record.data) {
+                    Ok(event) => event,
+                    Err(err) => return Some(Err(ReadError::Corrupt(err))),
+                };
+                if query.matches(event) {
+                    *buf = Some((record.position, event.to_owned()));
+                    break;
+                }
+            }
+            Err(err) => return Some(Err(ReadError::Log(Arc::new(err)))),
+        }
+    }
+    let (position, event) = buf.as_ref().unwrap();
+    Some(Ok(Sequenced {
+        position: *position,
+        event: event.as_ref(),
+    }))
+}
+
+/// Forward unindexable-segment fallback: scans `first..=upto` ascending and appends matching
+/// positions. Gates on the cap before opening a scan, since [`Scan::start`] opens a reader.
 fn scan_positions_into(
     snapshot: &Arc<Snapshot>,
     query: &Query,
@@ -973,20 +1177,124 @@ fn scan_positions_into(
     {
         return Ok(());
     }
-    let mut scan = Scan::start(Arc::clone(snapshot), first, upto);
-    while let Some(item) = scan.next() {
-        let record = item.map_err(|err| ReadError::Log(Arc::new(err)))?;
-        let event = EventRef::from_bytes(record.data).map_err(ReadError::Corrupt)?;
-        if query.matches(event) {
-            out.push(record.position);
-            if let Some(k) = cap
-                && out.len() >= k
-            {
-                break;
-            }
+    scan_positions_matching(
+        Scan::start(Arc::clone(snapshot), first, upto),
+        query,
+        out,
+        cap,
+    )
+}
+
+/// Gathers the **descending** positions matching `query` in `(ZERO, upto]`: the active
+/// segment's range first (it holds the highest positions), then sealed segments high-to-low,
+/// each yielding its matches descending through [`search_back`] (or a reverse scan of its
+/// range if unindexable). Segments are disjoint and ordered, so concatenating highest-first is
+/// already globally descending. The mirror of [`plan_positions`]; the same watermark clamp
+/// keeps it from planning a position past `upto` if a rollover raced this read.
+fn plan_positions_back(
+    snapshot: &Arc<Snapshot>,
+    query: &Query,
+    upto: Position,
+    limit: Option<u64>,
+) -> Result<Vec<Position>, ReadError> {
+    let mut out = Vec::new();
+    let wm = upto.get(); // inclusive upper bound of the range
+    let cap = limit.map(|k| k as usize);
+
+    // Active segment first: it holds the highest positions. Bounded above by `upto` (never past
+    // the pinned tip), mirroring the forward active arm.
+    let active_base = snapshot.active_log.base_position();
+    if upto >= active_base {
+        if snapshot.active_index.is_unindexable() {
+            scan_positions_back_into(snapshot, query, active_base, upto, &mut out, cap)?;
+        } else {
+            let view = snapshot.active_index.view(upto);
+            // Saturating `+ 1`, matching the sealed arm below, so `upto == Position::MAX` cannot
+            // overflow the exclusive upper bound (harmless today since the caller clamps `upto`
+            // to the watermark, but the two arms must agree on overflow discipline).
+            let before = Position::new(upto.get().saturating_add(1));
+            extend_capped(&mut out, search_back(&view, query, before), cap);
+        }
+        if let Some(k) = cap
+            && out.len() >= k
+        {
+            out.truncate(k);
+            return Ok(out);
         }
     }
-    Ok(())
+
+    // Sealed segments high index to low, so the concatenation stays globally descending.
+    for (seg, index) in snapshot
+        .sealed_log
+        .iter()
+        .zip(snapshot.sealed_index.iter())
+        .rev()
+    {
+        let base = seg.base_position();
+        let count = seg.event_count();
+        if count == 0 {
+            continue;
+        }
+        if base.get() > wm {
+            continue; // whole segment sits above the upper bound
+        }
+        // Top position in this segment within range: `upto` for the one straddling segment,
+        // else the segment's own last position. The `.min(wm)` also clamps a sealed segment a
+        // racing rollover extended past the pinned tip (as in `plan_positions`).
+        let effective_max = (base.get() + count - 1).min(wm);
+        match index {
+            Some(index_seg) => {
+                let before = Position::new(effective_max.saturating_add(1));
+                extend_capped(
+                    &mut out,
+                    search_back(index_seg.as_ref(), query, before),
+                    cap,
+                );
+            }
+            None => scan_positions_back_into(
+                snapshot,
+                query,
+                base,
+                Position::new(effective_max),
+                &mut out,
+                cap,
+            )?,
+        }
+        if let Some(k) = cap
+            && out.len() >= k
+        {
+            out.truncate(k);
+            return Ok(out);
+        }
+    }
+
+    if let Some(k) = cap {
+        out.truncate(k);
+    }
+    Ok(out)
+}
+
+/// Backward unindexable-segment fallback: the reverse of [`scan_positions_into`]. Scans
+/// `[first, upto]` descending and appends matching positions (descending).
+fn scan_positions_back_into(
+    snapshot: &Arc<Snapshot>,
+    query: &Query,
+    first: Position,
+    upto: Position,
+    out: &mut Vec<Position>,
+    cap: Option<usize>,
+) -> Result<(), ReadError> {
+    if let Some(k) = cap
+        && out.len() >= k
+    {
+        return Ok(());
+    }
+    scan_positions_matching(
+        ScanBack::start(Arc::clone(snapshot), first, upto),
+        query,
+        out,
+        cap,
+    )
 }
 
 #[cfg(test)]
@@ -1182,6 +1490,134 @@ mod tests {
                 "a cap above the result returns all"
             );
             assert!(over_exhausted, "an under-cap read drains and is exhausted");
+        }
+    }
+
+    /// The reverse plan is exactly the forward plan reversed across sealed-indexed and active
+    /// ranges; bounding above by `upto` yields the descending prefix at or below it, and a
+    /// `limit` yields the descending prefix from the tip.
+    #[test]
+    fn plan_positions_back_mirrors_plan_positions() {
+        let dir = TempDir::new().unwrap();
+        let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+        for _ in 0..60 {
+            set.append_batch(&[event("Enrolled", &["course:c1"]).as_bytes()])
+                .unwrap();
+        }
+        assert!(set.sealed_len() >= 2, "need several sealed segments");
+        let index = IndexSet::open(&set).unwrap();
+        let snapshot = Arc::new(Snapshot::capture(&set, &index));
+        let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
+        let last = set.last_position();
+
+        let forward = plan_positions(&snapshot, &query, Position::ZERO, last, None).unwrap();
+        let want: Vec<Position> = forward.iter().rev().copied().collect();
+        assert_eq!(
+            plan_positions_back(&snapshot, &query, last, None).unwrap(),
+            want
+        );
+
+        // Bounded above mid-log, across the sealed-indexed and active ranges.
+        for upto in [1u64, 5, 30, 59, 60] {
+            let back = plan_positions_back(&snapshot, &query, Position::new(upto), None).unwrap();
+            let want: Vec<Position> = forward
+                .iter()
+                .filter(|p| p.get() <= upto)
+                .rev()
+                .copied()
+                .collect();
+            assert_eq!(back, want, "upto {upto}");
+        }
+
+        // Limit yields the descending prefix from the tip.
+        let full: Vec<Position> = forward.iter().rev().copied().collect();
+        for limit in [0u64, 1, 5, 30, 60, 61] {
+            let back = plan_positions_back(&snapshot, &query, last, Some(limit)).unwrap();
+            assert_eq!(
+                back,
+                full[..(limit as usize).min(full.len())],
+                "limit {limit}"
+            );
+        }
+    }
+
+    /// The lending `Reads` reverse read yields the exact reverse of the forward read across all
+    /// verdicts (index, scan, scan-filtered, forced via `scan_bias`), honors the `limit` from
+    /// the tip, and reports exhaustion the same way.
+    #[test]
+    fn reads_back_is_the_reverse_of_reads_forward() {
+        let dir = TempDir::new().unwrap();
+        let mut set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+        for i in 0..40u64 {
+            // Half the events also carry student:s1, so a selective query has real work.
+            let carries: &[&str] = if i % 2 == 0 {
+                &["course:c1"]
+            } else {
+                &["course:c1", "student:s1"]
+            };
+            set.append_batch(&[event("Enrolled", carries).as_bytes()])
+                .unwrap();
+        }
+        let index = IndexSet::open(&set).unwrap();
+
+        let collect_forward = |query: &Query, scan_bias: u32| -> Vec<u64> {
+            let snapshot = Arc::new(Snapshot::capture(&set, &index));
+            let wm = set.last_position();
+            let mut reads = Reads::plan(
+                snapshot,
+                query,
+                Position::ZERO,
+                wm,
+                &ReadConfig { scan_bias },
+                None,
+            );
+            let mut out = Vec::new();
+            while let Some(item) = reads.next() {
+                out.push(item.unwrap().position.get());
+            }
+            out
+        };
+        let collect_back =
+            |query: &Query, scan_bias: u32, limit: Option<u64>| -> (Vec<u64>, bool) {
+                let snapshot = Arc::new(Snapshot::capture(&set, &index));
+                let wm = set.last_position();
+                let mut reads =
+                    Reads::plan_back(snapshot, query, wm, wm, &ReadConfig { scan_bias }, limit);
+                let mut out = Vec::new();
+                while let Some(item) = reads.next() {
+                    out.push(item.unwrap().position.get());
+                }
+                (out, reads.is_exhausted())
+            };
+
+        let queries = [
+            Query::all(),
+            Query::item(QueryItem::with_tags(tags(&["student:s1"]))),
+        ];
+        // bias 1 favors the index, bias u32::MAX forces the scan: together they cover the
+        // indexed, unfiltered-scan, and filtered-scan reverse paths.
+        for query in &queries {
+            for scan_bias in [1u32, u32::MAX] {
+                let want: Vec<u64> = collect_forward(query, scan_bias)
+                    .into_iter()
+                    .rev()
+                    .collect();
+
+                let (back, exhausted) = collect_back(query, scan_bias, None);
+                assert_eq!(back, want, "query {query:?} bias {scan_bias}");
+                assert!(
+                    exhausted,
+                    "an unlimited reverse read is exhausted at its end"
+                );
+
+                let (capped, capped_exhausted) = collect_back(query, scan_bias, Some(5));
+                let want_capped: Vec<u64> = want.iter().take(5).copied().collect();
+                assert_eq!(
+                    capped, want_capped,
+                    "capped query {query:?} bias {scan_bias}"
+                );
+                assert!(!capped_exhausted, "a capped reverse read is not exhausted");
+            }
         }
     }
 }

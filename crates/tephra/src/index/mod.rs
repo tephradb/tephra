@@ -34,7 +34,7 @@ pub mod recovery;
 
 pub use header::{INDEX_HEADER_SIZE, IndexHeaderError, IndexSegmentHeader};
 pub use plan::{Access, choose, estimate_item, estimate_matches};
-pub use search::search;
+pub use search::{search, search_back};
 pub use segment::{IndexSegment, IndexSegmentError};
 pub use set::{IndexError, IndexSet};
 pub use tail::{ActiveTail, ActiveView, TooManyTypes};

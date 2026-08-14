@@ -65,6 +65,17 @@ fn quickstart(addr: &str) -> Result<(), Box<dyn Error>> {
     // ANCHOR_END: paginate
     assert_eq!(seen, 3);
 
+    // ANCHOR: read_back
+    // `read_back` / `read_all_back` are the newest-first duals of `read` / `read_all`: they
+    // return matching events in descending position order. `before` is an exclusive upper bound,
+    // so `Position::MAX` starts at the tip. Pair it with a `limit`, then pass the oldest position
+    // of a page back as the next `before`, to page an event explorer newest-first.
+    let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));
+    let (newest, _watermark) = client.read_all_back(query, Position::MAX, Some(2))?;
+    let newest_positions: Vec<u64> = newest.iter().map(|seq| seq.position().get()).collect();
+    // ANCHOR_END: read_back
+    assert_eq!(newest_positions, vec![3, 2]);
+
     // ANCHOR: subscribe
     // Subscribe from the start: catch up on history, then a CaughtUp marker at the live edge.
     let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));

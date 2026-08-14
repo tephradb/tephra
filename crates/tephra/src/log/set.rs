@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 
+use seglog::parse::parse_record_ref;
 use seglog::read::{ReadError, ReadHint, Reader, RecordKind};
 use seglog::write::{WriteError, Writer};
 use seglog::{COMMIT_MARKER_PAYLOAD, FlushedOffset, RECORD_HEAD_SIZE};
@@ -710,6 +711,14 @@ impl SegmentSet {
         self.scan_at(Position::new(pos.get().saturating_add(1)))
     }
 
+    /// Returns a reverse scan of every record in `[first, upto]`, **descending**, rolling
+    /// across segment boundaries and skipping control records. `upto` is clamped down to the
+    /// live tip, so `scan_back(Position::new(1), Position::MAX)` walks the whole log
+    /// newest-first. The counterpart to [`scan_from`](Self::scan_from).
+    pub fn scan_back(&self, first: Position, upto: Position) -> ScanBack<&SegmentSet> {
+        ScanBack::start(self, first, upto.min(self.last_position()))
+    }
+
     /// Core scan constructor: emits records beginning at `first` (inclusive), up to the
     /// live tip. The writer scans its own live log, so the upper bound is
     /// [`last_position`](Self::last_position).
@@ -1048,6 +1057,274 @@ fn scan_segment_path<S: SegmentSource>(source: &S, idx: usize) -> PathBuf {
         .segment_at(idx)
         .map(|segment| segment.path.clone())
         .unwrap_or_default()
+}
+
+/// Target size of one reverse-scan window, matching `seglog`'s forward read-ahead window. A
+/// [`ScanBack`] reads records in windows this large and emits them high-to-low within each,
+/// so the I/O stays large-block sequential (only the emit order reverses) and the forward
+/// read-ahead's throughput is preserved going backward.
+const REVERSE_WINDOW_BYTES: usize = 64 * 1024;
+
+/// Reverse counterpart to [`Scan`]: emits data records in `[first, upto]` in **descending**
+/// position order, rolling backward across segment boundaries and skipping control records.
+///
+/// Where [`Scan`] streams forward through `seglog`'s read-ahead buffer, `ScanBack` reads each
+/// segment's records in ~64 KB windows (`REVERSE_WINDOW_BYTES`) using the offset sidecar for
+/// record boundaries: one positioned read per window, records parsed and yielded from the
+/// window buffer high-to-low. Control records interleaved between data records are skipped for
+/// free, because the sidecar only maps *data* records and `ScanBack` parses only at those
+/// offsets. Like [`Scan`] it is a *lending* iterator (the yielded [`RecordRef`] borrows the
+/// window buffer and is valid only until the next [`next`](ScanBack::next)) and owns its
+/// [`SegmentSource`], so it works over both a borrow of the live [`SegmentSet`] and an owned
+/// read snapshot.
+///
+/// The forward path is untouched: `ScanBack` shares only the read-only offset sidecar and the
+/// borrowing parser, so supporting backwards reads cannot slow forward reads down.
+pub struct ScanBack<S: SegmentSource> {
+    source: S,
+    /// Lowest global position to emit (inclusive).
+    first: Position,
+    /// Global position of the next record to emit; descends from `upto`. When it drops below
+    /// `first` the scan is exhausted.
+    position: Position,
+    /// Target window size in bytes (tunable for tests; [`REVERSE_WINDOW_BYTES`] by default).
+    window_bytes: usize,
+
+    /// The segment currently being read, its logical index, base, event count, an open reader,
+    /// and the reader's flushed byte extent. `None` until the first `next` (and after a segment
+    /// is exhausted downward), forcing a re-locate.
+    segment: Option<Arc<Segment>>,
+    seg_idx: usize,
+    seg_base: Position,
+    seg_count: u64,
+    reader: Option<Reader<0>>,
+    flushed_len: u64,
+
+    /// The window buffer, reused across windows. It holds the bytes `[win_base_byte,
+    /// win_base_byte + window.len())`; `win_lo_local` is the lowest local it covers, or `None`
+    /// when no window is loaded (a fresh segment, or the cursor dropped below the window).
+    window: Vec<u8>,
+    win_base_byte: u64,
+    win_lo_local: Option<u64>,
+
+    pending_err: Option<LogError>,
+    done: bool,
+}
+
+impl<S: SegmentSource> ScanBack<S> {
+    /// Starts a reverse scan of `source` emitting records in `[first, upto]` descending, with
+    /// the default window size. `upto == Position::ZERO` or `first > upto` yields an empty
+    /// scan. The caller clamps `upto` to what is durable (the pinned watermark, or the live
+    /// tip); positions above that must not be requested.
+    pub(crate) fn start(source: S, first: Position, upto: Position) -> Self {
+        Self::start_with_window(source, first, upto, REVERSE_WINDOW_BYTES)
+    }
+
+    /// [`start`](Self::start) with an explicit window size, so tests can force many window
+    /// boundaries with a tiny window.
+    pub(crate) fn start_with_window(
+        source: S,
+        first: Position,
+        upto: Position,
+        window_bytes: usize,
+    ) -> Self {
+        // Positions are 1-based; treat the empty sentinel as "down to the first position".
+        let first = Position::new(first.get().max(FIRST_POSITION));
+        let done = upto == Position::ZERO || first > upto;
+        ScanBack {
+            source,
+            first,
+            position: upto,
+            window_bytes: window_bytes.max(1),
+            segment: None,
+            seg_idx: 0,
+            seg_base: Position::ZERO,
+            seg_count: 0,
+            reader: None,
+            flushed_len: 0,
+            window: Vec::new(),
+            win_base_byte: 0,
+            win_lo_local: None,
+            pending_err: None,
+            done,
+        }
+    }
+
+    /// Advances to the next record (descending) and returns a view borrowing the window
+    /// buffer, valid only until the following `next` call. A lending iterator, so not
+    /// `std::iter::Iterator`; a read failure is surfaced once as an `Err` item and then
+    /// terminates the scan.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Result<RecordRef<'_>, LogError>> {
+        if let Some(err) = self.pending_err.take() {
+            self.done = true;
+            return Some(Err(err));
+        }
+        if self.done || self.position.get() < self.first.get() {
+            self.done = true;
+            return None;
+        }
+
+        // Position the cursor on the segment, then the window, that hold `self.position`.
+        if let Err(err) = self.ensure_segment() {
+            self.done = true;
+            return Some(Err(err));
+        }
+        if self.done {
+            return None; // no segment holds the cursor; nothing left
+        }
+        if let Err(err) = self.ensure_window() {
+            self.done = true;
+            return Some(Err(err));
+        }
+
+        // Compute the emit and advance the cursor downward *before* the borrowing parse, so no
+        // `self` field is written while the returned view borrows the window (mirrors `Scan`).
+        let position = self.position;
+        let local = (position.get() - self.seg_base.get()) as usize;
+        let byte = match self.segment.as_ref().unwrap().data_offset(local) {
+            Some(byte) => byte as u64,
+            None => {
+                self.done = true;
+                return Some(Err(LogError::NotFound { position }));
+            }
+        };
+        let rel = (byte - self.win_base_byte) as usize;
+        let seg_idx = self.seg_idx;
+        self.position = Position::new(position.get() - 1);
+
+        match parse_record_ref::<0>(&self.window, rel) {
+            Ok((data, _)) => Some(Ok(RecordRef { position, data })),
+            Err(err) => {
+                self.done = true;
+                Some(Err(LogError::read(
+                    scan_segment_path(&self.source, seg_idx),
+                    err,
+                )))
+            }
+        }
+    }
+
+    /// Ensures the loaded segment contains `self.position`, re-locating (a fresh reader, its
+    /// flushed extent, and a forced window reload) when the cursor has descended below the
+    /// current segment or none is loaded. Sets `done` if no segment holds the cursor.
+    fn ensure_segment(&mut self) -> Result<(), LogError> {
+        if self.reader.is_some() && self.position.get() >= self.seg_base.get() {
+            return Ok(());
+        }
+        // Clone the located `Arc` out first, so the borrow of `self.source` ends before the
+        // field writes below.
+        let located = self
+            .source
+            .locate(self.position)
+            .map(|(idx, seg)| (idx, Arc::clone(seg)));
+        match located {
+            Some((idx, seg)) => {
+                let reader = seg.open_reader()?;
+                self.flushed_len = reader.flushed_offset().load();
+                self.seg_base = seg.base_position();
+                self.seg_count = seg.event_count();
+                self.seg_idx = idx;
+                self.reader = Some(reader);
+                self.segment = Some(seg);
+                self.win_lo_local = None; // force a window load for the new segment
+                Ok(())
+            }
+            None => {
+                self.done = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensures a window covering `self.position`'s local is loaded, reading a fresh ~64 KB
+    /// window (topped at that local) when the cursor has dropped below the current one.
+    fn ensure_window(&mut self) -> Result<(), LogError> {
+        let h = self.position.get() - self.seg_base.get();
+        if let Some(lo) = self.win_lo_local
+            && h >= lo
+        {
+            return Ok(());
+        }
+
+        let seg = self.segment.clone().unwrap();
+        let head_off = seg.data_offset(h as usize).ok_or(LogError::NotFound {
+            position: self.position,
+        })? as u64;
+
+        // The exact byte just past record `h`. For a middle record that is the next data
+        // record's start (any control record between is inside the span and harmlessly
+        // unparsed); for a segment's last data record the successor offset is unknown and the
+        // file tail is zero-filled fallocate padding, so read the framed length from the header
+        // (`peek`, which uses the read-ahead buffer). Clamp to the flushed extent so the read
+        // is always in bounds even if the sidecar momentarily leads the flushed point.
+        let end = if h + 1 < self.seg_count {
+            seg.data_offset((h + 1) as usize)
+                .map(|off| off as u64)
+                .unwrap_or(self.flushed_len)
+                .min(self.flushed_len)
+        } else {
+            let reader = self.reader.as_mut().unwrap();
+            match reader
+                .peek(head_off)
+                .map_err(|err| LogError::read(scan_segment_path(&self.source, self.seg_idx), err))?
+            {
+                RecordKind::Data { total_len } => {
+                    (head_off + total_len as u64).min(self.flushed_len)
+                }
+                // The sidecar only ever points at data records.
+                _ => {
+                    return Err(LogError::NotFound {
+                        position: self.position,
+                    });
+                }
+            }
+        };
+
+        // Never read below `stop_local`: `first`'s local if `first` falls in this segment,
+        // else the segment base. Positions below that either end the scan or belong to a lower
+        // segment.
+        let stop_local = if self.first.get() > self.seg_base.get() {
+            self.first.get() - self.seg_base.get()
+        } else {
+            0
+        };
+
+        // Extend the window down from `h` while the span stays within budget, always covering
+        // at least record `h` (a single record larger than the window is read whole).
+        let mut lo = h;
+        let mut lo_byte = head_off;
+        while lo > stop_local {
+            let Some(cand) = seg.data_offset((lo - 1) as usize) else {
+                break;
+            };
+            let cand = cand as u64;
+            if end - cand > self.window_bytes as u64 {
+                break;
+            }
+            lo -= 1;
+            lo_byte = cand;
+        }
+
+        let read_len = (end - lo_byte) as usize;
+        self.window.resize(read_len, 0);
+        {
+            let reader = self.reader.as_ref().unwrap();
+            reader
+                .read_bytes(lo_byte, &mut self.window)
+                .map_err(|err| {
+                    LogError::read(scan_segment_path(&self.source, self.seg_idx), err)
+                })?;
+            // Warm the page just below this window: the kernel prefetches forward, not
+            // backward, so the next (lower) window would otherwise be a cold read.
+            if lo_byte > 0 {
+                reader.prefetch(lo_byte - 1);
+            }
+        }
+        self.win_base_byte = lo_byte;
+        self.win_lo_local = Some(lo);
+        Ok(())
+    }
 }
 
 /// Errors from segment-set operations.
@@ -1778,5 +2055,105 @@ mod tests {
                 payload_for(p, record_len)
             );
         }
+    }
+
+    /// Drains a lending [`ScanBack`] into owned records, preserving its descending order.
+    fn drain_back<S: SegmentSource>(mut scan: ScanBack<S>) -> Vec<Record> {
+        let mut out = Vec::new();
+        while let Some(item) = scan.next() {
+            out.push(item.unwrap().to_owned());
+        }
+        out
+    }
+
+    /// The core property: a reverse scan yields exactly the forward scan reversed, across
+    /// window sizes (single-record up to the default) and interior sub-ranges, over a log with
+    /// several sealed segments and interleaved commit-marker control records. Any window-
+    /// boundary, control-skip, or segment-crossing bug shows up as an inequality here.
+    #[test]
+    fn scan_back_is_the_reverse_of_scan_forward() {
+        let dir = TempDir::new().unwrap();
+        // Small segments so several seal; varied record sizes so windows pack differently and
+        // a single record can exceed the tiny window.
+        let mut set = open(dir.path(), 1024);
+        for i in 1..=80u64 {
+            let size = 8 + (i as usize % 17) * 5;
+            append_one(&mut set, &vec![(i % 251) as u8; size]);
+        }
+        assert!(set.sealed_len() >= 2, "need several sealed segments");
+        let last = set.last_position();
+
+        let forward = drain(set.scan_from(Position::new(1)));
+        assert_eq!(forward.len(), 80);
+
+        for window in [1usize, 32, 200, REVERSE_WINDOW_BYTES] {
+            let full = drain_back(ScanBack::start_with_window(
+                &set,
+                Position::new(1),
+                last,
+                window,
+            ));
+            let want: Vec<Record> = forward.iter().rev().cloned().collect();
+            assert_eq!(full, want, "window {window}, full range");
+
+            let (lo, hi) = (Position::new(20), Position::new(60));
+            let sub = drain_back(ScanBack::start_with_window(&set, lo, hi, window));
+            let want_sub: Vec<Record> = forward
+                .iter()
+                .filter(|record| record.position >= lo && record.position <= hi)
+                .rev()
+                .cloned()
+                .collect();
+            assert_eq!(sub, want_sub, "window {window}, sub range");
+        }
+    }
+
+    /// `upto` is clamped down to the live tip, so a huge `upto` still starts at the last
+    /// record; and the empty cases (`first > upto`, the `ZERO` sentinel, an empty log) yield
+    /// nothing.
+    #[test]
+    fn scan_back_bounds_and_empty_cases() {
+        let dir = TempDir::new().unwrap();
+        let mut set = open(dir.path(), 4096);
+        for i in 1..=5u64 {
+            append_one(&mut set, format!("e{i}").as_bytes());
+        }
+
+        // Position::MAX clamps to the tip: the whole log, newest first.
+        let all = drain_back(set.scan_back(Position::new(1), Position::MAX));
+        let positions: Vec<u64> = all.iter().map(|record| record.position.get()).collect();
+        assert_eq!(positions, vec![5, 4, 3, 2, 1]);
+
+        assert!(drain_back(set.scan_back(Position::new(4), Position::new(3))).is_empty());
+        assert!(drain_back(set.scan_back(Position::new(1), Position::ZERO)).is_empty());
+
+        let empty_dir = TempDir::new().unwrap();
+        let empty = open(empty_dir.path(), 4096);
+        assert!(drain_back(empty.scan_back(Position::new(1), Position::MAX)).is_empty());
+    }
+
+    /// A record larger than the whole window budget is still read and yielded intact (the
+    /// window always covers at least its top record).
+    #[test]
+    fn scan_back_record_larger_than_window() {
+        let dir = TempDir::new().unwrap();
+        let mut set = open(dir.path(), 1 << 16);
+        let big = vec![7u8; 4096];
+        append_one(&mut set, b"small-before");
+        let big_pos = append_one(&mut set, &big);
+        append_one(&mut set, b"small-after");
+
+        // A one-byte window forces each record into its own window, so the 4 KB record is read
+        // whole despite far exceeding the budget.
+        let got = drain_back(ScanBack::start_with_window(
+            &set,
+            Position::new(1),
+            set.last_position(),
+            1,
+        ));
+        assert_eq!(got[0].position, Position::new(3));
+        assert_eq!(got[1].position, big_pos);
+        assert_eq!(got[1].data, big);
+        assert_eq!(got[2].position, Position::new(1));
     }
 }

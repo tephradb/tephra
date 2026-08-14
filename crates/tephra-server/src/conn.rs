@@ -288,7 +288,13 @@ fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
             return;
         }
     };
-    let after = Position::new(read.after());
+    let reverse = read.reverse();
+    // The cursor, taken verbatim: an exclusive lower bound (`after`) for a forward read, an
+    // exclusive upper bound (`before`) for a backward one. The client sends the real position in
+    // both directions (a "from the tip" backward read sends `Position::MAX.get()`), so there is
+    // no sentinel to remap here: `0` means the same as it does embedded (from the start forward,
+    // nothing backward), keeping the wire and embedded paths in lockstep.
+    let cursor = Position::new(read.after());
     // Explicit presence: absent means unlimited, present (even 0) is a real cap.
     let limit = read.limit_opt();
 
@@ -304,7 +310,8 @@ fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
     let job = ReadJob {
         request_id,
         query,
-        after,
+        cursor,
+        reverse,
         limit,
         conn: conn.clone(),
         cancel,
@@ -385,12 +392,17 @@ fn register_cancel(conn: &ConnCtx, request_id: u64) -> Arc<AtomicBool> {
 fn run_read(
     request_id: u64,
     query: &Query,
-    after: Position,
+    cursor: Position,
+    reverse: bool,
     limit: Option<u64>,
     conn: &ConnCtx,
     cancel: &AtomicBool,
 ) {
-    let mut reads = conn.handle.read(query, after, limit);
+    let mut reads = if reverse {
+        conn.handle.read_back(query, cursor, limit)
+    } else {
+        conn.handle.read(query, cursor, limit)
+    };
     let watermark = reads.watermark();
 
     let mut batch = pb::ReadEvents::new();
@@ -645,7 +657,10 @@ fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
 pub(crate) struct ReadJob {
     request_id: u64,
     query: Query,
-    after: Position,
+    /// The pagination cursor: an exclusive lower bound (`after`) forward, an exclusive upper
+    /// bound (`before`) backward. Its meaning is set by `reverse`.
+    cursor: Position,
+    reverse: bool,
     limit: Option<u64>,
     conn: ConnCtx,
     cancel: Arc<AtomicBool>,
@@ -657,13 +672,14 @@ impl ReadJob {
         let ReadJob {
             request_id,
             query,
-            after,
+            cursor,
+            reverse,
             limit,
             conn,
             cancel,
             cleanup,
         } = self;
-        run_read(request_id, &query, after, limit, &conn, &cancel);
+        run_read(request_id, &query, cursor, reverse, limit, &conn, &cancel);
         // Release the permit/cancel/worker only once the read's frames are all queued.
         drop(cleanup);
     }

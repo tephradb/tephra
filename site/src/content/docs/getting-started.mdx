@@ -90,6 +90,19 @@ the limit is the last one.
 
 <Code code={anchor(gsRaw, 'paginate')} lang="rust" />
 
+## Read newest-first
+
+`read_back` and `read_all_back` are the newest-first duals of `read` and `read_all`: they return
+matching events in descending position order. Where a forward read takes `after` (an exclusive
+lower bound), a backward read takes `before` (an exclusive upper bound), so `Position::MAX` starts
+at the tip. This is what an event explorer showing recent activity first wants.
+
+<Code code={anchor(gsRaw, 'read_back')} lang="rust" />
+
+Pagination is symmetric: pass a `limit` for the page size, then set the next `before` to the
+oldest position the page returned. The cap is applied on the server during planning, so a page
+near the tip does the work of a page, not of the whole history.
+
 ## Subscribe
 
 A subscription catches up on history and then tails the live edge, as one loop. It yields events

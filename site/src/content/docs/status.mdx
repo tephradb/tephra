@@ -25,8 +25,10 @@ dictionary over tiered postings for tags and a dense column for types.
 The query planner chooses index against scan by comparing an estimated result size to the pruned
 range width, and is proven to change only the speed and never the answer. Reads run on the caller's
 own thread over an immutable snapshot and an atomically published watermark, with the active tail
-an append-only, lock-free structure. Subscriptions are catch-up and live-tail unified as one loop
-off the advancing watermark, wired through the server and client.
+an append-only, lock-free structure. Reads run forward or backward (`read_back`, newest-first),
+the backward path a windowed reverse scan that preserves read-ahead and leaves the forward path
+untouched. Subscriptions are catch-up and live-tail unified as one loop off the advancing
+watermark, wired through the server and client.
 
 For the full checklist, see [`ROADMAP.md`](https://github.com/tqwewe/tephra/blob/main/ROADMAP.md).
 

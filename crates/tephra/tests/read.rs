@@ -460,3 +460,141 @@ fn collect_positions(mut reads: tephra::read::Reads) -> Vec<u64> {
     }
     out
 }
+
+#[test]
+fn read_back_is_the_forward_read_reversed_on_every_path() {
+    // `read_back(query, before, limit)` must equal the forward matching set filtered to
+    // positions below `before`, reversed, and truncated to `limit`: the same events (checked by
+    // payload), descending. Pinned against an in-memory oracle and held byte-identical across
+    // planner biases, so the reverse path (index, unfiltered scan, filtered scan) never changes
+    // the answer. The reverse counterpart of `the_planner_never_changes_the_answer`.
+    let mut wrng = Rng(0x0FF1_CE00_ABCD_1234);
+    let events: Vec<Event> = (0..400).map(|_| random_event(&mut wrng)).collect();
+    let last = events.len() as u64;
+
+    // Oracle: the ascending matching positions of a query, straight from the workload.
+    let forward_matches = |query: &Query| -> Vec<u64> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| query.matches(ev.as_ref()))
+            .map(|(i, _)| i as u64 + 1)
+            .collect()
+    };
+
+    let mut qrng = Rng(0xABCD_0FF1_CE00_5678);
+    let cases: Vec<(Query, Position, Option<u64>)> = (0..500)
+        .map(|_| {
+            let query = random_query(&mut qrng);
+            let before = match qrng.below(4) {
+                0 => Position::MAX,                       // from the tip
+                1 => Position::new(last + 1),             // the whole log
+                _ => Position::new(qrng.below(last + 2)), // 0..=last+1, including empty
+            };
+            let limit = match qrng.below(3) {
+                0 => None,
+                _ => Some(qrng.below(6) * qrng.below(40)), // 0..=195, skewed small
+            };
+            (query, before, limit)
+        })
+        .collect();
+
+    let expected: Vec<Vec<u64>> = cases
+        .iter()
+        .map(|(query, before, limit)| {
+            let mut positions: Vec<u64> = forward_matches(query)
+                .into_iter()
+                .filter(|p| *p < before.get())
+                .collect();
+            positions.reverse();
+            if let Some(k) = limit {
+                positions.truncate(*k as usize);
+            }
+            positions
+        })
+        .collect();
+
+    let mut per_bias: Vec<Vec<Vec<u64>>> = Vec::new();
+    for &scan_bias in &[1u32, 4, u32::MAX] {
+        let (coord, handle, _dir) = coordinator_with_scan_bias(scan_bias);
+        for ev in &events {
+            handle.append(vec![ev.clone()], None).unwrap();
+        }
+        let results: Vec<Vec<u64>> = cases
+            .iter()
+            .map(|(query, before, limit)| {
+                let owned = handle
+                    .read_back(query, *before, *limit)
+                    .collect_owned()
+                    .unwrap();
+                // Every returned event is the one that lives at its position: no mis-fetch, and
+                // the reverse-scan window parsing yields the exact payload.
+                for (pos, ev) in &owned {
+                    assert_eq!(
+                        ev.as_bytes(),
+                        events[pos.get() as usize - 1].as_bytes(),
+                        "read_back returned the wrong event at {pos:?}"
+                    );
+                }
+                owned.into_iter().map(|(p, _)| p.get()).collect()
+            })
+            .collect();
+        coord.shutdown();
+
+        if per_bias.is_empty() {
+            assert_eq!(
+                results, expected,
+                "scan_bias {scan_bias} disagreed with the reverse oracle"
+            );
+        }
+        per_bias.push(results);
+    }
+
+    for (bias, results) in [4u32, u32::MAX].iter().zip(&per_bias[1..]) {
+        assert_eq!(
+            *results, per_bias[0],
+            "scan_bias {bias} changed the reverse answer versus the forced-index run"
+        );
+    }
+}
+
+#[test]
+fn read_back_paginates_with_no_gap_or_duplicate() {
+    // Paging newest-first with `before` set to the oldest position of the previous page
+    // reassembles exactly the full reverse read, with no gap and no duplicate at any seam.
+    let mut wrng = Rng(0x1234_ABCD_5EED_0001);
+    let events: Vec<Event> = (0..300).map(|_| random_event(&mut wrng)).collect();
+    let (coord, handle, _dir) = coordinator();
+    for ev in &events {
+        handle.append(vec![ev.clone()], None).unwrap();
+    }
+    let query = Query::item(QueryItem::with_tags(tags(&["course:c1"])));
+
+    let full: Vec<u64> = handle
+        .read_back(&query, Position::MAX, None)
+        .collect_owned()
+        .unwrap()
+        .into_iter()
+        .map(|(p, _)| p.get())
+        .collect();
+    assert!(
+        full.windows(2).all(|w| w[0] > w[1]),
+        "the full reverse read is strictly descending"
+    );
+
+    let mut tiled: Vec<u64> = Vec::new();
+    let mut before = Position::MAX;
+    loop {
+        let page = handle
+            .read_back(&query, before, Some(7))
+            .collect_owned()
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        before = page.last().unwrap().0; // the oldest position in this page
+        tiled.extend(page.into_iter().map(|(p, _)| p.get()));
+    }
+    assert_eq!(tiled, full);
+    coord.shutdown();
+}

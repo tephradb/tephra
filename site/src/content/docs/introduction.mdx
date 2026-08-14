@@ -71,7 +71,9 @@ do not, with no coordinator deciding that in advance.
 A minimally compliant store offers two operations, and Tephra is built around them:
 
 `read(query, after, limit)` returns the matching events in ascending position order, capped at
-`limit` (or the whole matching history when it is unset).
+`limit` (or the whole matching history when it is unset). Its dual `read_back(query, before,
+limit)` returns them newest-first, descending, where `before` is an exclusive upper bound as
+`after` is an exclusive lower one, for views like an event explorer that show recent events first.
 
 `append(events, condition)` records events atomically and fails if any event matches the
 condition's query after its `after` bound. Omit `after` (leave it at `Position::ZERO`) and the

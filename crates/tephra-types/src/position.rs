@@ -6,6 +6,12 @@ pub struct Position(pub(crate) u64);
 impl Position {
     pub const ZERO: Position = Position(0);
 
+    /// The largest representable position, the dual of [`ZERO`](Self::ZERO). Used as the
+    /// "from the tip" sentinel for a backwards read: `read_back(query, Position::MAX, limit)`
+    /// starts at the current durable tip, since the read is always clamped to the pinned
+    /// watermark anyway.
+    pub const MAX: Position = Position(u64::MAX);
+
     pub fn new(n: u64) -> Self {
         Position(n)
     }
