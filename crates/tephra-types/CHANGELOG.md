@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/tqwewe/tephra/compare/tephra-types-v0.1.2...tephra-types-v0.1.3) - 2026-08-14
+
+### Added
+
+- add backwards reads (read_back) across the engine, server, and client ([#15](https://github.com/tqwewe/tephra/pull/15))
+
 ## [0.1.2](https://github.com/tqwewe/tephra/compare/tephra-types-v0.1.1...tephra-types-v0.1.2) - 2026-08-13
 
 ### Added

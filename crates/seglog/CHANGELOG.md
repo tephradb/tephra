@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/tqwewe/tephra/compare/seglog-v0.3.3...seglog-v0.3.4) - 2026-08-14
+
+### Added
+
+- add backwards reads (read_back) across the engine, server, and client ([#15](https://github.com/tqwewe/tephra/pull/15))
+
 ## [0.3.3](https://github.com/tqwewe/tephra/compare/seglog-v0.3.2...seglog-v0.3.3) - 2026-08-14
 
 ### Other
