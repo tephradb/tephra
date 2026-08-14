@@ -306,3 +306,113 @@ fn wait_timeout_ticks_then_advances() {
     );
     coord.shutdown();
 }
+
+/// The async tail (`next_batch_async`) catches up on a prefix, keeps delivering live appends
+/// with no gap or duplicate at the boundary, and ends cleanly with `None` once the store closes
+/// while the subscriber is caught up. Driven on an executor-free `block_on` (a background writer
+/// wakes it), so it needs no async runtime dependency.
+#[cfg(feature = "async")]
+#[test]
+fn next_batch_async_catches_up_then_tails_then_closes() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        use std::pin::pin;
+
+        struct ThreadWaker(thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    let (coord, handle, _dir) = coordinator();
+    let before = 40u64;
+    let after = 40u64;
+    let total = before + after;
+    for _ in 0..before {
+        append(&handle, "k:1");
+    }
+
+    let mut sub = handle.subscribe(Query::all(), Position::ZERO);
+
+    // A writer appends the live half concurrently, waking the parked async subscriber.
+    let writer = {
+        let handle = handle.clone();
+        thread::spawn(move || {
+            for _ in 0..after {
+                append(&handle, "k:1");
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+
+    let positions = block_on(async {
+        let mut out: Vec<u64> = Vec::new();
+        while (out.len() as u64) < total {
+            match sub.next_batch_async().await {
+                Some(Ok(batch)) => out.extend(batch.into_iter().map(|(p, _)| p.get())),
+                Some(Err(err)) => panic!("read error: {err}"),
+                None => break,
+            }
+        }
+        out
+    });
+
+    writer.join().unwrap();
+    // Exactly the dense prefix 1..=total: no gap, no duplicate across the catch-up/live seam.
+    assert_eq!(positions, (1..=total).collect::<Vec<_>>());
+
+    // Caught up, then the store closes: the async tail ends with `None`, not a hang.
+    coord.shutdown();
+    assert!(
+        block_on(sub.next_batch_async()).is_none(),
+        "a closed store ends the async stream"
+    );
+}
+
+/// Drain-then-close: a subscriber caught up and parked in `wait` when a final batch is committed
+/// and the store closes in the same shutdown sequence still receives that batch, rather than
+/// ending on `None` with durable events unread. Whether the subscriber wakes on the commit
+/// (returns `Advanced`, drains at the loop top) or on the close (returns `Closed`, drains via the
+/// close branch), the delivered result is identical, so the assertion holds under either race.
+#[test]
+fn shutdown_delivers_a_final_batch_committed_while_parked() {
+    let (coord, handle, _dir) = coordinator();
+    append(&handle, "k:1"); // position 1
+    let mut sub = handle.subscribe(Query::all(), Position::ZERO);
+    assert_eq!(sub.poll_batch().unwrap().len(), 1); // caught up at 1
+    assert!(sub.poll_batch().unwrap().is_empty());
+
+    // Park the subscriber in `wait`, then commit the final event and close while it is parked.
+    let sub_thread = thread::spawn(move || sub.next_batch());
+    thread::sleep(Duration::from_millis(50)); // let it reach the blocking wait
+    append(&handle, "k:1"); // position 2: append blocks until the watermark is published
+    coord.shutdown(); // close fires with position 2 already durable and visible
+
+    let batch = sub_thread
+        .join()
+        .unwrap()
+        .expect("the final batch is delivered, not dropped at close")
+        .unwrap();
+    assert_eq!(
+        batch.iter().map(|(p, _)| p.get()).collect::<Vec<_>>(),
+        vec![2],
+    );
+}

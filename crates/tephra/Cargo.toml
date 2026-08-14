@@ -13,6 +13,7 @@ tephra-types.workspace = true
 
 crc32fast.workspace = true
 dashmap.workspace = true
+event-listener = { workspace = true, optional = true }
 flume.workspace = true
 fst.workspace = true
 futures-core = { workspace = true, optional = true }
@@ -25,7 +26,7 @@ criterion.workspace = true
 tempfile.workspace = true
 
 [features]
-async = ["flume/async", "dep:futures-core"]
+async = ["flume/async", "dep:futures-core", "dep:event-listener"]
 tracing = ["dep:tracing", "seglog/tracing"]
 # Turns on the gated crash and fault injection points across the engine and seglog. The macros
 # and their instrumentation live in seglog's `crash_points` module; tephra drives them through

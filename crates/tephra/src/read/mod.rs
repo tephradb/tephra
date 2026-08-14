@@ -171,6 +171,12 @@ struct Notify {
     closed: AtomicBool,
     /// Live subscriber count, so `wake` can skip the lock when there are none.
     subscribers: AtomicUsize,
+    /// The async counterpart of the condvar, for [`Subscription::next_batch_async`]. Notified
+    /// alongside `cv` on every commit and at close, so an async subscriber parked in
+    /// [`wait_past_async`](ReadCore::wait_past_async) wakes on the same signal the blocking one
+    /// does. Kept separate from the hot read path, which never touches it.
+    #[cfg(feature = "async")]
+    async_event: event_listener::Event,
 }
 
 /// The shared read state, held by both the writer thread (to publish) and every
@@ -210,6 +216,8 @@ impl ReadCore {
                 cv: Condvar::new(),
                 closed: AtomicBool::new(false),
                 subscribers: AtomicUsize::new(0),
+                #[cfg(feature = "async")]
+                async_event: event_listener::Event::new(),
             },
         })
     }
@@ -229,6 +237,14 @@ impl ReadCore {
     /// negligible against the fsync on the same path.
     pub(crate) fn publish_watermark(&self, tip: Position) {
         self.watermark.store(tip.get(), AtomicOrdering::SeqCst);
+    }
+
+    /// The durable tip (last readable position), loaded on its own without cloning the
+    /// snapshot. `Acquire`, matching [`load`](Self::load): callers that only need the head
+    /// (a lag gauge, say) pay a single atomic load rather than planning a read to reach the
+    /// watermark.
+    fn head(&self) -> Position {
+        Position::new(self.watermark.load(AtomicOrdering::Acquire))
     }
 
     /// Loads a consistent `(watermark, snapshot)` pair: watermark first (acquire), then the
@@ -274,6 +290,11 @@ impl ReadCore {
         }
         let _guard = self.notify.lock.lock().unwrap();
         self.notify.cv.notify_all();
+        // Wake async subscribers too. `notify` registers no ordering the count gate above does
+        // not already cover: a live async subscriber has incremented `subscribers` before its
+        // first watermark read (see `wait_past_async`), so a `wake` reaching here observed it.
+        #[cfg(feature = "async")]
+        self.notify.async_event.notify(usize::MAX);
     }
 
     /// Marks the store closed and wakes every parked subscriber (writer thread, at shutdown).
@@ -284,6 +305,11 @@ impl ReadCore {
         self.notify.closed.store(true, AtomicOrdering::Release);
         let _guard = self.notify.lock.lock().unwrap();
         self.notify.cv.notify_all();
+        // `closed` is set (release) before this notify, and `notify` establishes a happens-before
+        // with the woken listener, so an async waiter resumed here observes `closed` on its
+        // re-check and reports `Closed` (see `wait_past_async`).
+        #[cfg(feature = "async")]
+        self.notify.async_event.notify(usize::MAX);
     }
 
     /// Registers a new subscriber. Called from `Subscription::new` **before** the subscription
@@ -337,6 +363,40 @@ impl ReadCore {
             }
         }
     }
+
+    /// The async analogue of [`wait_past`](Self::wait_past) with no timeout: awaits until the
+    /// watermark advances past `cursor` (`Advanced`) or the store closes (`Closed`), yielding to
+    /// the executor while parked so a caller can `select!` it against its own mailbox. Backs
+    /// [`Subscription::next_batch_async`].
+    ///
+    /// The listener is registered **before** the final watermark/closed re-check: `event-listener`
+    /// only wakes listeners created before a `notify`, so registering first closes the same window
+    /// the condvar loop closes by re-reading under its lock. The watermark is read `SeqCst`
+    /// ([`watermark_gate`](Self::watermark_gate)) for the same store-buffer reason as the blocking
+    /// path (see [`wake`](Self::wake)): the async subscriber's `SeqCst` count increment in
+    /// `register_subscriber` runs before this first `SeqCst` load, so a `wake` that skips on a zero
+    /// count is ordered before it and its watermark store is already visible here.
+    #[cfg(feature = "async")]
+    async fn wait_past_async(&self, cursor: Position) -> WaitOutcome {
+        loop {
+            if self.notify.closed.load(AtomicOrdering::Acquire) {
+                return WaitOutcome::Closed;
+            }
+            if self.watermark_gate() > cursor {
+                return WaitOutcome::Advanced;
+            }
+            let listener = self.notify.async_event.listen();
+            // Re-check after registering: a commit (or close) landing between the checks above
+            // and `listen` still notifies this listener, so it is never lost.
+            if self.notify.closed.load(AtomicOrdering::Acquire) {
+                return WaitOutcome::Closed;
+            }
+            if self.watermark_gate() > cursor {
+                return WaitOutcome::Advanced;
+            }
+            listener.await;
+        }
+    }
 }
 
 /// A cloneable, `Send + Sync` handle for reads. Every clone shares the same [`ReadCore`];
@@ -364,6 +424,14 @@ impl ReadHandle {
     pub fn read(&self, query: &Query, after: Position, limit: Option<u64>) -> Reads {
         let (watermark, snapshot) = self.core.load();
         Reads::plan(snapshot, query, after, watermark, &self.config, limit)
+    }
+
+    /// The current durable tip: the last position any read may see, as published at the most
+    /// recent commit. A single atomic load, so a caller sampling it often (a lag gauge
+    /// computing `head - cursor` per module) pays no planning cost. Point-in-time like a
+    /// [`Reads::watermark`]: a later read pinned here resumes with no gap.
+    pub fn head(&self) -> Position {
+        self.core.head()
     }
 
     /// Starts a [`Subscription`] over `query`, resuming strictly after `after`: it catches up

@@ -166,7 +166,59 @@ impl Subscription {
                 Ok(_) => {
                     // Caught up to the live edge: block for the next advance.
                     if !self.wait() {
-                        return None;
+                        // Closed. A final batch may have been committed (watermark advanced)
+                        // in the same shutdown sequence just before close; deliver it before
+                        // ending, so a caught-up subscriber never drops durable events at the
+                        // seam. The caller loops, so any remainder drains on the next call.
+                        return match self.poll_batch() {
+                            Ok(batch) if !batch.is_empty() => Some(Ok(batch)),
+                            Ok(_) => None,
+                            Err(err) => Some(Err(err)),
+                        };
+                    }
+                }
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// Async analogue of [`wait`](Self::wait): awaits the next watermark advance past the cursor,
+    /// returning `true`, or the store closing, returning `false`. Yields to the executor while
+    /// parked, so a caller can `select!` it against its own work (an actor's mailbox, say)
+    /// without a bridge thread. Requires the `async` feature.
+    #[cfg(feature = "async")]
+    pub async fn wait_async(&self) -> bool {
+        matches!(
+            self.core.wait_past_async(self.cursor).await,
+            WaitOutcome::Advanced
+        )
+    }
+
+    /// Async analogue of [`next_batch`](Self::next_batch): awaits until at least one matching
+    /// event is available after the cursor, then returns it as an owned ascending batch (bounded
+    /// by the event cap). Returns `None` when the store has shut down. Requires the `async`
+    /// feature.
+    ///
+    /// Only the *wait* is async; the batch read ([`poll_batch`](Self::poll_batch)) runs inline on
+    /// the calling task's thread. That suits a subscriber pinned to its own thread (it would
+    /// otherwise sit idle), keeping the batch off any shared read pool. A caller multiplexing many
+    /// subscriptions on a shared executor should instead offload the read.
+    #[cfg(feature = "async")]
+    pub async fn next_batch_async(&mut self) -> Option<Result<Vec<(Position, Event)>, ReadError>> {
+        loop {
+            match self.poll_batch() {
+                Ok(batch) if !batch.is_empty() => return Some(Ok(batch)),
+                Ok(_) => {
+                    // Caught up to the live edge: await the next advance, yielding meanwhile.
+                    if !self.wait_async().await {
+                        // Closed: drain a final batch committed just before close (see
+                        // `next_batch`), then end. The caller loops, so a larger tail drains
+                        // across the next calls.
+                        return match self.poll_batch() {
+                            Ok(batch) if !batch.is_empty() => Some(Ok(batch)),
+                            Ok(_) => None,
+                            Err(err) => Some(Err(err)),
+                        };
                     }
                 }
                 Err(err) => return Some(Err(err)),
