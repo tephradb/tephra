@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;
 
@@ -81,7 +82,7 @@ pub fn check(server: ServerProcess, ground: &Ground) -> io::Result<(ServerProces
 /// index-vs-log read half). Returns the recovered log on success, or `None` if it could not be
 /// read (the reason is pushed to `v`). Shared by the full `check` and the read-only `verify_dir`.
 pub fn read_only_checks(
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     ground: &Ground,
     v: &mut Vec<String>,
 ) -> Option<Vec<SequencedEvent>> {
@@ -119,7 +120,7 @@ pub fn read_only_checks(
 /// Runs only the read-only invariants against an already-running server (used by the power-loss
 /// replay, where the store is opened but not mutated). Returns the violations and the recovered
 /// event count so a caller can show the test did real work.
-pub fn verify_readonly(addr: std::net::SocketAddr, ground: &Ground) -> (Vec<String>, usize) {
+pub fn verify_readonly(addr: SocketAddr, ground: &Ground) -> (Vec<String>, usize) {
     let mut v = Vec::new();
     let recovered = read_only_checks(addr, ground, &mut v)
         .map(|events| events.len())
@@ -234,7 +235,7 @@ fn check_in_flight(ground: &Ground, by_pos: &BTreeMap<u64, &SequencedEvent>, v: 
 
 /// Invariant 7 (read-only half): index/planner answers equal the log-filtered answers.
 fn check_index_agrees_with_log(
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     recovered: &[SequencedEvent],
     v: &mut Vec<String>,
 ) {
@@ -267,7 +268,7 @@ fn check_index_agrees_with_log(
 }
 
 /// Invariant 6: the next append lands exactly at recovered_max + 1.
-fn check_monotonic_append(addr: std::net::SocketAddr, recovered_max: u64, v: &mut Vec<String>) {
+fn check_monotonic_append(addr: SocketAddr, recovered_max: u64, v: &mut Vec<String>) {
     let mut client = match connect(addr) {
         Ok(client) => client,
         Err(err) => {
@@ -304,7 +305,7 @@ fn present_entity_tag(recovered: &[SequencedEvent]) -> Option<String> {
 
 /// Invariant 8: DCB conflict state survives recovery.
 fn check_dcb_integrity(
-    addr: std::net::SocketAddr,
+    addr: SocketAddr,
     existing_tag: Option<&str>,
     v: &mut Vec<String>,
 ) {
@@ -397,7 +398,7 @@ fn check_index_rebuild(server: ServerProcess, v: &mut Vec<String>) -> io::Result
 
 // --- helpers ---
 
-fn connect(addr: std::net::SocketAddr) -> io::Result<Client> {
+fn connect(addr: SocketAddr) -> io::Result<Client> {
     // The listening line is already seen, but retry briefly to smooth over the accept race.
     let mut last = None;
     for _ in 0..100 {
@@ -416,7 +417,7 @@ fn connect(addr: std::net::SocketAddr) -> io::Result<Client> {
 /// intact prefix and, if the stream ended on a decode error, a description of it (a torn/corrupt
 /// record surfacing). Only a connection failure is an `Err`; a mid-stream decode error is reported
 /// so the caller can still check the prefix.
-fn read_prefix(addr: std::net::SocketAddr) -> io::Result<(Vec<SequencedEvent>, Option<String>)> {
+fn read_prefix(addr: SocketAddr) -> io::Result<(Vec<SequencedEvent>, Option<String>)> {
     let mut client = connect(addr)?;
     let mut stream = client
         .read(Query::all(), Position::ZERO, None)

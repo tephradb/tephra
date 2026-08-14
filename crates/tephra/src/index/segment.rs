@@ -25,10 +25,12 @@
 //! is the source of truth.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
+use std::str;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -265,8 +267,8 @@ impl SegmentIndex for IndexSegment {
     }
 }
 
-impl std::fmt::Debug for IndexSegment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for IndexSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IndexSegment")
             .field("base_position", &self.header.base_position)
             .field("event_count", &self.header.event_count)
@@ -288,7 +290,7 @@ fn parse_type_dict(mut buf: &[u8]) -> Result<Vec<Box<str>>, IndexSegmentError> {
             });
         }
         let (name, rest) = buf.split_at(len);
-        let name = std::str::from_utf8(name).map_err(|_| IndexSegmentError::MalformedTypeDict {
+        let name = str::from_utf8(name).map_err(|_| IndexSegmentError::MalformedTypeDict {
             detail: "type name is not valid UTF-8",
         })?;
         names.push(Box::from(name));

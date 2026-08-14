@@ -27,6 +27,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -133,7 +134,7 @@ pub struct AsyncClient {
 
 impl AsyncClient {
     /// Connects to a server with the default [`AsyncClientConfig`].
-    pub async fn connect(addr: impl ToSocketAddrs) -> std::io::Result<AsyncClient> {
+    pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<AsyncClient> {
         AsyncClient::connect_with(addr, AsyncClientConfig::default()).await
     }
 
@@ -142,7 +143,7 @@ impl AsyncClient {
     pub async fn connect_with(
         addr: impl ToSocketAddrs,
         config: AsyncClientConfig,
-    ) -> std::io::Result<AsyncClient> {
+    ) -> io::Result<AsyncClient> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (read_half, write_half) = stream.into_split();

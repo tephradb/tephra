@@ -47,6 +47,7 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
+use std::vec::IntoIter;
 
 use thiserror::Error;
 
@@ -434,7 +435,7 @@ struct CachedReader {
 /// cached for the last segment, and the single-record buffer events are lent from.
 struct IndexedState {
     snapshot: Arc<Snapshot>,
-    positions: std::vec::IntoIter<Position>,
+    positions: IntoIter<Position>,
     reader: Option<CachedReader>,
     buf: Option<Record>,
 }

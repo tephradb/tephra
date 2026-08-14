@@ -1,6 +1,6 @@
 //! Round-trip and framing tests for the wire protocol.
 
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 use tephra_proto::tephra::{AppendRequest, Event, Request, Response, request};
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame, write_frame};
@@ -139,7 +139,7 @@ fn a_torn_frame_is_an_error_not_a_clean_eof() {
     bytes.extend_from_slice(b"abc");
     let mut cursor = Cursor::new(bytes);
     match read_frame::<Request, _>(&mut cursor, DEFAULT_MAX_FRAME_LEN) {
-        Err(FrameError::Io(err)) => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof),
+        Err(FrameError::Io(err)) => assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof),
         other => panic!("expected Io(UnexpectedEof), got {other:?}"),
     }
 }
@@ -150,6 +150,8 @@ fn a_torn_frame_is_an_error_not_a_clean_eof() {
 
 #[cfg(feature = "tokio")]
 mod async_framing {
+    use std::io;
+
     use tephra_proto::tephra::{AppendRequest, Request, request};
     use tephra_proto::{DEFAULT_MAX_FRAME_LEN, FrameError, read_frame_async, write_frame_async};
 
@@ -198,7 +200,7 @@ mod async_framing {
         let mut reader: &[u8] = &bytes;
         match read_frame_async::<Request, _>(&mut reader, DEFAULT_MAX_FRAME_LEN).await {
             Err(FrameError::Io(err)) => {
-                assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof)
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof)
             }
             other => panic!("expected Io(UnexpectedEof), got {other:?}"),
         }

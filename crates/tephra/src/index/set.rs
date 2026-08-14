@@ -18,10 +18,12 @@
 //! errors with the unanswerable range so the caller falls back to a log scan, rather than
 //! returning a short answer.
 
-use std::fs::File;
+use std::fmt;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::vec::IntoIter;
 
 use thiserror::Error;
 
@@ -86,7 +88,7 @@ impl IndexSet {
     pub fn open(set: &SegmentSet) -> Result<Self, IndexError> {
         let dir = set.dir().join("index");
         if !dir.exists() {
-            std::fs::create_dir_all(&dir).map_err(|source| IndexError::io(&dir, source))?;
+            fs::create_dir_all(&dir).map_err(|source| IndexError::io(&dir, source))?;
             if let Some(parent) = dir.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -264,7 +266,7 @@ impl IndexSet {
         &self,
         query: &Query,
         after: Position,
-    ) -> Result<std::vec::IntoIter<Position>, IndexError> {
+    ) -> Result<IntoIter<Position>, IndexError> {
         let mut out = Vec::new();
         for touched in self.plan_touched(after)? {
             match touched {
@@ -330,8 +332,8 @@ enum Touched<'a> {
     Active(&'a ActiveTail),
 }
 
-impl std::fmt::Debug for IndexSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for IndexSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IndexSet")
             .field("dir", &self.dir)
             .field("sealed", &self.sealed.len())
@@ -345,7 +347,7 @@ impl std::fmt::Debug for IndexSet {
 /// Loads `path` if it is a valid index segment whose base and event count match the log
 /// segment. Returns `None` (rebuild it) for a missing, corrupt, or mismatched file.
 fn load_valid(path: &Path, base: Position, count: u64) -> Result<Option<IndexSegment>, IndexError> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(IndexError::io(path, err)),
@@ -582,7 +584,7 @@ mod tests {
         drop(IndexSet::open(&set).unwrap());
         // .idx files now exist for each sealed segment.
         let idx_dir = dir.path().join("index");
-        let idx_count = std::fs::read_dir(&idx_dir).unwrap().count();
+        let idx_count = fs::read_dir(&idx_dir).unwrap().count();
         assert_eq!(idx_count, set.sealed_len());
         // Second open loads them and still agrees with the scan.
         let index = IndexSet::open(&set).unwrap();
@@ -599,13 +601,13 @@ mod tests {
         drop(IndexSet::open(&set).unwrap());
         // Delete one sealed .idx; the next open must rebuild it.
         let idx_dir = dir.path().join("index");
-        let first = std::fs::read_dir(&idx_dir)
+        let first = fs::read_dir(&idx_dir)
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
             .min()
             .unwrap();
-        std::fs::remove_file(&first).unwrap();
+        fs::remove_file(&first).unwrap();
         let index = IndexSet::open(&set).unwrap();
         let q = Query::all();
         let from_index: Vec<Position> = index.search_all(&q, Position::ZERO).unwrap().collect();
@@ -620,16 +622,16 @@ mod tests {
         drop(IndexSet::open(&set).unwrap());
         // Corrupt one .idx body byte (leave the header CRC valid): open must rebuild it.
         let idx_dir = dir.path().join("index");
-        let first = std::fs::read_dir(&idx_dir)
+        let first = fs::read_dir(&idx_dir)
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
             .min()
             .unwrap();
-        let mut bytes = std::fs::read(&first).unwrap();
+        let mut bytes = fs::read(&first).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
-        std::fs::write(&first, &bytes).unwrap();
+        fs::write(&first, &bytes).unwrap();
 
         let index = IndexSet::open(&set).unwrap();
         let q = Query::all();

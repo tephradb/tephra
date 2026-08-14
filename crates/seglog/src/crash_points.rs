@@ -30,7 +30,9 @@
 
 #[cfg(feature = "crash-points")]
 mod imp {
+    use std::env;
     use std::io;
+    use std::process;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,7 +55,7 @@ mod imp {
     fn plan() -> Option<&'static Plan> {
         static PLAN: OnceLock<Option<Plan>> = OnceLock::new();
         PLAN.get_or_init(|| {
-            let raw = std::env::var("TEPHRA_CRASH_POINT").ok()?;
+            let raw = env::var("TEPHRA_CRASH_POINT").ok()?;
             let mut parts = raw.splitn(3, ':');
             let site = parts.next()?.trim();
             if site.is_empty() {
@@ -102,7 +104,7 @@ mod imp {
         {
             // A hard abort: no destructors, no buffered flush, so the on-disk state is
             // exactly what had reached the kernel at this line, which is the point.
-            std::process::abort();
+            process::abort();
         }
     }
 

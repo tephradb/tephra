@@ -321,6 +321,8 @@ fn classify(err: LogError) -> AppendError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use tempfile::TempDir;
 
     use crate::Position;
@@ -480,7 +482,7 @@ mod tests {
         w.process(&[r1, r2]);
 
         // Drain both replies into a token-keyed map (arrival order is rejection-first).
-        let mut got = std::collections::HashMap::new();
+        let mut got = HashMap::new();
         for _ in 0..2 {
             let (token, res) = rx.try_recv().unwrap();
             got.insert(token, res);

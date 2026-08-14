@@ -423,6 +423,7 @@ mod tests {
     /// Executor-free `block_on` (mirrors `tests/writer.rs`): a `flume` async op wakes us from
     /// its own thread, so parking the current thread is enough to drive a read to completion.
     fn block_on<F: future::Future>(fut: F) -> F::Output {
+        use std::pin::pin;
         use std::sync::Arc;
         use std::task::{Context, Poll, Wake, Waker};
         use std::thread::{self, Thread};
@@ -439,7 +440,7 @@ mod tests {
 
         let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
         let mut cx = Context::from_waker(&waker);
-        let mut fut = std::pin::pin!(fut);
+        let mut fut = pin!(fut);
         loop {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(out) => return out,

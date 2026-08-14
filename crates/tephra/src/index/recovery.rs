@@ -93,6 +93,8 @@ pub fn rebuild<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
+
     use super::*;
     use crate::event::{Event, EventType, Tag, Tags};
     use crate::index::search;
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn empty_range_rebuilds_to_empty() {
-        let rebuilt = rebuild(Position::new(1), std::iter::empty());
+        let rebuilt = rebuild(Position::new(1), iter::empty());
         assert_eq!(rebuilt.count, 0);
         assert!(!rebuilt.unindexable);
         assert!(rebuilt.index.is_empty());

@@ -7,6 +7,7 @@
 //! ack for it, which is a valid in-flight-absent outcome.
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -33,7 +34,7 @@ pub enum Workload {
     Mixed,
 }
 
-impl std::str::FromStr for Workload {
+impl FromStr for Workload {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
         match s {

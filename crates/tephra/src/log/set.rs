@@ -1162,7 +1162,7 @@ fn read_header(path: &Path) -> Result<Option<[u8; SEGMENT_HEADER_SIZE]>, LogErro
     let mut buf = [0u8; SEGMENT_HEADER_SIZE];
     match file.read_exact_at(&mut buf, 0) {
         Ok(()) => Ok(Some(buf)),
-        Err(source) if source.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
         Err(source) => Err(LogError::io(path, source)),
     }
 }

@@ -39,6 +39,7 @@
 //! durable store. To measure the real durability ceiling, point `TEPHRA_BENCH_DIR` at a
 //! directory on the actual storage device under test.
 
+use std::env;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -77,7 +78,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
-        let dir = match std::env::var_os("TEPHRA_BENCH_DIR") {
+        let dir = match env::var_os("TEPHRA_BENCH_DIR") {
             Some(base) => TempDir::new_in(base).expect("create scratch dir under TEPHRA_BENCH_DIR"),
             None => TempDir::new().expect("create scratch dir"),
         };

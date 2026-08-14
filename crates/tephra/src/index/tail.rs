@@ -31,6 +31,7 @@
 //! being the tail's implementation of it.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
@@ -65,8 +66,8 @@ pub struct ActiveTail {
     unindexable: AtomicBool,
 }
 
-impl std::fmt::Debug for ActiveTail {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ActiveTail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActiveTail")
             .field("base", &self.base)
             .field("len", &self.len())

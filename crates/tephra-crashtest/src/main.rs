@@ -4,7 +4,8 @@
 //! violation prints the seed and cycle to reproduce it and copies the store to the artifact dir.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -114,7 +115,7 @@ fn main() -> ExitCode {
     let data_root = args
         .data_root
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("tephra-crashtest"));
+        .unwrap_or_else(|| env::temp_dir().join("tephra-crashtest"));
 
     let crash = match &args.crash_point {
         Some(point) => Crash::Point(point.clone()),
@@ -152,9 +153,9 @@ fn main() -> ExitCode {
         };
         return match tephra_crashtest::spawn_and_verify(
             &cfg.server_bin,
-            std::path::Path::new(dir),
+            Path::new(dir),
             cfg.segment_size,
-            std::path::Path::new(witness),
+            Path::new(witness),
         ) {
             Ok(v) if v.is_empty() => {
                 println!("verify_dir {dir}: ok");
@@ -318,7 +319,7 @@ fn run_phase2(base: &tephra_crashtest::HarnessConfig, cycles_per_site: u64) -> E
         let mut hits = 0u64;
         let mut violations = 0u64;
         let mut first_hit: Option<u64> = None;
-        let mut messages: Vec<(u64, Vec<String>, Option<std::path::PathBuf>)> = Vec::new();
+        let mut messages: Vec<(u64, Vec<String>, Option<PathBuf>)> = Vec::new();
 
         for cycle in 0..cycles_per_site {
             total_cycles += 1;

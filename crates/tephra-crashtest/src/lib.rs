@@ -6,10 +6,13 @@
 //! witness. Cycles are independent and seeded, so a failure reproduces from its seed and cycle
 //! index alone, and the whole data dir plus witness is copied to an artifact directory.
 
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub mod driver;
@@ -237,7 +240,7 @@ pub fn cycle_seed(seed: u64, cycle: u64) -> u64 {
 /// Locates the server binary: `TEPHRA_SERVER_BIN` if set, else `target/debug/tephra-server`
 /// relative to the workspace root.
 pub fn default_server_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("TEPHRA_SERVER_BIN") {
+    if let Ok(path) = env::var("TEPHRA_SERVER_BIN") {
         return PathBuf::from(path);
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -285,7 +288,7 @@ pub fn run_cycle(cfg: &HarnessConfig, cycle: u64) -> io::Result<CycleResult> {
     let (crash_hit, server) = match &cfg.crash {
         Crash::SigkillTimed | Crash::IoFault(_) => {
             let delay = 10 + (seed % 391);
-            std::thread::sleep(Duration::from_millis(delay));
+            thread::sleep(Duration::from_millis(delay));
             server.kill()?;
             let sub = running.stop_and_join();
             (true, RestartOutcome::new(server.restart_clean()?, sub))
@@ -298,7 +301,7 @@ pub fn run_cycle(cfg: &HarnessConfig, cycle: u64) -> io::Result<CycleResult> {
         Crash::PointDuringRecovery(point) => {
             // First leave committed data on disk with a timed SIGKILL.
             let delay = 10 + (seed % 391);
-            std::thread::sleep(Duration::from_millis(delay));
+            thread::sleep(Duration::from_millis(delay));
             server.kill()?;
             let sub = running.stop_and_join();
             drop(server);
@@ -401,7 +404,7 @@ pub fn run_workload_only(
     // A fixed duration when given (so a power-loss run can guarantee enough events to roll over),
     // otherwise the seeded delay.
     let delay = workload_ms.unwrap_or(10 + (seed % 391));
-    std::thread::sleep(Duration::from_millis(delay));
+    thread::sleep(Duration::from_millis(delay));
     server.kill()?;
     running.stop_and_join();
     drop(server);
@@ -419,7 +422,7 @@ pub fn spawn_and_verify(
     witness_path: &Path,
 ) -> io::Result<Vec<String>> {
     let config_path =
-        std::env::temp_dir().join(format!("tephra-verify-{}.toml", std::process::id()));
+        env::temp_dir().join(format!("tephra-verify-{}.toml", process::id()));
     write_config(&config_path, segment_size)?;
     let server = ServerProcess::spawn(server_bin, data_dir, &config_path, None)?;
     let ground = Ground::read(witness_path)?;

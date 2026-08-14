@@ -353,9 +353,11 @@ impl<const H: usize> Writer<H> {
         // skips the trailing-record CRC would wrongly adopt it.
         #[cfg(feature = "crash-points")]
         if crate::crash_points::armed("torn_marker") {
+            use std::process;
+
             let _ = self.writer.write_all(&payload[..1]);
             let _ = self.writer.flush();
-            std::process::abort();
+            process::abort();
         }
         self.writer.write_all(&payload)?;
         self.write_offset += total as u64;

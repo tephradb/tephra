@@ -22,8 +22,9 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
+use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::panic::AssertUnwindSafe;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -418,7 +419,7 @@ fn run_read(
         if batch.events().len() >= conn.config.read_batch_events
             || batch_bytes >= conn.config.read_batch_bytes
         {
-            let full = std::mem::replace(&mut batch, pb::ReadEvents::new());
+            let full = mem::replace(&mut batch, pb::ReadEvents::new());
             if conn
                 .out_tx
                 .send(make_response(request_id, ResponseKind::ReadEvents(full)))
@@ -519,7 +520,7 @@ fn send_event_batch(
         if batch.events().len() >= conn.config.read_batch_events
             || batch_bytes >= conn.config.read_batch_bytes
         {
-            let full = std::mem::replace(&mut batch, pb::ReadEvents::new());
+            let full = mem::replace(&mut batch, pb::ReadEvents::new());
             conn.out_tx
                 .send(make_response(request_id, ResponseKind::ReadEvents(full)))
                 .map_err(|_| ())?;
@@ -694,7 +695,7 @@ impl ReadPool {
                         // Isolate a panic in one read so a single bad request cannot tear down a
                         // permanent worker and shrink the pool. `WorkerCleanup` lives inside the
                         // job, so it still drops during the unwind.
-                        let _ = std::panic::catch_unwind(AssertUnwindSafe(move || job.run()));
+                        let _ = panic::catch_unwind(AssertUnwindSafe(move || job.run()));
                     }
                 })
                 .expect("spawn read worker thread");

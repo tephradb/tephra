@@ -44,6 +44,7 @@
 //! after a fresh process as the only cold sample. This mirrors the fsync caveat in
 //! `write_path.rs`.
 
+use std::env;
 use std::hint::black_box;
 use std::mem;
 
@@ -93,7 +94,7 @@ impl Store {
     /// Builds a store of [`N`] events, each carrying one tag per selectivity level, pinned to
     /// `scan_bias` and `payload`-byte payloads.
     fn new(scan_bias: u32, payload: usize) -> Store {
-        let dir = match std::env::var_os("TEPHRA_BENCH_DIR") {
+        let dir = match env::var_os("TEPHRA_BENCH_DIR") {
             Some(base) => TempDir::new_in(base).expect("create scratch dir under TEPHRA_BENCH_DIR"),
             None => TempDir::new().expect("create scratch dir"),
         };

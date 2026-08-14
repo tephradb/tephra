@@ -6,7 +6,8 @@
 //! stderr, so there is no fixed sleep: the harness proceeds the instant the socket is up, which
 //! is what keeps the crash-cycle rate high.
 
-use std::io::{self, BufRead, BufReader};
+use std::fs;
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -76,7 +77,7 @@ impl ServerProcess {
         // line, keeps a shared rolling tail for artifacts, and drains the rest so a chatty server
         // never blocks on a full pipe.
         for stream in [
-            Box::new(stdout) as Box<dyn std::io::Read + Send>,
+            Box::new(stdout) as Box<dyn Read + Send>,
             Box::new(stderr),
         ] {
             let tail = Arc::clone(&tail);
@@ -170,11 +171,11 @@ impl ServerProcess {
             child
                 .stdout
                 .take()
-                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
             child
                 .stderr
                 .take()
-                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                .map(|s| Box::new(s) as Box<dyn Read + Send>),
         ]
         .into_iter()
         .flatten()
@@ -190,12 +191,12 @@ impl ServerProcess {
             });
         }
 
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(!status.success());
             }
-            if listening.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+            if listening.load(Ordering::SeqCst) || Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ok(false);
@@ -214,7 +215,7 @@ impl ServerProcess {
     /// Waits for the child to exit on its own (used when a crash point aborts it) and returns
     /// whether it exited abnormally (killed or aborted by signal).
     pub fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<ExitKind> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait()? {
                 Some(status) => {
@@ -224,7 +225,7 @@ impl ServerProcess {
                         ExitKind::Abnormal
                     });
                 }
-                None if std::time::Instant::now() >= deadline => return Ok(ExitKind::StillRunning),
+                None if Instant::now() >= deadline => return Ok(ExitKind::StillRunning),
                 None => thread::sleep(Duration::from_millis(2)),
             }
         }
@@ -258,7 +259,7 @@ impl ServerProcess {
         drop(self);
         let index_dir = data_dir.join("index");
         if index_dir.exists() {
-            std::fs::remove_dir_all(&index_dir)?;
+            fs::remove_dir_all(&index_dir)?;
         }
         ServerProcess::spawn(&bin, &data_dir, &config, None)
     }

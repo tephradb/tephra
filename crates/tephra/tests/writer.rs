@@ -2,7 +2,7 @@
 //! conflict resolution, shutdown, backpressure, and durability across reopen.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use smallvec::SmallVec;
@@ -109,7 +109,7 @@ fn overlapping_uniqueness_guard_lets_exactly_one_win() {
     let (coord, handle) = WriteCoordinator::start(open(&dir), config()).unwrap();
 
     const THREADS: usize = 16;
-    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let barrier = Arc::new(Barrier::new(THREADS));
     let mut joins = Vec::new();
     for _ in 0..THREADS {
         let h = handle.clone();
@@ -334,11 +334,15 @@ fn append_with_no_events_is_rejected() {
     coord.shutdown();
 }
 
+#[cfg(feature = "async")]
+use std::future::Future;
+
 /// Drives a future to completion on the calling thread with a park/unpark waker. The
 /// worker replies from its own thread, so its `wake` unparks us. Keeps the async tests
 /// free of an executor dependency.
 #[cfg(feature = "async")]
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+fn block_on<F: Future>(fut: F) -> F::Output {
+    use std::pin::pin;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
     use std::thread::{self, Thread};
@@ -355,7 +359,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
     let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
     let mut cx = Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(fut);
+    let mut fut = pin!(fut);
     loop {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(out) => return out,

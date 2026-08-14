@@ -40,6 +40,7 @@
 //! fsync/tmpfs caveat in `write_path.rs` and `read_path.rs`, and relates to the deferred
 //! "condition-check latency with and without tips".
 
+use std::env;
 use std::hint::black_box;
 use std::mem;
 
@@ -77,7 +78,7 @@ struct Store {
 impl Store {
     /// Builds a store of `n` events, the last carrying [`SENTINEL`], pinned to `force_scan`.
     fn new(force_scan: bool, n: u64) -> Store {
-        let dir = match std::env::var_os("TEPHRA_BENCH_DIR") {
+        let dir = match env::var_os("TEPHRA_BENCH_DIR") {
             Some(base) => TempDir::new_in(base).expect("create scratch dir under TEPHRA_BENCH_DIR"),
             None => TempDir::new().expect("create scratch dir"),
         };

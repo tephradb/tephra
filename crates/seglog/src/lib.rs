@@ -286,12 +286,15 @@ mod tests {
 
     use super::*;
     use read::{ReadHint, Reader};
-    use std::io::{Seek, Write as _};
+    use std::env;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Seek, SeekFrom, Write as _};
+    use std::path::{Path, PathBuf};
     use write::Writer;
 
     const SEGMENT_SIZE: usize = 1024 * 1024; // 1 MB
 
-    fn temp_path() -> std::path::PathBuf {
+    fn temp_path() -> PathBuf {
         tempfile::Builder::new()
             .suffix(".seg")
             .tempfile()
@@ -509,11 +512,11 @@ mod tests {
 
         // Manually corrupt the file by writing garbage after valid data
         drop(writer);
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .open(&temp)
             .expect("failed to open file");
-        file.seek(std::io::SeekFrom::Start(good_offset))
+        file.seek(SeekFrom::Start(good_offset))
             .expect("failed to seek");
         file.write_all(&[0xFF; 100])
             .expect("failed to write garbage");
@@ -647,11 +650,11 @@ mod tests {
         drop(writer);
 
         // Corrupt the data by modifying a byte in the data portion
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .open(&temp)
             .expect("failed to open file");
-        file.seek(std::io::SeekFrom::Start(RECORD_HEAD_SIZE as u64))
+        file.seek(SeekFrom::Start(RECORD_HEAD_SIZE as u64))
             .expect("failed to seek");
         file.write_all(&[0xFF]).expect("failed to write");
         drop(file);
@@ -1150,7 +1153,7 @@ mod tests {
         drop(writer);
 
         // Verify header is intact
-        let file = std::fs::File::open(&temp).expect("failed to open file");
+        let file = File::open(&temp).expect("failed to open file");
         let mut magic_read = vec![0u8; magic.len()];
         file.read_exact_at(&mut magic_read, 0)
             .expect("failed to read magic");
@@ -1291,11 +1294,11 @@ mod tests {
 
         // Manually corrupt the file after valid data
         drop(writer);
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .open(&temp)
             .expect("failed to open file");
-        file.seek(std::io::SeekFrom::Start(good_offset))
+        file.seek(SeekFrom::Start(good_offset))
             .expect("failed to seek");
         file.write_all(&[0xFF; 100])
             .expect("failed to write garbage");
@@ -1586,7 +1589,7 @@ mod tests {
         drop(writer);
 
         // Flip bit 31 of the length field (the first 4 bytes, little-endian) directly on disk.
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&temp)
@@ -1594,7 +1597,7 @@ mod tests {
         let mut len_bytes = [0u8; 4];
         file.read_exact(&mut len_bytes).unwrap();
         let raw = u32::from_le_bytes(len_bytes) | 0x8000_0000;
-        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&raw.to_le_bytes()).unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -1985,7 +1988,7 @@ mod tests {
 
             // Simulate a crash mid-batch by truncating the tail of batch 2.
             let cut = safe + cut_within as u64;
-            std::fs::OpenOptions::new()
+            OpenOptions::new()
                 .write(true)
                 .open(&temp)
                 .expect("failed to open file")
@@ -2021,11 +2024,11 @@ mod tests {
 
         // Corrupt a byte in the data of record 1 of the second batch. Its marker is intact,
         // but validating the whole run must reject the entire batch.
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .open(&temp)
             .expect("failed to open file");
-        file.seek(std::io::SeekFrom::Start(safe + RECORD_HEAD_SIZE as u64))
+        file.seek(SeekFrom::Start(safe + RECORD_HEAD_SIZE as u64))
             .expect("failed to seek");
         file.write_all(&[0xFF]).expect("failed to corrupt");
         drop(file);
@@ -2077,13 +2080,13 @@ mod tests {
     #[test]
     fn test_create_relative_path_no_parent() {
         let dir = tempfile::TempDir::new().expect("failed to create temp dir");
-        let original = std::env::current_dir().expect("failed to read cwd");
-        std::env::set_current_dir(dir.path()).expect("failed to set cwd");
+        let original = env::current_dir().expect("failed to read cwd");
+        env::set_current_dir(dir.path()).expect("failed to set cwd");
 
         // A bare filename has an empty parent component; create must fall back to ".".
-        let result = Writer::<0>::create(std::path::Path::new("segment.log"), SEGMENT_SIZE, 0);
+        let result = Writer::<0>::create(Path::new("segment.log"), SEGMENT_SIZE, 0);
 
-        std::env::set_current_dir(&original).expect("failed to restore cwd");
+        env::set_current_dir(&original).expect("failed to restore cwd");
 
         let writer = result.expect("create with bare filename should succeed");
         assert_eq!(writer.write_offset(), 0);

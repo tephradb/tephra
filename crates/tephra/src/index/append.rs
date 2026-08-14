@@ -27,6 +27,7 @@
 //!   not yet grown can never panic a reader.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -161,7 +162,7 @@ pub struct PostingSlot {
     inline: [AtomicU32; INLINE],
     /// Allocated only once a tag exceeds `INLINE` postings. `OnceLock::get` supplies the
     /// acquire for the spill's own storage once `len > INLINE` is observed.
-    spill: std::sync::OnceLock<ChunkedVec<AtomicU32>>,
+    spill: OnceLock<ChunkedVec<AtomicU32>>,
 }
 
 impl PostingSlot {

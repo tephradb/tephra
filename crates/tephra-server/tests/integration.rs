@@ -1,9 +1,11 @@
 //! End-to-end tests over a real socket: a `tephra-server` bound to an ephemeral port, driven
 //! by the blocking `tephra-client`.
 
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -469,7 +471,7 @@ fn graceful_shutdown_stops_accepting_and_returns() {
     // Signal shutdown; the accept loop stops and `run` returns (joined by Drop), which drops
     // the listener and closes the port.
     ts.shutdown.shutdown();
-    thread::sleep(std::time::Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(50));
 
     // A new connection is refused, or if it slips in before the port closes, its request
     // fails: either way the server no longer accepts work.
@@ -806,7 +808,7 @@ fn pipelined_appends_all_succeed_with_dense_positions() {
     writer.flush().unwrap();
 
     // Collect one AppendResponse per request id.
-    let mut positions = std::collections::HashMap::new();
+    let mut positions = HashMap::new();
     for _ in 0..n {
         let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
             .unwrap()
@@ -1125,7 +1127,7 @@ async fn async_client_pipelines_concurrent_appends() {
         });
     }
 
-    let mut firsts = std::collections::BTreeSet::new();
+    let mut firsts = BTreeSet::new();
     while let Some(joined) = set.join_next().await {
         let range = joined.unwrap();
         assert_eq!(range.first, range.last, "each append is a single event");
@@ -1133,7 +1135,7 @@ async fn async_client_pipelines_concurrent_appends() {
     }
 
     // All succeeded, and the assigned positions are exactly 1..=n, dense and unique.
-    let expected: std::collections::BTreeSet<u64> = (1..=n).collect();
+    let expected: BTreeSet<u64> = (1..=n).collect();
     assert_eq!(firsts, expected);
 }
 
@@ -1393,11 +1395,11 @@ async fn bounded_inflight_flood_backpressures_without_dropping() {
     for _ in 0..CONNS {
         pool.push(AsyncClient::connect_with(ts.addr, config).await.unwrap());
     }
-    let pool = std::sync::Arc::new(pool);
+    let pool = Arc::new(pool);
 
     let mut workers = tokio::task::JoinSet::new();
     for w in 0..WORKERS {
-        let pool = std::sync::Arc::clone(&pool);
+        let pool = Arc::clone(&pool);
         workers.spawn(async move {
             // Keep OUTSTANDING appends in flight at all times until the quota is met.
             let mut inflight = tokio::task::JoinSet::new();
@@ -1467,13 +1469,13 @@ async fn write_flood_over_a_connection_pool_never_drops() {
     for _ in 0..CONNS {
         pool.push(AsyncClient::connect(ts.addr).await.unwrap());
     }
-    let pool = std::sync::Arc::new(pool);
+    let pool = Arc::new(pool);
 
     // No in-flight limit: fire every append as its own task, round-robined across the pool, so
     // each socket carries a huge number of concurrent pipelined appends at once.
     let mut set = tokio::task::JoinSet::new();
     for i in 0..TOTAL_APPENDS {
-        let pool = std::sync::Arc::clone(&pool);
+        let pool = Arc::clone(&pool);
         set.spawn(async move {
             let client = &pool[i % CONNS];
             client
