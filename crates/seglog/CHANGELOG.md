@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/tqwewe/tephra/compare/seglog-v0.3.2...seglog-v0.3.3) - 2026-08-14
+
+### Other
+
+- import std items instead of inlining full paths
+
 ## [0.3.2](https://github.com/tqwewe/tephra/compare/seglog-v0.3.1...seglog-v0.3.2) - 2026-08-13
 
 ### Fixed

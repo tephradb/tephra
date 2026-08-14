@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/tqwewe/tephra/compare/tephra-v0.3.0...tephra-v0.3.1) - 2026-08-14
+
+### Added
+
+- *(tephra)* add async subscription tailing, read head accessor, and drain-on-close
+
+### Other
+
+- import std items instead of inlining full paths
+
 ## [0.3.0](https://github.com/tqwewe/tephra/compare/tephra-v0.2.0...tephra-v0.3.0) - 2026-08-13
 
 ### Added
