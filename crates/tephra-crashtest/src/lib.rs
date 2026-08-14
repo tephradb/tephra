@@ -421,8 +421,7 @@ pub fn spawn_and_verify(
     segment_size: usize,
     witness_path: &Path,
 ) -> io::Result<Vec<String>> {
-    let config_path =
-        env::temp_dir().join(format!("tephra-verify-{}.toml", process::id()));
+    let config_path = env::temp_dir().join(format!("tephra-verify-{}.toml", process::id()));
     write_config(&config_path, segment_size)?;
     let server = ServerProcess::spawn(server_bin, data_dir, &config_path, None)?;
     let ground = Ground::read(witness_path)?;

@@ -304,11 +304,7 @@ fn present_entity_tag(recovered: &[SequencedEvent]) -> Option<String> {
 }
 
 /// Invariant 8: DCB conflict state survives recovery.
-fn check_dcb_integrity(
-    addr: SocketAddr,
-    existing_tag: Option<&str>,
-    v: &mut Vec<String>,
-) {
+fn check_dcb_integrity(addr: SocketAddr, existing_tag: Option<&str>, v: &mut Vec<String>) {
     // Guard on a tag known to be present in the recovered log, so the uniqueness guard must fire.
     let Some(existing_tag) = existing_tag else {
         return; // nothing present to conflict with

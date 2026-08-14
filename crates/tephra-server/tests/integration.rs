@@ -4,8 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 

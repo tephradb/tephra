@@ -76,10 +76,7 @@ impl ServerProcess {
         // A reader thread per stream: each reports the bound address if it sees the listening
         // line, keeps a shared rolling tail for artifacts, and drains the rest so a chatty server
         // never blocks on a full pipe.
-        for stream in [
-            Box::new(stdout) as Box<dyn Read + Send>,
-            Box::new(stderr),
-        ] {
+        for stream in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
             let tail = Arc::clone(&tail);
             let ready_tx = Arc::clone(&ready_tx);
             thread::spawn(move || {
