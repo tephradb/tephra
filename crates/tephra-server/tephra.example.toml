@@ -18,10 +18,11 @@ data_dir = "tephra-data"
 size = 268435456           # 256 MiB
 
 [writer]
-# Bounded request-queue depth. When full, an append blocks (backpressure).
-queue_capacity = 1024
+# Bounded request-queue depth. When full, an append blocks (backpressure). Keep it well above
+# max_batch_records or it caps the achievable batch size.
+queue_capacity = 16384
 # Most requests folded into one group-committed batch. The main throughput-vs-latency dial.
-max_batch_records = 1024
+max_batch_records = 2048
 # Byte budget for one batch. Clamped down to the segment capacity at startup, so it can never
 # exceed a shrunk segment.size.
 max_batch_bytes = 8388608  # 8 MiB

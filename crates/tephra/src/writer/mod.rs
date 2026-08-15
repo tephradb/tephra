@@ -63,8 +63,8 @@ pub struct WriterConfig {
 impl Default for WriterConfig {
     fn default() -> Self {
         WriterConfig {
-            queue_capacity: 1024,
-            max_batch_records: 1024,
+            queue_capacity: 16384,
+            max_batch_records: 2048,
             max_batch_bytes: 8 * 1024 * 1024,
             tips_window: 1_000_000,
             verify_tips: false,

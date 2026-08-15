@@ -25,8 +25,8 @@ data_dir = "tephra-data"
 size = 268435456           # 256 MiB, the segment file size including its header
 
 [writer]
-queue_capacity = 1024      # bounded request queue; a full queue blocks the caller
-max_batch_records = 1024   # most requests folded into one group commit
+queue_capacity = 16384     # bounded request queue; a full queue blocks the caller
+max_batch_records = 2048   # most requests folded into one group commit
 max_batch_bytes = 8388608  # 8 MiB byte budget per batch
 tips_window = 1000000      # recent-position window for the durable tips (memory bound only)
 condition_force_scan = false
