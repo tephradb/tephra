@@ -29,7 +29,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 
 [features]
-# Turns on the gated crash and fault injection points in the engine. Off by default.
+default = ["metrics"]
+metrics = []
 crash-points = ["tephra/crash-points"]
 
 [[bin]]

@@ -21,12 +21,10 @@
 //! per-request flag that the read/subscribe loops observe.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -43,6 +41,7 @@ use tephra_proto::tephra as pb;
 use tephra_proto::{FrameError, read_frame, write_frame};
 
 use crate::convert;
+use crate::stats;
 use crate::{ServerConfig, SharedStats};
 
 /// The reply payload the coordinator sends back for one append, tagged with its `request_id`.
@@ -235,44 +234,18 @@ fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply
 /// Answers a stats request inline on the reader thread: atomic gauges plus one stat of the data
 /// directory, cheap enough not to warrant a worker.
 fn handle_stats(request_id: u64, conn: &ConnCtx) {
-    let (segment_count, disk_bytes) = match &conn.stats.data_dir {
-        Some(dir) => scan_data_dir(dir),
-        None => (0, 0),
-    };
+    let snap = stats::gather(&conn.stats, &conn.handle);
     let mut stats = pb::StatsResponse::new();
-    stats.set_event_count(conn.handle.head().get());
-    stats.set_segment_count(segment_count);
-    stats.set_disk_bytes(disk_bytes);
-    stats.set_uptime_seconds(conn.stats.start_time.elapsed().as_secs());
-    stats.set_active_connections(conn.stats.active_connections.load(Ordering::Relaxed));
-    stats.set_active_subscriptions(conn.stats.active_subscriptions.load(Ordering::Relaxed));
-    stats.set_version(env!("CARGO_PKG_VERSION").to_string());
+    stats.set_event_count(snap.event_count);
+    stats.set_segment_count(snap.segment_count);
+    stats.set_disk_bytes(snap.disk_bytes);
+    stats.set_uptime_seconds(snap.uptime_seconds);
+    stats.set_active_connections(snap.active_connections);
+    stats.set_active_subscriptions(snap.active_subscriptions);
+    stats.set_version(snap.version.to_string());
     let _ = conn
         .out_tx
         .send(make_response(request_id, ResponseKind::Stats(stats)));
-}
-
-/// Sums the file sizes in `dir` and counts the log segments among them, for the stats op. A
-/// directory that cannot be read reports zero rather than failing the request.
-fn scan_data_dir(dir: &Path) -> (u64, u64) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return (0, 0);
-    };
-    let mut segment_count = 0;
-    let mut disk_bytes = 0;
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        disk_bytes += metadata.len();
-        if entry.path().extension().is_some_and(|ext| ext == "log") {
-            segment_count += 1;
-        }
-    }
-    (segment_count, disk_bytes)
 }
 
 /// Submits an append to the coordinator without blocking; the pump delivers its reply. Input

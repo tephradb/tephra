@@ -26,6 +26,9 @@
 
 mod conn;
 mod convert;
+#[cfg(feature = "metrics")]
+mod metrics;
+mod stats;
 
 use std::collections::HashMap;
 use std::io;
@@ -195,6 +198,10 @@ pub struct Server {
     running: Arc<AtomicBool>,
     connections: Connections,
     data_dir: Option<PathBuf>,
+    #[cfg(feature = "metrics")]
+    metrics_listener: Option<TcpListener>,
+    #[cfg(feature = "metrics")]
+    metrics_addr: Option<SocketAddr>,
 }
 
 impl Server {
@@ -215,6 +222,10 @@ impl Server {
             running: Arc::new(AtomicBool::new(true)),
             connections: Connections::default(),
             data_dir: None,
+            #[cfg(feature = "metrics")]
+            metrics_listener: None,
+            #[cfg(feature = "metrics")]
+            metrics_addr: None,
         })
     }
 
@@ -224,6 +235,24 @@ impl Server {
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Server {
         self.data_dir = Some(data_dir.into());
         self
+    }
+
+    /// Binds a Prometheus `/metrics` HTTP endpoint on `addr`, served on its own thread and port
+    /// (separate from the data protocol). Bound eagerly so [`metrics_local_addr`](Self::metrics_local_addr)
+    /// is known before [`run`](Self::run); the endpoint starts serving when `run` is called.
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics_addr(mut self, addr: impl ToSocketAddrs) -> io::Result<Server> {
+        let listener = TcpListener::bind(addr)?;
+        self.metrics_addr = Some(listener.local_addr()?);
+        self.metrics_listener = Some(listener);
+        Ok(self)
+    }
+
+    /// The address the metrics endpoint is bound to, if one was configured (useful when binding
+    /// to port 0).
+    #[cfg(feature = "metrics")]
+    pub fn metrics_local_addr(&self) -> Option<SocketAddr> {
+        self.metrics_addr
     }
 
     /// The address the listener is bound to (useful when binding to port 0).
@@ -248,6 +277,27 @@ impl Server {
         let next_id = AtomicU64::new(0);
         let mut threads = Vec::new();
         let stats = Arc::new(SharedStats::new(self.data_dir.clone()));
+
+        // Optional Prometheus endpoint on its own thread and port. Absent unless a metrics
+        // address was bound, so a deployment that does not want it runs nothing extra.
+        #[cfg(feature = "metrics")]
+        let metrics_thread = match self.metrics_listener {
+            Some(listener) => {
+                if let Some(addr) = self.metrics_addr {
+                    tracing::info!(%addr, "metrics endpoint listening");
+                }
+                let handle = self.handle.clone();
+                let stats = Arc::clone(&stats);
+                let running = Arc::clone(&self.running);
+                Some(
+                    thread::Builder::new()
+                        .name("tephra-metrics".to_string())
+                        .spawn(move || metrics::serve(listener, handle, stats, running))
+                        .expect("spawn metrics thread"),
+                )
+            }
+            None => None,
+        };
 
         // One shared, server-wide pool of reusable worker threads streams every connection's
         // reads, so a read pays no per-request thread-creation cost. `0` means one worker per
@@ -328,6 +378,11 @@ impl Server {
         }
         // Every connection (and so every cloned sender) is gone; drain and join the pool workers.
         read_pool.shutdown();
+        // The metrics thread polls `running` (now cleared), so it exits within a poll tick.
+        #[cfg(feature = "metrics")]
+        if let Some(metrics_thread) = metrics_thread {
+            let _ = metrics_thread.join();
+        }
         tracing::info!("tephra server stopped");
         Ok(())
     }

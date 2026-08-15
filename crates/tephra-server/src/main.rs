@@ -100,6 +100,11 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
 
     let server = Server::bind(&settings.bind, handle, settings.server_config())?
         .with_data_dir(&settings.data_dir);
+    #[cfg(feature = "metrics")]
+    let server = match &settings.metrics.bind {
+        Some(addr) => server.with_metrics_addr(addr)?,
+        None => server,
+    };
     let shutdown = server.shutdown_handle();
 
     // SIGINT (Ctrl-C) and SIGTERM (the signal `docker stop`, systemd, and Kubernetes send)
