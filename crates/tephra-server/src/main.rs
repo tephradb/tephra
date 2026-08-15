@@ -14,6 +14,7 @@
 mod healthcheck;
 mod settings;
 
+use std::env;
 use std::error::Error;
 use std::process::{self, ExitCode};
 use std::sync::Arc;
@@ -22,7 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tephra::log::set::SegmentSet;
 use tephra::writer::WriteCoordinator;
 use tephra_server::Server;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use settings::{Args, Settings};
 
@@ -65,13 +68,22 @@ fn main() -> ExitCode {
 }
 
 /// Initialises tracing. An explicit `log` setting (from `--log`, the file, or the env) wins;
-/// otherwise `RUST_LOG` is honoured, falling back to `info`.
+/// otherwise `RUST_LOG` is honoured, falling back to `info`. Uses `Targets` rather than
+/// `EnvFilter` so the binary carries no regex engine; the `target=level` directive syntax is the
+/// same.
 fn init_tracing(settings: &Settings) {
-    let filter = match &settings.log {
-        Some(filter) => EnvFilter::new(filter.clone()),
-        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-    };
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let directives = settings
+        .log
+        .clone()
+        .or_else(|| env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| "info".to_string());
+    let targets = directives
+        .parse::<Targets>()
+        .unwrap_or_else(|_| Targets::new().with_default(LevelFilter::INFO));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(targets)
+        .init();
 }
 
 fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
