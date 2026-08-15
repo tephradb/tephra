@@ -226,6 +226,58 @@ fn poll_active_subscriptions(client: &mut Client, expected: u64) -> u64 {
     seen
 }
 
+#[cfg(feature = "metrics")]
+#[test]
+fn metrics_endpoint_serves_prometheus_exposition() {
+    let dir = TempDir::new().unwrap();
+    let set = SegmentSet::open(dir.path(), SegmentConfig::new(16 * 1024 * 1024)).unwrap();
+    let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+    let server = Server::bind("127.0.0.1:0", handle, ServerConfig::default())
+        .unwrap()
+        .with_data_dir(dir.path())
+        .with_metrics_addr("127.0.0.1:0")
+        .unwrap();
+    let data_addr = server.local_addr();
+    let metrics_addr = server.metrics_local_addr().unwrap();
+    let shutdown = server.shutdown_handle();
+    let server_thread = thread::spawn(move || server.run().expect("server run"));
+
+    // Two appends, so the exposition reflects a non-zero, exact event count.
+    let mut client = Client::connect(data_addr).unwrap();
+    client.append([ev("E", &["k:1"], b"x")], None).unwrap();
+    client.append([ev("E", &["k:2"], b"y")], None).unwrap();
+
+    let ok = http_get(metrics_addr, "/metrics");
+    assert!(ok.starts_with("HTTP/1.1 200"), "expected 200, got: {ok}");
+    assert!(ok.contains("# TYPE tephra_events_total counter"));
+    assert!(ok.contains("\ntephra_events_total 2\n"), "body: {ok}");
+    assert!(ok.contains("tephra_active_connections"));
+
+    // Any other path is a 404.
+    let missing = http_get(metrics_addr, "/nope");
+    assert!(
+        missing.starts_with("HTTP/1.1 404"),
+        "expected 404, got: {missing}"
+    );
+
+    shutdown.shutdown();
+    server_thread.join().unwrap();
+    coordinator.shutdown();
+}
+
+/// Sends one HTTP/1.1 `GET path` and returns the full response (the server closes after replying).
+#[cfg(feature = "metrics")]
+fn http_get(addr: SocketAddr, path: &str) -> String {
+    use std::io::Read as _;
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
 #[test]
 fn tag_query_filters_the_read() {
     let ts = TestServer::start();

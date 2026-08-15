@@ -64,6 +64,7 @@ pub struct Settings {
     pub writer: WriterSettings,
     pub read: ReadSettings,
     pub server: ServerSettings,
+    pub metrics: MetricsSettings,
 }
 
 impl Default for Settings {
@@ -76,8 +77,17 @@ impl Default for Settings {
             writer: WriterSettings::default(),
             read: ReadSettings::default(),
             server: ServerSettings::default(),
+            metrics: MetricsSettings::default(),
         }
     }
+}
+
+/// Prometheus `/metrics` endpoint. Served on its own port, separate from `bind`.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsSettings {
+    /// Address for the `/metrics` HTTP endpoint, e.g. `127.0.0.1:9100`. `None` disables it.
+    pub bind: Option<String>,
 }
 
 /// Log-segment sizing options.

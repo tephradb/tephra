@@ -66,3 +66,8 @@ frame_queue_depth = 256
 keepalive_idle_secs = 60
 # Interval between TCP keepalive probes once they start, in seconds.
 keepalive_interval_secs = 15
+
+[metrics]
+# Address for the Prometheus /metrics HTTP endpoint, on its own port. Omitted (disabled) by
+# default; set it to expose metrics, e.g. for scraping from an internal network only.
+# bind = "127.0.0.1:9100"
