@@ -3,7 +3,7 @@ name = "tephra-client"
 description = "TCP client for a tephra event store speaking the length-prefixed protobuf protocol: a blocking client, plus an optional multiplexing async (tokio) client behind the `async` feature"
 edition = "2024"
 license = "Apache-2.0"
-version = "0.3.2"
+version = "0.3.3"
 rust-version = "1.85.0"
 repository.workspace = true
 

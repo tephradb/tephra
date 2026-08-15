@@ -22,10 +22,10 @@ repository = "https://github.com/tqwewe/tephra"
 [workspace.dependencies]
 # Internal crates
 seglog = { path = "crates/seglog", version = "0.3.4" }
-tephra = { path = "crates/tephra", version = "0.3.2" }
-tephra-client = { path = "crates/tephra-client", version = "0.3.2" }
-tephra-proto = { path = "crates/tephra-proto", version = "0.1.5" }
-tephra-server = { path = "crates/tephra-server", version = "0.3.3" }
+tephra = { path = "crates/tephra", version = "0.3.3" }
+tephra-client = { path = "crates/tephra-client", version = "0.3.3" }
+tephra-proto = { path = "crates/tephra-proto", version = "0.1.6" }
+tephra-server = { path = "crates/tephra-server", version = "0.3.4" }
 tephra-types = { path = "crates/tephra-types", version = "0.1.3" }
 
 # Third-party

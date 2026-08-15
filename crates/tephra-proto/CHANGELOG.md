@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/tqwewe/tephra/compare/tephra-proto-v0.1.5...tephra-proto-v0.1.6) - 2026-08-15
+
+### Added
+
+- add a server stats op and `--healthcheck` probe ([#17](https://github.com/tqwewe/tephra/pull/17))
+
 ## [0.1.5](https://github.com/tqwewe/tephra/compare/tephra-proto-v0.1.4...tephra-proto-v0.1.5) - 2026-08-14
 
 ### Added
