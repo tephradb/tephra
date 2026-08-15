@@ -41,6 +41,10 @@ pub struct Args {
     /// tracing filter, overriding RUST_LOG (e.g. "info" or "tephra=debug")
     #[argh(option, short = 'l')]
     pub log: Option<String>,
+
+    /// probe a running server at the configured bind address, then exit 0 if healthy or 1 if not
+    #[argh(switch)]
+    pub healthcheck: bool,
 }
 
 /// The fully-resolved server configuration.
@@ -312,6 +316,7 @@ mod tests {
             bind: None,
             data_dir: None,
             log: None,
+            healthcheck: false,
         }
     }
 
@@ -381,6 +386,7 @@ mod tests {
             bind: Some("0.0.0.0:7000".to_string()),
             data_dir: Some("/var/lib/tephra".to_string()),
             log: Some("tephra=debug".to_string()),
+            healthcheck: false,
         };
         let settings = load(&args).unwrap();
         assert_eq!(settings.bind, "0.0.0.0:7000");

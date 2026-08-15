@@ -30,10 +30,11 @@ mod convert;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{SockRef, TcpKeepalive};
 
@@ -147,6 +148,44 @@ impl Connections {
     }
 }
 
+// Server-wide state sampled by the stats op: the data directory (stat'd for segment count and
+// disk usage), the start instant for uptime, and the live connection/subscription gauges.
+// Shared behind an `Arc` and read with plain atomic loads.
+pub(crate) struct SharedStats {
+    data_dir: Option<PathBuf>,
+    start_time: Instant,
+    active_connections: AtomicU64,
+    active_subscriptions: AtomicU64,
+}
+
+impl SharedStats {
+    fn new(data_dir: Option<PathBuf>) -> SharedStats {
+        SharedStats {
+            data_dir,
+            start_time: Instant::now(),
+            active_connections: AtomicU64::new(0),
+            active_subscriptions: AtomicU64::new(0),
+        }
+    }
+}
+
+// Holds the live-connection gauge up for one connection: increments on construction and
+// decrements on drop, so an unwind out of `serve_connection` cannot inflate it.
+struct ConnGuard(Arc<SharedStats>);
+
+impl ConnGuard {
+    fn new(stats: Arc<SharedStats>) -> ConnGuard {
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        ConnGuard(stats)
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A bound server, ready to [`run`](Server::run).
 pub struct Server {
     listener: TcpListener,
@@ -155,6 +194,7 @@ pub struct Server {
     local_addr: SocketAddr,
     running: Arc<AtomicBool>,
     connections: Connections,
+    data_dir: Option<PathBuf>,
 }
 
 impl Server {
@@ -174,7 +214,16 @@ impl Server {
             local_addr,
             running: Arc::new(AtomicBool::new(true)),
             connections: Connections::default(),
+            data_dir: None,
         })
+    }
+
+    /// Records the data directory the store lives in, so the stats op can report the on-disk
+    /// segment count and byte usage. Without it, those fields report zero (the store still
+    /// serves normally). The standalone binary always sets this.
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Server {
+        self.data_dir = Some(data_dir.into());
+        self
     }
 
     /// The address the listener is bound to (useful when binding to port 0).
@@ -198,6 +247,7 @@ impl Server {
         tracing::info!(addr = %self.local_addr, "tephra server listening");
         let next_id = AtomicU64::new(0);
         let mut threads = Vec::new();
+        let stats = Arc::new(SharedStats::new(self.data_dir.clone()));
 
         // One shared, server-wide pool of reusable worker threads streams every connection's
         // reads, so a read pays no per-request thread-creation cost. `0` means one worker per
@@ -260,10 +310,14 @@ impl Server {
             // even when no events flow and the socket is idle.
             let running = Arc::clone(&self.running);
             let read_pool = read_pool.sender();
+            let stats = Arc::clone(&stats);
             let thread = thread::Builder::new()
                 .name("tephra-conn".to_string())
                 .spawn(move || {
-                    conn::serve_connection(stream, handle, config, running, read_pool);
+                    // A guard, not a bare fetch_sub, so an unwind out of serve_connection (e.g. a
+                    // failed thread spawn under load) cannot leave the gauge inflated.
+                    let guard = ConnGuard::new(stats);
+                    conn::serve_connection(stream, handle, config, running, read_pool, &guard.0);
                     connections.remove(id);
                 })?;
             threads.push(thread);

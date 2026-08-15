@@ -47,7 +47,9 @@ impl TestServer {
         let dir = TempDir::new().unwrap();
         let set = SegmentSet::open(dir.path(), SegmentConfig::new(segment_size)).unwrap();
         let (coordinator, handle) = WriteCoordinator::start(set, writer_config).unwrap();
-        let server = Server::bind("127.0.0.1:0", handle, server_config).unwrap();
+        let server = Server::bind("127.0.0.1:0", handle, server_config)
+            .unwrap()
+            .with_data_dir(dir.path());
         let addr = server.local_addr();
         let shutdown = server.shutdown_handle();
         let server_thread = thread::spawn(move || server.run().expect("server run"));
@@ -152,6 +154,76 @@ fn append_then_read_round_trips_events() {
     assert_eq!(pos, 2);
     assert_eq!(ty, "Renamed");
     assert_eq!(payload, b"payload-2");
+}
+
+#[test]
+fn stats_reports_event_count_and_disk_usage() {
+    let ts = TestServer::start();
+    let mut client = ts.client();
+
+    // Empty store: no events, but the first segment is already on disk.
+    let empty = client.stats().unwrap();
+    assert_eq!(empty.event_count, 0);
+    assert!(empty.segment_count >= 1, "the first segment file exists");
+    assert!(empty.disk_bytes > 0, "the segment is allocated on disk");
+    assert!(!empty.version.is_empty());
+    assert!(empty.active_connections >= 1, "this connection is counted");
+    assert_eq!(empty.active_subscriptions, 0);
+
+    for i in 0..5 {
+        client
+            .append([ev("E", &[&format!("k:{i}")], b"payload")], None)
+            .unwrap();
+    }
+
+    let after = client.stats().unwrap();
+    assert_eq!(after.event_count, 5, "positions are dense and 1-based");
+    assert!(after.disk_bytes >= empty.disk_bytes);
+}
+
+#[test]
+fn stats_counts_active_subscriptions() {
+    let ts = TestServer::start();
+    let mut appender = ts.client();
+    appender.append([ev("E", &["k:1"], b"")], None).unwrap();
+
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
+    let cancel = cancel_rx.recv().unwrap();
+    // The first delivered event proves the subscription is registered server-side.
+    match item_rx.recv().unwrap() {
+        Ok(SubEvent::Event(_)) => {}
+        other => panic!("expected the first event, got {other:?}"),
+    }
+
+    let mut stats_client = ts.client();
+    assert_eq!(poll_active_subscriptions(&mut stats_client, 1), 1);
+
+    // Cancelling tears the subscription down, and the gauge returns to zero.
+    cancel.cancel();
+    subscriber.join().unwrap();
+    assert_eq!(poll_active_subscriptions(&mut stats_client, 0), 0);
+}
+
+/// Polls the active-subscription gauge until it reaches `expected` (the server decrements it on
+/// its own worker thread, off the client's join), returning the last value seen.
+fn poll_active_subscriptions(client: &mut Client, expected: u64) -> u64 {
+    let mut seen = client.stats().unwrap().active_subscriptions;
+    for _ in 0..100 {
+        if seen == expected {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+        seen = client.stats().unwrap().active_subscriptions;
+    }
+    seen
 }
 
 #[test]

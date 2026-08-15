@@ -125,6 +125,13 @@ impl WriteHandle {
         self.reader.clone()
     }
 
+    /// The current durable tip: the last committed position, as published at the most recent
+    /// commit. A single atomic load. Because positions are dense and 1-based, its numeric value
+    /// is also the total event count (`0` on an empty store). See [`ReadHandle::head`].
+    pub fn head(&self) -> Position {
+        self.reader.head()
+    }
+
     /// The `async` counterpart of [`append`](Self::append): identical semantics, but it
     /// yields to the executor instead of blocking the thread while the request queue is
     /// full (backpressure) and while awaiting the durable reply.
