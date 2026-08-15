@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/tqwewe/tephra/compare/tephra-client-v0.3.2...tephra-client-v0.3.3) - 2026-08-15
+
+### Added
+
+- add a server stats op and `--healthcheck` probe ([#17](https://github.com/tqwewe/tephra/pull/17))
+
 ## [0.3.2](https://github.com/tqwewe/tephra/compare/tephra-client-v0.3.1...tephra-client-v0.3.2) - 2026-08-14
 
 ### Added

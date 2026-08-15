@@ -3,7 +3,7 @@ name = "tephra-proto"
 description = "Wire protocol (protobuf messages + length-prefixed framing) shared by the tephra TCP server and client"
 edition = "2024"
 license = "Apache-2.0"
-version = "0.1.5"
+version = "0.1.6"
 rust-version = "1.85.0"
 repository.workspace = true
 

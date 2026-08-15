@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-client"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "futures-core",
  "tephra-proto",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-proto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "protobuf",
  "protobuf-codegen",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "argh",
  "config",
