@@ -45,8 +45,8 @@ use tephra_proto::tephra as pb;
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame_async, write_frame_async};
 
 use super::{
-    AppendCondition, AppendResult, ClientError, Event, Position, Query, SequencedEvent, SubEvent,
-    UNATTRIBUTED_REQUEST_ID, event_to_pb, sequenced_from_pb, server_error,
+    AppendCondition, AppendResult, ClientError, Event, Position, Query, SequencedEvent, Stats,
+    SubEvent, UNATTRIBUTED_REQUEST_ID, event_to_pb, sequenced_from_pb, server_error, stats_from_pb,
 };
 
 /// Tuning for an [`AsyncClient`].
@@ -111,6 +111,8 @@ struct Registered {
 enum Sink {
     /// One append: a single result.
     Append(oneshot::Sender<Result<AppendResult, ClientError>>),
+    /// One stats request: a single result.
+    Stats(oneshot::Sender<Result<Stats, ClientError>>),
     /// A streamed read: events, then a terminating watermark or error.
     Read(mpsc::UnboundedSender<ReadItem>),
     /// A live subscription: events and caught-up markers until an error or cancel.
@@ -212,6 +214,31 @@ impl AsyncClient {
         }
 
         // A dropped sender means the reader task ended (the connection closed) before replying.
+        rx.await.unwrap_or(Err(ClientError::UnexpectedEof))
+    }
+
+    /// Fetches a snapshot of the server's operational state (event count, on-disk size, uptime,
+    /// and live connection/subscription gauges).
+    pub async fn stats(&self) -> Result<Stats, ClientError> {
+        let id = self.shared.next_id();
+        let mut request = pb::Request::new();
+        request.set_request_id(id);
+        request.set_stats(pb::StatsRequest::new());
+
+        let _permit = self.acquire_inflight().await;
+        let (tx, rx) = oneshot::channel();
+        self.shared.requests.lock().unwrap().insert(
+            id,
+            Registered {
+                sink: Sink::Stats(tx),
+                _permit,
+            },
+        );
+        if self.out_tx.send(request).await.is_err() {
+            self.shared.requests.lock().unwrap().remove(&id);
+            return Err(ClientError::UnexpectedEof);
+        }
+
         rx.await.unwrap_or(Err(ClientError::UnexpectedEof))
     }
 
@@ -450,6 +477,16 @@ fn route(response: pb::Response, shared: &Shared) {
             let _ = tx.send(result);
             // `_permit` drops here: the append is answered.
         }
+        Sink::Stats(tx) => {
+            let result = match response.kind() {
+                pb::response::KindOneof::Stats(stats) => Ok(stats_from_pb(stats)),
+                pb::response::KindOneof::Error(error) => Err(server_error(error)),
+                other => Err(ClientError::Protocol(format!(
+                    "unexpected response to stats: {other:?}"
+                ))),
+            };
+            let _ = tx.send(result);
+        }
         Sink::Read(tx) => {
             // Re-register (carrying the same permit) while the read continues; a terminal frame
             // leaves it removed, dropping the permit.
@@ -560,6 +597,9 @@ fn fail_all(shared: &Shared, reason: &str) {
     for (_id, Registered { sink, _permit }) in map.drain() {
         match sink {
             Sink::Append(tx) => {
+                let _ = tx.send(Err(ClientError::Protocol(reason.to_string())));
+            }
+            Sink::Stats(tx) => {
                 let _ = tx.send(Err(ClientError::Protocol(reason.to_string())));
             }
             Sink::Read(tx) => {

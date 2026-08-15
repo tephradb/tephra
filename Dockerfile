@@ -108,6 +108,10 @@ EXPOSE 9000
 ENV TEPHRA__BIND=0.0.0.0:9000 \
     TEPHRA__DATA_DIR=/data
 
+# Exec form so no shell is needed; the probe reads TEPHRA__BIND from the container env.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["tephra-server", "--healthcheck"]
+
 ENTRYPOINT ["tephra-server"]
 
 # --- Static runtime (scratch) --------------------------------------------------------------
@@ -127,6 +131,10 @@ EXPOSE 9000
 ENV TEPHRA__BIND=0.0.0.0:9000 \
     TEPHRA__DATA_DIR=/data
 
+# Absolute path because scratch has no PATH; exec form because it has no shell.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/tephra-server", "--healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/tephra-server"]
 
 # --- Primary runtime (distroless) ----------------------------------------------------------
@@ -144,5 +152,9 @@ EXPOSE 9000
 
 ENV TEPHRA__BIND=0.0.0.0:9000 \
     TEPHRA__DATA_DIR=/data
+
+# Exec form so no shell is needed; the probe reads TEPHRA__BIND from the container env.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["tephra-server", "--healthcheck"]
 
 ENTRYPOINT ["tephra-server"]

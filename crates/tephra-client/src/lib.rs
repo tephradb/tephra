@@ -148,6 +148,25 @@ pub struct AppendResult {
     pub last: Position,
 }
 
+/// A snapshot of a server's operational state, returned by [`Client::stats`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stats {
+    /// Total durable events, which (positions being dense and 1-based) is also the tip position.
+    pub event_count: u64,
+    /// On-disk log segments in the data directory.
+    pub segment_count: u64,
+    /// Total bytes on disk in the data directory (log segments plus index sidecars).
+    pub disk_bytes: u64,
+    /// Seconds since the server began accepting connections.
+    pub uptime_seconds: u64,
+    /// Connections currently being served, including this one.
+    pub active_connections: u64,
+    /// Live subscriptions across all connections.
+    pub active_subscriptions: u64,
+    /// The server's crate version.
+    pub version: String,
+}
+
 /// One item from a [`SubscribeStream`]: a matching event, or a live-edge marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubEvent {
@@ -319,6 +338,26 @@ impl Client {
             pb::response::KindOneof::Error(error) => Err(server_error(error)),
             other => Err(ClientError::Protocol(format!(
                 "unexpected response to append: {other:?}"
+            ))),
+        }
+    }
+
+    /// Fetches a snapshot of the server's operational state (event count, on-disk size, uptime,
+    /// and live connection/subscription gauges). Blocks until the server replies.
+    pub fn stats(&mut self) -> Result<Stats, ClientError> {
+        let id = self.next_id();
+        let mut request = pb::Request::new();
+        request.set_request_id(id);
+        request.set_stats(pb::StatsRequest::new());
+        self.send(&request)?;
+
+        let response = self.recv()?;
+        check_response_id(&response, id)?;
+        match response.kind() {
+            pb::response::KindOneof::Stats(stats) => Ok(stats_from_pb(stats)),
+            pb::response::KindOneof::Error(error) => Err(server_error(error)),
+            other => Err(ClientError::Protocol(format!(
+                "unexpected response to stats: {other:?}"
             ))),
         }
     }
@@ -744,6 +783,18 @@ fn server_error(error: pb::ErrorResponseView<'_>) -> ClientError {
         conflict_position: error
             .has_conflict_position()
             .then(|| Position::new(error.conflict_position())),
+    }
+}
+
+fn stats_from_pb(stats: pb::StatsResponseView<'_>) -> Stats {
+    Stats {
+        event_count: stats.event_count(),
+        segment_count: stats.segment_count(),
+        disk_bytes: stats.disk_bytes(),
+        uptime_seconds: stats.uptime_seconds(),
+        active_connections: stats.active_connections(),
+        active_subscriptions: stats.active_subscriptions(),
+        version: stats.version().to_str().unwrap_or_default().to_string(),
     }
 }
 

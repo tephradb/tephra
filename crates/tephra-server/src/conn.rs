@@ -21,10 +21,12 @@
 //! per-request flag that the read/subscribe loops observe.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -40,8 +42,8 @@ use tephra::{Event, Position};
 use tephra_proto::tephra as pb;
 use tephra_proto::{FrameError, read_frame, write_frame};
 
-use crate::ServerConfig;
 use crate::convert;
+use crate::{ServerConfig, SharedStats};
 
 /// The reply payload the coordinator sends back for one append, tagged with its `request_id`.
 type AppendReply = (u64, Result<PositionRange, AppendError>);
@@ -55,6 +57,7 @@ pub(crate) fn serve_connection(
     config: ServerConfig,
     running: Arc<AtomicBool>,
     read_pool: Sender<ReadJob>,
+    stats: &Arc<SharedStats>,
 ) {
     let peer = stream.peer_addr().ok();
     if let Err(err) = stream.set_nodelay(true) {
@@ -115,6 +118,7 @@ pub(crate) fn serve_connection(
         workers: workers.clone(),
         inflight,
         subscriptions,
+        stats: Arc::clone(stats),
         read_pool,
     };
 
@@ -185,6 +189,8 @@ struct ConnCtx {
     inflight: Arc<Semaphore>,
     /// Rejecting budget for concurrent subscriptions.
     subscriptions: Arc<Semaphore>,
+    /// Server-wide gauges and data-directory location, read by the stats op.
+    stats: Arc<SharedStats>,
     /// Sender into the shared, server-wide read-worker pool. Cloned per read job.
     read_pool: Sender<ReadJob>,
 }
@@ -214,6 +220,7 @@ fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply
                 flag.store(true, Ordering::Release);
             }
         }
+        pb::request::KindOneof::Stats(_) => handle_stats(request_id, conn),
         // No kind set, or a future kind this server does not understand.
         _ => {
             let error =
@@ -223,6 +230,49 @@ fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply
                 .send(make_response(request_id, ResponseKind::Error(error)));
         }
     }
+}
+
+/// Answers a stats request inline on the reader thread: atomic gauges plus one stat of the data
+/// directory, cheap enough not to warrant a worker.
+fn handle_stats(request_id: u64, conn: &ConnCtx) {
+    let (segment_count, disk_bytes) = match &conn.stats.data_dir {
+        Some(dir) => scan_data_dir(dir),
+        None => (0, 0),
+    };
+    let mut stats = pb::StatsResponse::new();
+    stats.set_event_count(conn.handle.head().get());
+    stats.set_segment_count(segment_count);
+    stats.set_disk_bytes(disk_bytes);
+    stats.set_uptime_seconds(conn.stats.start_time.elapsed().as_secs());
+    stats.set_active_connections(conn.stats.active_connections.load(Ordering::Relaxed));
+    stats.set_active_subscriptions(conn.stats.active_subscriptions.load(Ordering::Relaxed));
+    stats.set_version(env!("CARGO_PKG_VERSION").to_string());
+    let _ = conn
+        .out_tx
+        .send(make_response(request_id, ResponseKind::Stats(stats)));
+}
+
+/// Sums the file sizes in `dir` and counts the log segments among them, for the stats op. A
+/// directory that cannot be read reports zero rather than failing the request.
+fn scan_data_dir(dir: &Path) -> (u64, u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut segment_count = 0;
+    let mut disk_bytes = 0;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        disk_bytes += metadata.len();
+        if entry.path().extension().is_some_and(|ext| ext == "log") {
+            segment_count += 1;
+        }
+    }
+    (segment_count, disk_bytes)
 }
 
 /// Submits an append to the coordinator without blocking; the pump delivers its reply. Input
@@ -358,11 +408,15 @@ fn spawn_subscribe(request_id: u64, subscribe: pb::SubscribeRequestView<'_>, con
         workers: conn.workers.clone(),
         request_id,
     };
+    // Tracks the live-subscription gauge for the whole life of the worker (including an unwind
+    // or a failed spawn, where the guard drops without ever running).
+    let gauge = SubGauge::new(Arc::clone(&conn.stats));
     let conn_owned = conn.clone();
     if let Err(err) = thread::Builder::new()
         .name("tephra-conn-subscribe".to_string())
         .spawn(move || {
             let _cleanup = cleanup;
+            let _gauge = gauge;
             run_subscribe(request_id, query, after, &conn_owned, &cancel);
         })
     {
@@ -629,6 +683,7 @@ enum ResponseKind {
     ReadEvents(pb::ReadEvents),
     ReadEnd(pb::ReadEnd),
     CaughtUp(pb::SubscribeCaughtUp),
+    Stats(pb::StatsResponse),
     Error(pb::ErrorResponse),
 }
 
@@ -641,6 +696,7 @@ fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
         ResponseKind::ReadEvents(events) => response.set_read_events(events),
         ResponseKind::ReadEnd(end) => response.set_read_end(end),
         ResponseKind::CaughtUp(caught_up) => response.set_caught_up(caught_up),
+        ResponseKind::Stats(stats) => response.set_stats(stats),
         ResponseKind::Error(error) => response.set_error(error),
     }
     response
@@ -756,6 +812,23 @@ impl Drop for WorkerCleanup {
             sem.release();
         }
         self.workers.done();
+    }
+}
+
+/// Holds the server-wide live-subscription gauge up for one subscription: increments on
+/// construction and decrements on drop, so the count is right across an unwind or a failed spawn.
+struct SubGauge(Arc<SharedStats>);
+
+impl SubGauge {
+    fn new(stats: Arc<SharedStats>) -> SubGauge {
+        stats.active_subscriptions.fetch_add(1, Ordering::Relaxed);
+        SubGauge(stats)
+    }
+}
+
+impl Drop for SubGauge {
+    fn drop(&mut self) {
+        self.0.active_subscriptions.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

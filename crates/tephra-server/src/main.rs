@@ -11,6 +11,7 @@
 //! Everything else (segment size, group-commit sizing, tips window, planner bias, frame and
 //! read-batch limits) is set in the config file or the environment. See `tephra.example.toml`.
 
+mod healthcheck;
 mod settings;
 
 use std::error::Error;
@@ -39,6 +40,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // `--healthcheck` runs as a client, not a server: probe the configured bind address and
+    // exit, without opening the store or standing up the listener.
+    if args.healthcheck {
+        return match healthcheck::probe(&settings.bind) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("healthcheck failed: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     init_tracing(&settings);
 
     match run(settings) {
@@ -84,7 +98,8 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
         "opened event store"
     );
 
-    let server = Server::bind(&settings.bind, handle, settings.server_config())?;
+    let server = Server::bind(&settings.bind, handle, settings.server_config())?
+        .with_data_dir(&settings.data_dir);
     let shutdown = server.shutdown_handle();
 
     // SIGINT (Ctrl-C) and SIGTERM (the signal `docker stop`, systemd, and Kubernetes send)

@@ -70,6 +70,9 @@ message CancelRequest {
   uint64 target = 1;
 }
 
+// Asks the server for a point-in-time snapshot of its operational state.
+message StatsRequest {}
+
 message AppendResponse {
   uint64 first = 1;
   uint64 last = 2;
@@ -94,6 +97,24 @@ message ReadEnd {
 // about to tail live. Re-armed: emitted once per live-edge, with non-decreasing watermarks.
 message SubscribeCaughtUp {
   uint64 watermark = 1;
+}
+
+// A snapshot of the server's operational state, the reply to a StatsRequest.
+message StatsResponse {
+  // Total durable events, which (positions being dense and 1-based) is also the tip position.
+  uint64 event_count = 1;
+  // On-disk log segments in the data directory.
+  uint64 segment_count = 2;
+  // Total bytes on disk in the data directory (log segments plus index sidecars).
+  uint64 disk_bytes = 3;
+  // Seconds since the server began accepting connections.
+  uint64 uptime_seconds = 4;
+  // Connections currently being served (including the one asking).
+  uint64 active_connections = 5;
+  // Live subscriptions across all connections.
+  uint64 active_subscriptions = 6;
+  // The server's crate version.
+  string version = 7;
 }
 
 enum ErrorCode {
@@ -123,6 +144,7 @@ message Request {
     ReadRequest read = 3;
     SubscribeRequest subscribe = 4;
     CancelRequest cancel = 5;
+    StatsRequest stats = 6;
   }
 }
 
@@ -134,5 +156,6 @@ message Response {
     ReadEnd read_end = 4;
     ErrorResponse error = 5;
     SubscribeCaughtUp caught_up = 6;
+    StatsResponse stats = 7;
   }
 }
