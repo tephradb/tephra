@@ -7,12 +7,14 @@
 //! subscriptions are returned as [`Stream`]s; dropping one cancels it server-side (a
 //! `CancelRequest`) without disturbing other requests.
 //!
-//! By default the client opens two sockets: appends, stats, and cancels use a **control**
-//! connection, while streaming reads and subscriptions use a **bulk** connection. This keeps a
-//! multi-megabyte read response from delaying a small append ack behind it on one byte stream
-//! (head-of-line blocking). Set [`AsyncClientConfig::bulk_connections`] to `0` to fold everything
-//! onto a single socket (the legacy behavior, which reintroduces that hazard) or above `1` for a
-//! pool of bulk sockets that also relieves read-versus-read blocking.
+//! By default the client opens a **control** socket for appends, stats, and cancels plus a pool of
+//! four **bulk** sockets for streaming reads and subscriptions. Splitting the control socket off
+//! keeps a multi-megabyte read response from delaying a small append ack behind it on one byte
+//! stream (head-of-line blocking), and the bulk pool keeps concurrent reads from serializing behind
+//! one another, which otherwise caps read throughput sharply under load. Set
+//! [`AsyncClientConfig::bulk_connections`] to `0` to fold everything onto a single socket (the
+//! legacy behavior, which reintroduces both hazards); raise it for more read fan-out at the cost of
+//! more sockets per client on the server.
 //!
 //! ```no_run
 //! use tephra_client::{AsyncClient, Event, Position, Query};
@@ -77,12 +79,14 @@ pub struct AsyncClientConfig {
     /// flight is bounded.
     pub max_inflight_requests: usize,
     /// Number of dedicated **bulk** sockets carrying streaming reads and subscriptions, separate
-    /// from the control socket that carries appends, stats, and cancels. `1` (the default) gives a
-    /// two-socket control/bulk split that protects append latency from large read responses. `0`
-    /// folds reads onto the control socket (a single socket, the legacy head-of-line hazard).
-    /// Values above `1` round-robin reads across a pool, also relieving read-versus-read blocking.
-    /// The connection is one `Semaphore`-bounded budget per socket, so N > 1 raises total
-    /// concurrency accordingly.
+    /// from the control socket that carries appends, stats, and cancels. `4` (the default) fans
+    /// reads across a small pool so they do not serialize behind one another on one byte stream,
+    /// which otherwise caps read throughput sharply under concurrent load; four saturates a
+    /// per-core server read pool while keeping per-client sockets low, since total server
+    /// connections scale with this value times the client count. `1` is a control/bulk split with
+    /// no read fan-out; `0` folds reads onto the control socket (the legacy head-of-line hazard).
+    /// The outstanding-read budget is per socket, so a larger pool also raises how many of this
+    /// client's reads the server admits at once.
     pub bulk_connections: usize,
 }
 
@@ -92,7 +96,7 @@ impl Default for AsyncClientConfig {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             request_queue_depth: 256,
             max_inflight_requests: 1024,
-            bulk_connections: 1,
+            bulk_connections: 4,
         }
     }
 }

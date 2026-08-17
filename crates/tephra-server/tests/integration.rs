@@ -1705,11 +1705,11 @@ async fn write_flood_over_a_connection_pool_never_drops() {
 // --- head-of-line blocking: egress fairness and the control/bulk socket split ---
 
 #[tokio::test]
-async fn async_client_defaults_to_a_control_and_bulk_socket() {
+async fn async_client_defaults_to_a_control_and_bulk_pool() {
     let ts = TestServer::start();
     let client = AsyncClient::connect(ts.addr).await.unwrap();
-    // A default client opens two sockets: one control, one bulk.
-    assert_eq!(wait_active_connections(&client, 2).await, 2);
+    // A default client opens five sockets: one control plus a pool of four bulk.
+    assert_eq!(wait_active_connections(&client, 5).await, 5);
 }
 
 #[tokio::test]
