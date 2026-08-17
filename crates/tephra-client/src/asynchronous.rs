@@ -1,11 +1,18 @@
 //! An async, multiplexing client for a tephra event store, built on tokio.
 //!
 //! Unlike the blocking [`Client`](super::Client), which runs one request at a time per
-//! connection, an [`AsyncClient`] pipelines many requests over a single socket. It is a cheap
-//! `Clone` handle to a shared connection actor: a background **reader task** demultiplexes each
-//! response frame by its `request_id` into the waiting caller, and a **writer task** serializes
-//! outbound frames. Reads and subscriptions are returned as [`Stream`]s; dropping one cancels it
-//! server-side (a `CancelRequest`) without disturbing the other requests sharing the socket.
+//! connection, an [`AsyncClient`] pipelines many requests. It is a cheap `Clone` handle over one or
+//! more connection actors, each a socket with a background **reader task** that demultiplexes
+//! response frames by `request_id` and a **writer task** that serializes outbound frames. Reads and
+//! subscriptions are returned as [`Stream`]s; dropping one cancels it server-side (a
+//! `CancelRequest`) without disturbing other requests.
+//!
+//! By default the client opens two sockets: appends, stats, and cancels use a **control**
+//! connection, while streaming reads and subscriptions use a **bulk** connection. This keeps a
+//! multi-megabyte read response from delaying a small append ack behind it on one byte stream
+//! (head-of-line blocking). Set [`AsyncClientConfig::bulk_connections`] to `0` to fold everything
+//! onto a single socket (the legacy behavior, which reintroduces that hazard) or above `1` for a
+//! pool of bulk sockets that also relieves read-versus-read blocking.
 //!
 //! ```no_run
 //! use tephra_client::{AsyncClient, Event, Position, Query};
@@ -28,16 +35,18 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::net::{TcpStream, ToSocketAddrs, lookup_host};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
 use tephra_proto::convert as wire;
@@ -67,6 +76,14 @@ pub struct AsyncClientConfig {
     /// of outrunning the connection. Many requests still run concurrently; only the total in
     /// flight is bounded.
     pub max_inflight_requests: usize,
+    /// Number of dedicated **bulk** sockets carrying streaming reads and subscriptions, separate
+    /// from the control socket that carries appends, stats, and cancels. `1` (the default) gives a
+    /// two-socket control/bulk split that protects append latency from large read responses. `0`
+    /// folds reads onto the control socket (a single socket, the legacy head-of-line hazard).
+    /// Values above `1` round-robin reads across a pool, also relieving read-versus-read blocking.
+    /// The connection is one `Semaphore`-bounded budget per socket, so N > 1 raises total
+    /// concurrency accordingly.
+    pub bulk_connections: usize,
 }
 
 impl Default for AsyncClientConfig {
@@ -75,6 +92,7 @@ impl Default for AsyncClientConfig {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             request_queue_depth: 256,
             max_inflight_requests: 1024,
+            bulk_connections: 1,
         }
     }
 }
@@ -126,27 +144,18 @@ enum ReadItem {
     Err(ClientError),
 }
 
-/// A cheap, cloneable handle to a multiplexed connection. Every clone shares one socket and one
-/// set of background tasks; requests issued through any clone run concurrently.
-#[derive(Clone)]
-pub struct AsyncClient {
+/// One multiplexed socket: a shared request registry plus its reader and writer tasks. An
+/// [`AsyncClient`] composes one or more of these.
+struct Conn {
     shared: Arc<Shared>,
     out_tx: mpsc::Sender<pb::Request>,
 }
 
-impl AsyncClient {
-    /// Connects to a server with the default [`AsyncClientConfig`].
-    pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<AsyncClient> {
-        AsyncClient::connect_with(addr, AsyncClientConfig::default()).await
-    }
-
-    /// Connects to a server with an explicit [`AsyncClientConfig`], setting `TCP_NODELAY` and
-    /// spawning the reader and writer tasks. The returned handle can be cloned and shared.
-    pub async fn connect_with(
-        addr: impl ToSocketAddrs,
-        config: AsyncClientConfig,
-    ) -> io::Result<AsyncClient> {
-        let stream = TcpStream::connect(addr).await?;
+impl Conn {
+    /// Connects one socket to the first working address, sets `TCP_NODELAY`, and spawns its reader
+    /// and writer tasks.
+    async fn connect(addrs: &[SocketAddr], config: AsyncClientConfig) -> io::Result<Conn> {
+        let stream = connect_any(addrs).await?;
         stream.set_nodelay(true)?;
         let (read_half, write_half) = stream.into_split();
 
@@ -162,18 +171,88 @@ impl AsyncClient {
         tokio::spawn(reader_task(read_half, Arc::clone(&shared)));
         tokio::spawn(writer_task(write_half, out_rx, shared.max_frame_len));
 
-        Ok(AsyncClient { shared, out_tx })
+        Ok(Conn { shared, out_tx })
     }
 
-    /// Acquires a permit from the outstanding-request budget, awaiting when the client is at its
-    /// in-flight limit (backpressure). The permit is held inside the request's [`Registered`]
-    /// entry for its whole life and released when that entry is dropped.
+    /// Acquires a permit from this connection's outstanding-request budget, awaiting at the
+    /// in-flight limit (backpressure). The permit is held inside the request's [`Registered`] entry
+    /// for its whole life and released when that entry is dropped.
     async fn acquire_inflight(&self) -> OwnedSemaphorePermit {
         Arc::clone(&self.shared.inflight)
             .acquire_owned()
             .await
             // The semaphore is never closed, so acquisition cannot fail.
             .expect("inflight semaphore is never closed")
+    }
+}
+
+/// Tries each address in turn, returning the first connected socket or the last error.
+async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to")
+    }))
+}
+
+/// A cheap, cloneable handle to a tephra server over a control socket plus a pool of bulk sockets
+/// (see the module docs and [`AsyncClientConfig::bulk_connections`]). Every clone shares the same
+/// sockets and background tasks; requests issued through any clone run concurrently.
+#[derive(Clone)]
+pub struct AsyncClient {
+    control: Arc<Conn>,
+    bulk: Arc<Vec<Conn>>,
+    next_bulk: Arc<AtomicUsize>,
+}
+
+impl AsyncClient {
+    /// Connects to a server with the default [`AsyncClientConfig`].
+    pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<AsyncClient> {
+        AsyncClient::connect_with(addr, AsyncClientConfig::default()).await
+    }
+
+    /// Connects to a server with an explicit [`AsyncClientConfig`], opening one control socket plus
+    /// [`bulk_connections`](AsyncClientConfig::bulk_connections) bulk sockets. Each sets
+    /// `TCP_NODELAY` and spawns its own reader and writer tasks. The returned handle can be cloned.
+    pub async fn connect_with(
+        addr: impl ToSocketAddrs,
+        config: AsyncClientConfig,
+    ) -> io::Result<AsyncClient> {
+        let addrs: Vec<SocketAddr> = lookup_host(addr).await?.collect();
+        // The control socket must succeed; dial the bulk pool concurrently so a pool over a high-RTT
+        // link pays one round-trip, not N. If any bulk socket fails the whole connect fails (the
+        // caller asked for this many sockets); the JoinSet aborts the rest on drop.
+        let control = Arc::new(Conn::connect(&addrs, config).await?);
+        let mut dialing = JoinSet::new();
+        for _ in 0..config.bulk_connections {
+            let addrs = addrs.clone();
+            dialing.spawn(async move { Conn::connect(&addrs, config).await });
+        }
+        let mut bulk = Vec::with_capacity(config.bulk_connections);
+        while let Some(joined) = dialing.join_next().await {
+            bulk.push(joined.map_err(io::Error::other)??);
+        }
+        Ok(AsyncClient {
+            control,
+            bulk: Arc::new(bulk),
+            next_bulk: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// The connection a streaming read or subscription runs on: round-robin across the bulk pool,
+    /// or the control connection when no bulk sockets are configured (single-socket mode).
+    fn bulk(&self) -> &Conn {
+        if self.bulk.is_empty() {
+            self.control.as_ref()
+        } else {
+            let i = self.next_bulk.fetch_add(1, Ordering::Relaxed) % self.bulk.len();
+            &self.bulk[i]
+        }
     }
 
     /// Appends `events` as one atomic batch, optionally guarded by `condition`, resolving to the
@@ -184,7 +263,9 @@ impl AsyncClient {
         events: impl IntoIterator<Item = Event>,
         condition: Option<AppendCondition>,
     ) -> Result<AppendResult, ClientError> {
-        let id = self.shared.next_id();
+        // Appends ride the control connection, off the bulk lane carrying large read responses.
+        let conn = self.control.as_ref();
+        let id = conn.shared.next_id();
         let mut append = pb::AppendRequest::new();
         for event in events {
             append.events_mut().push(event_to_pb(&event));
@@ -198,9 +279,9 @@ impl AsyncClient {
 
         // Take an outstanding-request permit before the request goes on the wire (backpressure at
         // the in-flight limit); it rides in the registry entry and frees when the reply is routed.
-        let _permit = self.acquire_inflight().await;
+        let _permit = conn.acquire_inflight().await;
         let (tx, rx) = oneshot::channel();
-        self.shared.requests.lock().unwrap().insert(
+        conn.shared.requests.lock().unwrap().insert(
             id,
             Registered {
                 sink: Sink::Append(tx),
@@ -208,8 +289,8 @@ impl AsyncClient {
             },
         );
         // Await room in the outbound queue (backpressure). An error means the writer task is gone.
-        if self.out_tx.send(request).await.is_err() {
-            self.shared.requests.lock().unwrap().remove(&id);
+        if conn.out_tx.send(request).await.is_err() {
+            conn.shared.requests.lock().unwrap().remove(&id);
             return Err(ClientError::UnexpectedEof);
         }
 
@@ -220,22 +301,23 @@ impl AsyncClient {
     /// Fetches a snapshot of the server's operational state (event count, on-disk size, uptime,
     /// and live connection/subscription gauges).
     pub async fn stats(&self) -> Result<Stats, ClientError> {
-        let id = self.shared.next_id();
+        let conn = self.control.as_ref();
+        let id = conn.shared.next_id();
         let mut request = pb::Request::new();
         request.set_request_id(id);
         request.set_stats(pb::StatsRequest::new());
 
-        let _permit = self.acquire_inflight().await;
+        let _permit = conn.acquire_inflight().await;
         let (tx, rx) = oneshot::channel();
-        self.shared.requests.lock().unwrap().insert(
+        conn.shared.requests.lock().unwrap().insert(
             id,
             Registered {
                 sink: Sink::Stats(tx),
                 _permit,
             },
         );
-        if self.out_tx.send(request).await.is_err() {
-            self.shared.requests.lock().unwrap().remove(&id);
+        if conn.out_tx.send(request).await.is_err() {
+            conn.shared.requests.lock().unwrap().remove(&id);
             return Err(ClientError::UnexpectedEof);
         }
 
@@ -276,7 +358,9 @@ impl AsyncClient {
         reverse: bool,
         limit: Option<u64>,
     ) -> ReadStream {
-        let id = self.shared.next_id();
+        // Reads ride a bulk connection so their large responses never delay control-lane acks.
+        let conn = self.bulk();
+        let id = conn.shared.next_id();
         let mut read = pb::ReadRequest::new();
         read.set_query(wire::query_to_pb(&query));
         read.set_after(cursor.get());
@@ -290,28 +374,28 @@ impl AsyncClient {
         request.set_request_id(id);
         request.set_read(read);
 
-        let _permit = self.acquire_inflight().await;
+        let _permit = conn.acquire_inflight().await;
         let (tx, rx) = mpsc::unbounded_channel();
-        self.shared.requests.lock().unwrap().insert(
+        conn.shared.requests.lock().unwrap().insert(
             id,
             Registered {
                 sink: Sink::Read(tx),
                 _permit,
             },
         );
-        if self.out_tx.send(request).await.is_err() {
+        if conn.out_tx.send(request).await.is_err() {
             if let Some(Registered {
                 sink: Sink::Read(tx),
                 ..
-            }) = self.shared.requests.lock().unwrap().remove(&id)
+            }) = conn.shared.requests.lock().unwrap().remove(&id)
             {
                 let _ = tx.send(ReadItem::Err(ClientError::UnexpectedEof));
             }
         }
 
         ReadStream {
-            shared: Arc::clone(&self.shared),
-            out_tx: self.out_tx.clone(),
+            shared: Arc::clone(&conn.shared),
+            out_tx: conn.out_tx.clone(),
             id,
             rx,
             watermark: None,
@@ -347,7 +431,9 @@ impl AsyncClient {
     /// live edge. Awaits room in the outbound queue before returning; dropping the returned
     /// [`Stream`] cancels the subscription server-side.
     pub async fn subscribe(&self, query: Query, after: Position) -> SubscribeStream {
-        let id = self.shared.next_id();
+        // Subscriptions ride a bulk connection alongside reads, off the control lane.
+        let conn = self.bulk();
+        let id = conn.shared.next_id();
         let mut subscribe = pb::SubscribeRequest::new();
         subscribe.set_query(wire::query_to_pb(&query));
         subscribe.set_after(after.get());
@@ -355,28 +441,28 @@ impl AsyncClient {
         request.set_request_id(id);
         request.set_subscribe(subscribe);
 
-        let _permit = self.acquire_inflight().await;
+        let _permit = conn.acquire_inflight().await;
         let (tx, rx) = mpsc::unbounded_channel();
-        self.shared.requests.lock().unwrap().insert(
+        conn.shared.requests.lock().unwrap().insert(
             id,
             Registered {
                 sink: Sink::Subscribe(tx),
                 _permit,
             },
         );
-        if self.out_tx.send(request).await.is_err() {
+        if conn.out_tx.send(request).await.is_err() {
             if let Some(Registered {
                 sink: Sink::Subscribe(tx),
                 ..
-            }) = self.shared.requests.lock().unwrap().remove(&id)
+            }) = conn.shared.requests.lock().unwrap().remove(&id)
             {
                 let _ = tx.send(Err(ClientError::UnexpectedEof));
             }
         }
 
         SubscribeStream {
-            shared: Arc::clone(&self.shared),
-            out_tx: self.out_tx.clone(),
+            shared: Arc::clone(&conn.shared),
+            out_tx: conn.out_tx.clone(),
             id,
             rx,
             done: false,

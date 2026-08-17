@@ -16,11 +16,16 @@
 //! - **Subscribe** runs on its own dedicated thread until cancelled or the connection ends, so
 //!   it no longer monopolizes the connection.
 //!
-//! All producers push built [`pb::Response`]s into one bounded channel drained by the writer,
-//! so frames never tear and a slow client applies backpressure. A [`pb::CancelRequest`] flips a
-//! per-request flag that the read/subscribe loops observe.
+//! Producers push built [`pb::Response`]s onto one of two bounded channels drained by the writer:
+//! a **control** lane (append acks, stats, standalone errors) and a **bulk** lane (read and
+//! subscription event frames). The writer prioritizes control so a small ack never queues behind
+//! megabytes of read response, with a bounded run so a sustained control stream cannot starve the
+//! bulk lane. Each lane is independently bounded, so a slow client applies backpressure per lane
+//! and frames never tear. A [`pb::CancelRequest`] flips a per-request flag that the read/subscribe
+//! loops observe.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{BufReader, BufWriter, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -28,8 +33,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use flume::{Receiver, Sender};
+use flume::{Receiver, Selector, Sender, TryRecvError};
 
 use tephra::log::set::PositionRange;
 use tephra::query::Query;
@@ -79,12 +85,23 @@ pub(crate) fn serve_connection(
     };
 
     let alive = Arc::new(AtomicBool::new(true));
-    let (out_tx, out_rx) = flume::bounded::<pb::Response>(config.frame_queue_depth);
+    // Two egress lanes: a control lane the writer drains first (append acks, stats, errors) and the
+    // deep bulk lane for read/subscription frames, each independently bounded. Control is sized to
+    // hold the whole append-ack backlog, so a healthy client never blocks the pump there; it fills
+    // only when a client stops reading its socket, where a blocking send is ordinary backpressure.
+    let control_depth = config.max_inflight_requests_per_conn.max(CONTROL_QUEUE_MIN);
+    let (control_tx, control_rx) = flume::bounded::<pb::Response>(control_depth);
+    let (bulk_tx, bulk_rx) = flume::bounded::<pb::Response>(config.frame_queue_depth);
     let (reply_tx, reply_rx) = flume::unbounded::<AppendReply>();
     let cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::default();
-    // Appends and reads share one blocking budget; subscriptions get a separate rejecting one, so a
-    // long-lived subscription never holds a permit only a cancel could free (see `spawn_subscribe`).
-    let inflight = Arc::new(Semaphore::new(config.max_inflight_requests_per_conn));
+    // Appends and reads have separate budgets so an append never blocks the reader behind reads
+    // (which would strand a cancel for those reads). Appends block on `append_inflight` (bounding the
+    // reply backlog); reads take `read_inflight` without ever blocking the reader, and `read_overflow`
+    // bounds reads that could not take a permit up front (they acquire it on a worker). Subscriptions
+    // get a separate rejecting budget (see `spawn_subscribe`).
+    let append_inflight = Arc::new(Semaphore::new(config.max_inflight_requests_per_conn));
+    let read_inflight = Arc::new(Semaphore::new(config.max_inflight_requests_per_conn));
+    let read_overflow = Arc::new(Semaphore::new(config.max_inflight_requests_per_conn));
     let subscriptions = Arc::new(Semaphore::new(config.max_concurrent_subscriptions));
     let workers = WaitGroup::default();
 
@@ -94,16 +111,16 @@ pub(crate) fn serve_connection(
         let max = config.max_frame_len;
         thread::Builder::new()
             .name("tephra-conn-writer".to_string())
-            .spawn(move || writer_loop(write_half, out_rx, shutdown, alive, max, peer))
+            .spawn(move || writer_loop(write_half, control_rx, bulk_rx, shutdown, alive, max, peer))
             .expect("spawn connection writer thread")
     };
 
     let pump_thread = {
-        let out_tx = out_tx.clone();
-        let inflight = Arc::clone(&inflight);
+        let control_tx = control_tx.clone();
+        let append_inflight = Arc::clone(&append_inflight);
         thread::Builder::new()
             .name("tephra-conn-pump".to_string())
-            .spawn(move || pump_loop(reply_rx, out_tx, inflight))
+            .spawn(move || pump_loop(reply_rx, control_tx, append_inflight))
             .expect("spawn connection pump thread")
     };
 
@@ -112,10 +129,13 @@ pub(crate) fn serve_connection(
         config,
         running,
         alive: Arc::clone(&alive),
-        out_tx: out_tx.clone(),
+        control_tx: control_tx.clone(),
+        bulk_tx: bulk_tx.clone(),
         cancels: Arc::clone(&cancels),
         workers: workers.clone(),
-        inflight,
+        append_inflight,
+        read_inflight,
+        read_overflow,
         subscriptions,
         stats: Arc::clone(stats),
         read_pool,
@@ -139,7 +159,8 @@ pub(crate) fn serve_connection(
                     FrameError::Io(_) | FrameError::Serialize(_) => None,
                 };
                 if let Some(error) = error {
-                    let _ = out_tx.send(make_response(0, ResponseKind::Error(error)));
+                    // Best-effort on the control lane; the loop is breaking regardless.
+                    let _ = control_tx.try_send(make_response(0, ResponseKind::Error(error)));
                 }
                 // A transport error (reset, broken pipe, torn frame) is not an orderly close;
                 // surface it so a load-induced drop is not silent. A plain end-of-stream still
@@ -164,7 +185,8 @@ pub(crate) fn serve_connection(
     // joins don't hang (a slow-but-alive client is bounded by TCP keepalive / server shutdown).
     alive.store(false, Ordering::Release);
     drop(conn);
-    drop(out_tx);
+    drop(control_tx);
+    drop(bulk_tx);
     drop(reply_tx);
     workers.wait();
     let _ = pump_thread.join();
@@ -181,11 +203,19 @@ struct ConnCtx {
     running: Arc<AtomicBool>,
     /// This connection is being torn down (a transport failure on either half).
     alive: Arc<AtomicBool>,
-    out_tx: Sender<pb::Response>,
+    /// The priority egress lane: append acks, stats, and errors not tied to an active stream.
+    control_tx: Sender<pb::Response>,
+    /// The bulk egress lane: read and subscription event frames.
+    bulk_tx: Sender<pb::Response>,
     cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     workers: WaitGroup,
-    /// Blocking budget shared by in-flight appends and reads.
-    inflight: Arc<Semaphore>,
+    /// Blocking budget for in-flight appends (bounds the reply backlog). Separate from reads so an
+    /// append never parks the reader behind reads holding permits.
+    append_inflight: Arc<Semaphore>,
+    /// Non-blocking budget for running reads: taken at admission, or deferred via `read_overflow`.
+    read_inflight: Arc<Semaphore>,
+    /// Rejecting budget bounding reads that could not take a `read_inflight` permit up front.
+    read_overflow: Arc<Semaphore>,
     /// Rejecting budget for concurrent subscriptions.
     subscriptions: Arc<Semaphore>,
     /// Server-wide gauges and data-directory location, read by the stats op.
@@ -201,6 +231,29 @@ impl ConnCtx {
         self.running.load(Ordering::Acquire)
             && self.alive.load(Ordering::Acquire)
             && !cancel.load(Ordering::Acquire)
+    }
+
+    /// Sends a control-lane frame. Blocking, like the append pump: a full control lane means the
+    /// client has stopped reading its socket, so blocking here is ordinary backpressure (the lane is
+    /// sized to hold the whole ack backlog, so a healthy client never fills it), not a disconnect.
+    /// Independent of the bulk lane, so this never queues behind a large read.
+    fn send_control(&self, response: pb::Response) {
+        let _ = self.control_tx.send(response);
+    }
+
+    /// Sends a bad-request error on the control lane (the common shape across the reader-thread
+    /// validation and admission-rejection paths).
+    fn send_error(&self, request_id: u64, message: impl fmt::Display) {
+        self.send_control(make_response(
+            request_id,
+            ResponseKind::Error(convert::bad_request(message)),
+        ));
+    }
+
+    /// Sends a bulk-lane frame from a worker or subscription thread, blocking on a slow client
+    /// (backpressure). Returns whether the frame was queued; `false` means the writer is gone.
+    fn send_bulk(&self, response: pb::Response) -> bool {
+        self.bulk_tx.send(response).is_ok()
     }
 }
 
@@ -221,13 +274,10 @@ fn dispatch(request: &pb::Request, conn: &ConnCtx, reply_tx: &Sender<AppendReply
         }
         pb::request::KindOneof::Stats(_) => handle_stats(request_id, conn),
         // No kind set, or a future kind this server does not understand.
-        _ => {
-            let error =
-                convert::bad_request("request has no append, read, subscribe, or cancel set");
-            let _ = conn
-                .out_tx
-                .send(make_response(request_id, ResponseKind::Error(error)));
-        }
+        _ => conn.send_error(
+            request_id,
+            "request has no append, read, subscribe, or cancel set",
+        ),
     }
 }
 
@@ -243,9 +293,7 @@ fn handle_stats(request_id: u64, conn: &ConnCtx) {
     stats.set_active_connections(snap.active_connections);
     stats.set_active_subscriptions(snap.active_subscriptions);
     stats.set_version(snap.version.to_string());
-    let _ = conn
-        .out_tx
-        .send(make_response(request_id, ResponseKind::Stats(stats)));
+    conn.send_control(make_response(request_id, ResponseKind::Stats(stats)));
 }
 
 /// Submits an append to the coordinator without blocking; the pump delivers its reply. Input
@@ -263,10 +311,7 @@ fn handle_append(
     let events = match convert::events_from_proto(append) {
         Ok(events) => events,
         Err(err) => {
-            let _ = conn.out_tx.send(make_response(
-                request_id,
-                ResponseKind::Error(convert::bad_request(err)),
-            ));
+            conn.send_error(request_id, err);
             return;
         }
     };
@@ -274,40 +319,36 @@ fn handle_append(
         Some(condition) => match convert::condition_from_proto(condition) {
             Ok(condition) => Some(condition),
             Err(err) => {
-                let _ = conn.out_tx.send(make_response(
-                    request_id,
-                    ResponseKind::Error(convert::bad_request(err)),
-                ));
+                conn.send_error(request_id, err);
                 return;
             }
         },
         None => None,
     };
 
-    conn.inflight.acquire();
+    conn.append_inflight.acquire();
     if let Err(err) = conn
         .handle
         .append_submit(events, condition, request_id, reply_tx.clone())
     {
-        conn.inflight.release();
-        let _ = conn.out_tx.send(make_response(
+        conn.append_inflight.release();
+        conn.send_control(make_response(
             request_id,
             ResponseKind::Error(convert::append_error_to_proto(&err)),
         ));
     }
 }
 
-/// Validates the query, then queues the read onto the shared read pool. Acquiring an in-flight
-/// permit here (shared with appends) bounds a connection's outstanding reads and applies
-/// backpressure to the reader before the job is enqueued.
+/// Validates the query, admits the read without blocking the reader, then queues it onto the shared
+/// read pool. A read takes a `read_inflight` permit up front when one is free; otherwise it takes an
+/// `read_overflow` slot and acquires its permit later on a pool worker, so the reader is never
+/// parked on read admission (a read never strands a cancel behind it). A read past both budgets is
+/// rejected. Appends and a non-draining client still backpressure the reader through their own paths.
 fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
     let query = match convert::query_from_proto(read.query()) {
         Ok(query) => query,
         Err(err) => {
-            let _ = conn.out_tx.send(make_response(
-                request_id,
-                ResponseKind::Error(convert::bad_request(err)),
-            ));
+            conn.send_error(request_id, err);
             return;
         }
     };
@@ -321,12 +362,24 @@ fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
     // Explicit presence: absent means unlimited, present (even 0) is a real cap.
     let limit = read.limit_opt();
 
+    // Admit without blocking the reader: a free permit runs immediately, otherwise an overflow slot
+    // defers the permit acquire to the worker, and a read past both budgets is rejected.
+    let admission = match conn.read_inflight.try_acquire_guard() {
+        Some(permit) => Admission::Permitted(permit),
+        None => match conn.read_overflow.try_acquire_guard() {
+            Some(slot) => Admission::Overflow { slot },
+            None => {
+                conn.send_error(request_id, "too many in-flight reads on this connection");
+                return;
+            }
+        },
+    };
+
     let cancel = register_cancel(conn, request_id);
-    conn.inflight.acquire();
     conn.workers.add();
     let cleanup = WorkerCleanup {
         cancels: Arc::clone(&conn.cancels),
-        sem: Some(Arc::clone(&conn.inflight)),
+        sem: None,
         workers: conn.workers.clone(),
         request_id,
     };
@@ -339,11 +392,12 @@ fn spawn_read(request_id: u64, read: pb::ReadRequestView<'_>, conn: &ConnCtx) {
         conn: conn.clone(),
         cancel,
         cleanup,
+        admission,
     };
     if conn.read_pool.send(job).is_err() {
-        // The pool is gone, which only happens once the server is shutting down. The job (and
-        // with it `WorkerCleanup`) is dropped by the failed send, releasing its permit/worker/
-        // cancel. No error frame: teardown is already underway.
+        // The pool is gone, which only happens once the server is shutting down. The job (and with
+        // it `WorkerCleanup` and the admission guard) is dropped by the failed send, releasing its
+        // permit/slot/worker/cancel. No error frame: teardown is already underway.
         tracing::debug!(request_id, "read pool closed; dropping read");
     }
 }
@@ -355,22 +409,17 @@ fn spawn_subscribe(request_id: u64, subscribe: pb::SubscribeRequestView<'_>, con
     let query = match convert::query_from_proto(subscribe.query()) {
         Ok(query) => query,
         Err(err) => {
-            let _ = conn.out_tx.send(make_response(
-                request_id,
-                ResponseKind::Error(convert::bad_request(err)),
-            ));
+            conn.send_error(request_id, err);
             return;
         }
     };
     let after = Position::new(subscribe.after());
 
     if !conn.subscriptions.try_acquire() {
-        let _ = conn.out_tx.send(make_response(
+        conn.send_error(
             request_id,
-            ResponseKind::Error(convert::bad_request(
-                "too many concurrent subscriptions on this connection",
-            )),
-        ));
+            "too many concurrent subscriptions on this connection",
+        );
         return;
     }
     let cancel = register_cancel(conn, request_id);
@@ -394,12 +443,7 @@ fn spawn_subscribe(request_id: u64, subscribe: pb::SubscribeRequestView<'_>, con
         })
     {
         tracing::warn!(%err, "failed to spawn subscribe worker");
-        let _ = conn.out_tx.send(make_response(
-            request_id,
-            ResponseKind::Error(convert::bad_request(
-                "server could not start the subscription",
-            )),
-        ));
+        conn.send_error(request_id, "server could not start the subscription");
     }
 }
 
@@ -442,7 +486,7 @@ fn run_read(
         let sequenced = match item {
             Ok(sequenced) => sequenced,
             Err(err) => {
-                let _ = conn.out_tx.send(make_response(
+                conn.send_bulk(make_response(
                     request_id,
                     ResponseKind::Error(convert::internal_error(err)),
                 ));
@@ -459,11 +503,7 @@ fn run_read(
             || batch_bytes >= conn.config.read_batch_bytes
         {
             let full = mem::replace(&mut batch, pb::ReadEvents::new());
-            if conn
-                .out_tx
-                .send(make_response(request_id, ResponseKind::ReadEvents(full)))
-                .is_err()
-            {
+            if !conn.send_bulk(make_response(request_id, ResponseKind::ReadEvents(full))) {
                 return;
             }
             batch_bytes = 0;
@@ -471,19 +511,14 @@ fn run_read(
     }
 
     if !batch.events().is_empty()
-        && conn
-            .out_tx
-            .send(make_response(request_id, ResponseKind::ReadEvents(batch)))
-            .is_err()
+        && !conn.send_bulk(make_response(request_id, ResponseKind::ReadEvents(batch)))
     {
         return;
     }
 
     let mut end = pb::ReadEnd::new();
     end.set_watermark(watermark.get());
-    let _ = conn
-        .out_tx
-        .send(make_response(request_id, ResponseKind::ReadEnd(end)));
+    conn.send_bulk(make_response(request_id, ResponseKind::ReadEnd(end)));
 }
 
 /// Serves a live subscription: catch up on matching events after `after`, then tail new ones,
@@ -506,7 +541,7 @@ fn run_subscribe(
         let batch = match sub.poll_batch() {
             Ok(batch) => batch,
             Err(err) => {
-                let _ = conn.out_tx.send(make_response(
+                conn.send_bulk(make_response(
                     request_id,
                     ResponseKind::Error(convert::internal_error(err)),
                 ));
@@ -520,11 +555,7 @@ fn run_subscribe(
             if !announced {
                 let mut caught_up = pb::SubscribeCaughtUp::new();
                 caught_up.set_watermark(sub.position().get());
-                if conn
-                    .out_tx
-                    .send(make_response(request_id, ResponseKind::CaughtUp(caught_up)))
-                    .is_err()
-                {
+                if !conn.send_bulk(make_response(request_id, ResponseKind::CaughtUp(caught_up))) {
                     return;
                 }
                 announced = true;
@@ -560,52 +591,51 @@ fn send_event_batch(
             || batch_bytes >= conn.config.read_batch_bytes
         {
             let full = mem::replace(&mut batch, pb::ReadEvents::new());
-            conn.out_tx
-                .send(make_response(request_id, ResponseKind::ReadEvents(full)))
-                .map_err(|_| ())?;
+            if !conn.send_bulk(make_response(request_id, ResponseKind::ReadEvents(full))) {
+                return Err(());
+            }
             batch_bytes = 0;
         }
     }
-    if !batch.events().is_empty() {
-        conn.out_tx
-            .send(make_response(request_id, ResponseKind::ReadEvents(batch)))
-            .map_err(|_| ())?;
+    if !batch.events().is_empty()
+        && !conn.send_bulk(make_response(request_id, ResponseKind::ReadEvents(batch)))
+    {
+        return Err(());
     }
     Ok(())
 }
 
-/// The writer thread: drains built responses and writes them, flushing once per burst so a
-/// streamed read is delivered promptly without a syscall per frame. On a transport failure it
-/// marks the connection dead and shuts the socket, unblocking the reader and any parked worker.
+/// Floor for the control egress lane depth. The lane is sized to `max(append budget, this)` so it
+/// can hold the whole append-ack backlog without blocking the pump on a healthy client, while still
+/// giving small deployments a reasonable buffer for reader-thread acks and errors.
+const CONTROL_QUEUE_MIN: usize = 64;
+
+/// Most consecutive control frames the writer emits while bulk is pending before forcing one bulk
+/// frame. Bounds how long a sustained ack stream can starve a read sharing the connection while
+/// keeping ack latency effectively unchanged.
+const MAX_CONTROL_RUN: usize = 64;
+
+/// How often an overflow read parked on a permit re-checks its cancel flag (see
+/// [`Semaphore::acquire_guard_or_cancel`]). Bounds the delay before a cancelled, permit-starved read
+/// gives its worker back.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The writer thread: drains the two egress lanes and writes them, prioritizing control so a small
+/// ack never queues behind a large read. On a transport failure it marks the connection dead and
+/// shuts the socket, unblocking the reader and any parked worker.
 fn writer_loop(
     write_half: TcpStream,
-    out_rx: Receiver<pb::Response>,
+    control_rx: Receiver<pb::Response>,
+    bulk_rx: Receiver<pb::Response>,
     shutdown: Option<TcpStream>,
     alive: Arc<AtomicBool>,
     max_frame_len: u32,
     peer: Option<SocketAddr>,
 ) {
     let mut writer = BufWriter::new(write_half);
-    let outcome = 'outer: loop {
-        let Ok(response) = out_rx.recv() else {
-            // The channel closed: every producer is gone (orderly teardown). Not a failure.
-            break Ok(());
-        };
-        if let Err(err) = write_frame(&mut writer, &response, max_frame_len) {
-            break Err(err);
-        }
-        // Write anything already queued before paying for a flush.
-        while let Ok(response) = out_rx.try_recv() {
-            if let Err(err) = write_frame(&mut writer, &response, max_frame_len) {
-                break 'outer Err(err);
-            }
-        }
-        if let Err(err) = writer.flush() {
-            break Err(FrameError::Io(err));
-        }
-    };
+    let outcome = drive_writer(&mut writer, &control_rx, &bulk_rx, max_frame_len);
     // A write failure closes the connection under the client; name it so the drop is not silent.
-    // `alive` was still set here means the writer is the half that observed the failure first.
+    // `alive` still set here means the writer is the half that observed the failure first.
     if let Err(err) = outcome {
         if alive.load(Ordering::Acquire) {
             tracing::warn!(?peer, %err, "closing connection: writer failed");
@@ -620,12 +650,77 @@ fn writer_loop(
     }
 }
 
+/// Drains the control and bulk lanes onto `writer`, control-first with a bulk-liveness escape
+/// valve. Generic over the sink so it can be exercised against an in-memory buffer in tests.
+/// Returns `Ok(())` when both lanes have disconnected and drained, or the first write error.
+fn drive_writer<W: Write>(
+    writer: &mut W,
+    control_rx: &Receiver<pb::Response>,
+    bulk_rx: &Receiver<pb::Response>,
+    max_frame_len: u32,
+) -> Result<(), FrameError> {
+    loop {
+        // Control first, but cap the run at MAX_CONTROL_RUN while bulk is pending, so a client
+        // appending at full rate cannot starve a read sharing the connection.
+        let mut control_written = 0;
+        let mut wrote_control = false;
+        loop {
+            if control_written >= MAX_CONTROL_RUN && !bulk_rx.is_empty() {
+                break;
+            }
+            match control_rx.try_recv() {
+                Ok(response) => {
+                    write_frame(writer, &response, max_frame_len)?;
+                    wrote_control = true;
+                    control_written += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if wrote_control {
+            writer.flush().map_err(FrameError::Io)?;
+        }
+
+        // One bulk frame: normal priority, or the forced frame after a full control run.
+        match bulk_rx.try_recv() {
+            Ok(response) => {
+                write_frame(writer, &response, max_frame_len)?;
+                // Coalesce: flush only when nothing else is immediately queued.
+                if bulk_rx.is_empty() && control_rx.is_empty() {
+                    writer.flush().map_err(FrameError::Io)?;
+                }
+                continue;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
+        }
+        if wrote_control {
+            continue;
+        }
+
+        // Both lanes idle: flush and block on whichever is still live.
+        writer.flush().map_err(FrameError::Io)?;
+        let next = match (!control_rx.is_disconnected(), !bulk_rx.is_disconnected()) {
+            (true, true) => Selector::new()
+                .recv(control_rx, |r| r.ok())
+                .recv(bulk_rx, |r| r.ok())
+                .wait(),
+            (true, false) => control_rx.recv().ok(),
+            (false, true) => bulk_rx.recv().ok(),
+            (false, false) => return Ok(()),
+        };
+        match next {
+            Some(response) => write_frame(writer, &response, max_frame_len)?,
+            None => continue,
+        }
+    }
+}
+
 /// The append completion pump: turns each durable reply into a response frame and releases the
 /// append's in-flight permit. Exits when the reply channel closes (all appends done and the
 /// reader gone) or the writer has gone away.
 fn pump_loop(
     reply_rx: Receiver<AppendReply>,
-    out_tx: Sender<pb::Response>,
+    control_tx: Sender<pb::Response>,
     inflight: Arc<Semaphore>,
 ) {
     while let Ok((request_id, result)) = reply_rx.recv() {
@@ -641,8 +736,10 @@ fn pump_loop(
                 ResponseKind::Error(convert::append_error_to_proto(&err)),
             ),
         };
-        // Send before releasing, so a full frame channel keeps the in-flight bound tight.
-        let sent = out_tx.send(response);
+        // A blocking send off the reader thread: a full control lane backpressures the pump (and so
+        // the in-flight budget) without ever parking the reader. Send before releasing, so the bound
+        // stays tight.
+        let sent = control_tx.send(response);
         inflight.release();
         if sent.is_err() {
             break;
@@ -680,9 +777,9 @@ fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
 // ---------------------------------------------------------------------------
 
 /// One queued read, carrying everything [`run_read`] needs so a pool worker can run it without
-/// borrowing the connection. The `WorkerCleanup` guard rides along and drops when the job
-/// finishes (or if a worker unwinds), releasing the in-flight permit, the cancel entry, and the
-/// worker count exactly once.
+/// borrowing the connection. `admission` owns the in-flight permit (or the overflow slot pending
+/// one); `cleanup` rides along and drops when the job finishes (or a worker unwinds), releasing the
+/// cancel entry and the worker count exactly once.
 pub(crate) struct ReadJob {
     request_id: u64,
     query: Query,
@@ -694,6 +791,14 @@ pub(crate) struct ReadJob {
     conn: ConnCtx,
     cancel: Arc<AtomicBool>,
     cleanup: WorkerCleanup,
+    admission: Admission,
+}
+
+/// A read's admission to run: either it took a `read_inflight` permit up front, or it holds an
+/// overflow slot and must acquire its permit on the worker before running.
+enum Admission {
+    Permitted(Permit),
+    Overflow { slot: Permit },
 }
 
 impl ReadJob {
@@ -707,9 +812,37 @@ impl ReadJob {
             conn,
             cancel,
             cleanup,
+            admission,
         } = self;
+        // Acquire the permit if it was deferred (blocking here on the worker, never the reader),
+        // watching the cancel flag so a cancelled read waiting on a permit gives its worker back
+        // promptly instead of parking until an unrelated read finishes. Acquiring frees the overflow
+        // slot: the read now counts against the in-flight budget instead.
+        //
+        // This parks a shared pool worker while it waits. Harmless at the default
+        // `max_inflight_requests_per_conn` (>= the worker count): the FIFO drains all of a
+        // connection's permit-holders before any of its overflow reads is pulled, so a worker never
+        // blocks here with a permit available. Only a deployment configuring the budget below the
+        // pool size could tie up workers this way.
+        let _permit = match admission {
+            Admission::Permitted(permit) => permit,
+            Admission::Overflow { slot } => {
+                match conn.read_inflight.acquire_guard_or_cancel(&cancel) {
+                    Some(permit) => {
+                        drop(slot);
+                        permit
+                    }
+                    // Cancelled while waiting: drop the slot and cleanup, run nothing.
+                    None => return,
+                }
+            }
+        };
+        // A cancel that landed while the job waited for a permit stops it before any work.
+        if cancel.load(Ordering::Acquire) {
+            return;
+        }
         run_read(request_id, &query, cursor, reverse, limit, &conn, &cancel);
-        // Release the permit/cancel/worker only once the read's frames are all queued.
+        // Release the cancel/worker only once the read's frames are all queued; `_permit` drops here.
         drop(cleanup);
     }
 }
@@ -718,8 +851,8 @@ impl ReadJob {
 /// startup, so a read pays no per-request thread-creation cost. One unbounded MPMC channel feeds
 /// all workers: a sent [`ReadJob`] wakes whichever worker is idle, which runs it to completion
 /// and returns for the next (the reads themselves, not the queue, are the bottleneck; the
-/// per-connection in-flight budget already bounds how many jobs can be outstanding). Subscriptions
-/// keep their own dedicated threads and never use this pool.
+/// per-connection in-flight plus overflow budgets already bound how many jobs can be outstanding).
+/// Subscriptions keep their own dedicated threads and never use this pool.
 pub(crate) struct ReadPool {
     tx: Sender<ReadJob>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -770,7 +903,8 @@ impl ReadPool {
 // ---------------------------------------------------------------------------
 
 /// Releases a worker's resources when its thread ends (including on panic or a spawn failure):
-/// deregisters the cancel flag, returns the read permit (if any), and marks the worker done.
+/// deregisters the cancel flag, returns its budget permit (subscriptions only; a read's permit is
+/// owned by its [`Admission`]), and marks the worker done.
 struct WorkerCleanup {
     cancels: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
     sem: Option<Arc<Semaphore>>,
@@ -805,8 +939,9 @@ impl Drop for SubGauge {
     }
 }
 
-/// A counting semaphore bounding a per-connection budget. Used two ways: `acquire` (blocking) for
-/// the appends/reads budget, and `try_acquire` (rejecting) for the subscriptions budget.
+/// A counting semaphore bounding a per-connection budget. Used three ways: `acquire` (blocking) and
+/// `try_acquire` (rejecting) for the raw count, and the guard variants that tie a permit's release
+/// to a [`Permit`]'s drop.
 struct Semaphore {
     permits: Mutex<usize>,
     available: Condvar,
@@ -844,6 +979,49 @@ impl Semaphore {
         *self.permits.lock().unwrap() += 1;
         self.available.notify_one();
     }
+
+    /// Non-blocking [`try_acquire`](Self::try_acquire) returning an RAII [`Permit`] on success.
+    fn try_acquire_guard(self: &Arc<Self>) -> Option<Permit> {
+        self.try_acquire().then(|| Permit(Arc::clone(self)))
+    }
+
+    /// Blocks for a permit, returning an RAII [`Permit`], but gives up (returns `None`) if `cancel`
+    /// is set. Re-checks `cancel` on a fixed poll so a cancel that lands while parked is observed
+    /// even with no permit release to wake it, so a cancelled overflow read yields its worker
+    /// promptly rather than parking until some unrelated read finishes.
+    fn acquire_guard_or_cancel(self: &Arc<Self>, cancel: &AtomicBool) -> Option<Permit> {
+        let mut permits = self.permits.lock().unwrap();
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                // If a permit is available we are declining, hand it to another waiter rather than
+                // strand it (this waiter may have consumed the release's `notify_one`).
+                if *permits > 0 {
+                    self.available.notify_one();
+                }
+                return None;
+            }
+            if *permits > 0 {
+                *permits -= 1;
+                return Some(Permit(Arc::clone(self)));
+            }
+            let (guard, _timeout) = self
+                .available
+                .wait_timeout(permits, CANCEL_POLL_INTERVAL)
+                .unwrap();
+            permits = guard;
+        }
+    }
+}
+
+/// An RAII permit from a [`Semaphore`]: releases its permit when dropped. Used for the read
+/// in-flight budget and the read-overflow budget, so a dropped read job (cancel, pool shutdown)
+/// returns exactly what it held with no leak or over-release.
+struct Permit(Arc<Semaphore>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 /// Tracks outstanding worker threads so teardown can wait for them without holding join
@@ -872,5 +1050,122 @@ impl WaitGroup {
         while *count > 0 {
             count = self.inner.1.wait(count).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    /// Control-lane frame carrying `id` (an append ack stands in for any small control response).
+    fn control(id: u64) -> pb::Response {
+        make_response(id, ResponseKind::Append(pb::AppendResponse::new()))
+    }
+
+    /// Bulk-lane frame carrying `id` (an empty `ReadEvents` stands in for a read batch).
+    fn bulk(id: u64) -> pb::Response {
+        make_response(id, ResponseKind::ReadEvents(pb::ReadEvents::new()))
+    }
+
+    /// Decodes the request ids of every frame written by [`drive_writer`], in order.
+    fn decode_ids(bytes: &[u8]) -> Vec<u64> {
+        let mut cursor = Cursor::new(bytes);
+        let mut ids = Vec::new();
+        while let Some(resp) = read_frame::<pb::Response, _>(&mut cursor, 1 << 20).unwrap() {
+            ids.push(resp.request_id());
+        }
+        ids
+    }
+
+    /// Drives the writer over two pre-loaded, then disconnected, lanes so it drains and returns.
+    /// Control ids are tagged `>= 1000`, bulk ids `< 1000`.
+    fn run(control_frames: &[u64], bulk_frames: &[u64]) -> Vec<u64> {
+        let (control_tx, control_rx) = flume::bounded::<pb::Response>(control_frames.len().max(1));
+        let (bulk_tx, bulk_rx) = flume::bounded::<pb::Response>(bulk_frames.len().max(1));
+        for id in bulk_frames {
+            bulk_tx.send(bulk(*id)).unwrap();
+        }
+        for id in control_frames {
+            control_tx.send(control(1000 + *id)).unwrap();
+        }
+        drop(control_tx);
+        drop(bulk_tx);
+        let mut out = Vec::new();
+        drive_writer(&mut out, &control_rx, &bulk_rx, 1 << 20).unwrap();
+        decode_ids(&out)
+    }
+
+    #[test]
+    fn control_frames_are_written_before_queued_bulk() {
+        // Three bulk frames queued first, then three control: control still egresses first, so a
+        // small ack never waits behind queued read frames.
+        let ids = run(&[0, 1, 2], &[0, 1, 2]);
+        assert_eq!(ids.len(), 6);
+        let first_bulk = ids.iter().position(|id| *id < 1000).unwrap();
+        assert_eq!(first_bulk, 3, "all queued control drains before any bulk");
+        assert!(ids[first_bulk..].iter().all(|id| *id < 1000));
+    }
+
+    #[test]
+    fn a_sustained_control_stream_cannot_starve_bulk() {
+        // Far more than MAX_CONTROL_RUN control frames with bulk pending: the escape valve forces a
+        // bulk frame out within MAX_CONTROL_RUN + 1 writes rather than starving the read.
+        let control_frames: Vec<u64> = vec![0; MAX_CONTROL_RUN * 3];
+        let ids = run(&control_frames, &[0, 1]);
+        let first_bulk = ids
+            .iter()
+            .position(|id| *id < 1000)
+            .expect("a bulk frame must be written");
+        assert!(
+            first_bulk <= MAX_CONTROL_RUN,
+            "bulk starved: first bulk at {first_bulk}, cap {MAX_CONTROL_RUN}",
+        );
+    }
+
+    #[test]
+    fn a_cancelled_overflow_acquire_gives_up_without_a_permit() {
+        // An overflow read parked on an exhausted budget must return promptly once cancelled, so its
+        // pool worker is freed instead of waiting for an unrelated read to release a permit.
+        let sem = Arc::new(Semaphore::new(1));
+        let _held = sem.try_acquire_guard().expect("the sole permit");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            let cancel = Arc::clone(&cancel);
+            // Time how long the waiter takes to observe the cancel and return.
+            thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let gave_up = sem.acquire_guard_or_cancel(&cancel).is_none();
+                (gave_up, started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(10));
+        cancel.store(true, Ordering::Release);
+        let (gave_up, waited) = waiter.join().unwrap();
+        assert!(gave_up, "a cancelled waiter returns None, not a permit");
+        // Bounded by the poll interval (plus slack), so a regression removing the timeout or making
+        // it seconds-long fails here rather than silently passing.
+        assert!(
+            waited < CANCEL_POLL_INTERVAL * 8,
+            "cancel took {waited:?}, expected within a few poll intervals",
+        );
+    }
+
+    #[test]
+    fn an_overflow_acquire_takes_a_released_permit() {
+        // The uncancelled path still blocks for and takes a permit once one is freed.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.try_acquire_guard().expect("the sole permit");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let sem = Arc::clone(&sem);
+            let cancel = Arc::clone(&cancel);
+            thread::spawn(move || sem.acquire_guard_or_cancel(&cancel).is_some())
+        };
+        thread::sleep(Duration::from_millis(10));
+        drop(held);
+        assert!(waiter.join().unwrap(), "a waiter takes the released permit",);
     }
 }

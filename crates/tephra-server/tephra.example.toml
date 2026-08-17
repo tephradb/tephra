@@ -60,7 +60,8 @@ max_concurrent_subscriptions = 64
 # short and CPU-bound, so one per core reaches the read-parallelism ceiling; raise it for
 # slow-client streaming-read workloads.
 read_worker_threads = 0
-# Depth of a connection's outbound frame queue (buffered response frames before backpressure).
+# Depth of a connection's outbound bulk frame queue (read/subscription frames buffered before
+# backpressure). Small control frames (acks, stats, errors) use a separate priority lane.
 frame_queue_depth = 256
 # TCP keepalive idle time before the first probe on an accepted connection, in seconds. The OS
 # default (~2h on Linux) is too long to reap a silently-dead subscription promptly.

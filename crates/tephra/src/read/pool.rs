@@ -54,7 +54,8 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 /// Tuning for a [`ReadPool`]. `Default` mirrors the server's read defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadPoolConfig {
-    /// Number of worker threads (read-parallelism). Clamped to at least 1.
+    /// Number of worker threads (read-parallelism). Clamped to at least 1. Defaults to one per
+    /// logical CPU, like the server pool, so an async caller is not serialized behind one long read.
     pub workers: usize,
     /// Flush a batch once it holds this many events. Clamped to at least 1.
     pub batch_events: usize,
@@ -72,7 +73,7 @@ pub struct ReadPoolConfig {
 impl Default for ReadPoolConfig {
     fn default() -> ReadPoolConfig {
         ReadPoolConfig {
-            workers: 1,
+            workers: thread::available_parallelism().map_or(1, |n| n.get()),
             batch_events: DEFAULT_MAX_BATCH_EVENTS,
             batch_bytes: 512 * 1024,
             channel_depth: 8,

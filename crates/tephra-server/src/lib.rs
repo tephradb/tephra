@@ -61,9 +61,12 @@ pub struct ServerConfig {
     /// a subscription with no events flowing responsive to `shutdown` without a heartbeat
     /// frame.
     pub subscribe_wait_tick: Duration,
-    /// Most appends + reads a single connection may have in flight at once. Once reached, the
-    /// connection's reader blocks (backpressure) until one finishes, bounding both read worker
-    /// threads and the buffered append-reply backlog. Subscriptions are budgeted separately.
+    /// Per-connection in-flight budget, applied separately to appends and reads. Appends: this many
+    /// may be awaiting their durable reply before the reader blocks (backpressure, bounding the
+    /// reply backlog). Reads: this many may run concurrently, plus this many more may queue for a
+    /// slot without ever blocking the reader, before a further read is rejected (so a read never
+    /// strands a cancel behind it; an append at its own cap, or a client that has stopped reading,
+    /// still backpressures the reader). Subscriptions are budgeted separately.
     pub max_inflight_requests_per_conn: usize,
     /// Most live subscriptions a single connection may hold at once. A subscription over the
     /// limit is rejected with an error (rather than blocking the reader, since a long-lived
@@ -75,8 +78,10 @@ pub struct ServerConfig {
     /// ceiling without oversubscription; raise it for deployments dominated by slow-client
     /// streaming reads, where workers can park on a backpressured send.
     pub read_worker_threads: usize,
-    /// Depth of a connection's outbound frame queue. Bounds buffered response frames, so a slow
-    /// client applies backpressure to the workers producing them.
+    /// Depth of a connection's outbound **bulk** frame queue (read and subscription frames).
+    /// Bounds buffered response frames, so a slow client applies backpressure to the workers
+    /// producing them. Small control frames (append acks, stats, errors) use a separate, priority
+    /// lane so they never queue behind a large read.
     pub frame_queue_depth: usize,
     /// TCP keepalive idle time before the first probe on an accepted connection. The OS
     /// default (~2h on Linux) is too long to reap a silently-dead subscription promptly, so it
