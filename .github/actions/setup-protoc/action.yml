@@ -1,0 +1,32 @@
+name: setup-protoc
+description: >-
+  Install a pinned protoc for the runner's own arch, downloaded straight from the protobuf
+  releases (mirroring the Dockerfile). Replaces arduino/setup-protoc, whose version-resolution
+  API call is broken under the Node 24 action runtime.
+
+inputs:
+  version:
+    description: protoc version, kept in step with the version-locked protobuf crates.
+    required: false
+    default: "35.1"
+
+runs:
+  using: composite
+  steps:
+    - name: Install protoc ${{ inputs.version }}
+      shell: bash
+      env:
+        PROTOC_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64)  protoc_arch=x86_64 ;;
+          aarch64) protoc_arch=aarch_64 ;;
+          *) echo "::error::unsupported runner arch $(uname -m)" >&2; exit 1 ;;
+        esac
+        curl -fsSL -o /tmp/protoc.zip \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
+        sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+        rm /tmp/protoc.zip
+        echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+        protoc --version

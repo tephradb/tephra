@@ -27,11 +27,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
       # cargo publish verifies each crate by building it, and tephra-proto's build.rs runs protoc.
-      - name: Install protoc 35.1
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "35.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz release
         uses: release-plz/action@v0.5
@@ -53,11 +49,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - name: Install protoc 35.1
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "35.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz release-pr
         uses: release-plz/action@v0.5
