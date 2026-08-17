@@ -106,6 +106,18 @@ fn tag_condition(tags: &[&str]) -> AppendCondition {
     AppendCondition::new(tag_query(tags))
 }
 
+/// Seeds `batches * per_batch` events of `payload_len` bytes each, one atomic append (one fsync) per
+/// batch, so a multi-megabyte corpus is written quickly.
+fn seed_bulk(client: &mut Client, batches: usize, per_batch: usize, payload_len: usize) {
+    let payload = vec![b'x'; payload_len];
+    for _ in 0..batches {
+        let events: Vec<Event> = (0..per_batch)
+            .map(|_| ev("E", &["hot"], &payload))
+            .collect();
+        client.append(events, None).unwrap();
+    }
+}
+
 /// The positions of a batch of sequenced events as plain `u64`s.
 fn positions(events: &[SequencedEvent]) -> Vec<u64> {
     events.iter().map(|e| e.position().get()).collect()
@@ -1688,4 +1700,152 @@ async fn write_flood_over_a_connection_pool_never_drops() {
         total_failures, 0,
         "the write flood dropped {total_failures} appends; sample error: {sample_err:?}"
     );
+}
+
+// --- head-of-line blocking: egress fairness and the control/bulk socket split ---
+
+#[tokio::test]
+async fn async_client_defaults_to_a_control_and_bulk_socket() {
+    let ts = TestServer::start();
+    let client = AsyncClient::connect(ts.addr).await.unwrap();
+    // A default client opens two sockets: one control, one bulk.
+    assert_eq!(wait_active_connections(&client, 2).await, 2);
+}
+
+#[tokio::test]
+async fn async_client_single_socket_mode_uses_one_connection() {
+    let ts = TestServer::start();
+    let config = AsyncClientConfig {
+        bulk_connections: 0,
+        ..AsyncClientConfig::default()
+    };
+    let client = AsyncClient::connect_with(ts.addr, config).await.unwrap();
+    // With no bulk sockets, reads share the single control connection (legacy mode).
+    assert_eq!(wait_active_connections(&client, 1).await, 1);
+    let (events, _) = client
+        .read_all(Query::all(), Position::ZERO, None)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+/// Polls the server's connection gauge until it reaches `want` (the bulk socket may register a
+/// beat after `connect` returns), returning the last value seen.
+async fn wait_active_connections(client: &AsyncClient, want: u64) -> u64 {
+    let mut last = 0;
+    for _ in 0..200 {
+        last = client.stats().await.unwrap().active_connections;
+        if last == want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    last
+}
+
+#[test]
+fn a_small_response_interleaves_with_a_large_read_on_one_socket() {
+    // A multi-megabyte read and a small append pipelined on one socket: the append ack must reach
+    // the client near the front, not queued behind the whole read (the head-of-line defect). Small
+    // frames plus a small client receive buffer hold the read in hard TCP backpressure so it stays
+    // in flight, and a brief pause lets the append commit; the ack then rides the priority control
+    // lane and lands within the first few frames rather than after the ~hundreds the read queues.
+    let server_config = ServerConfig {
+        read_batch_bytes: 8 * 1024,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+    // ~3 MiB => hundreds of 8 KiB frames, far more than the receive buffer and bulk lane hold, so
+    // the read is firmly in flight when the append commits.
+    seed_bulk(&mut ts.client(), 24, 16, 8 * 1024);
+
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    socket2::SockRef::from(&stream)
+        .set_recv_buffer_size(32 * 1024)
+        .unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(
+        &mut writer,
+        &append_frame(2, "E", "k:new"),
+        DEFAULT_MAX_FRAME_LEN,
+    )
+    .unwrap();
+    writer.flush().unwrap();
+    // Give the append time to commit while the read stays backpressured (nothing drained yet), so
+    // its ack is queued on the control lane before we start reading.
+    thread::sleep(Duration::from_millis(50));
+
+    // The ack must appear near the front, well before the read's hundreds of frames drain. The bound
+    // (a small multiple of what the receive buffer pre-holds) is far below the read's frame count,
+    // so a regression that queued the ack behind the read would blow past it.
+    const EARLY: usize = 64;
+    let mut reader = BufReader::new(stream);
+    for _ in 0..EARLY {
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("server closed before the append ack arrived");
+        if let pb::response::KindOneof::Append(_) = resp.kind()
+            && resp.request_id() == 2
+        {
+            return; // interleaved near the front, ahead of the read's hundreds of frames
+        }
+    }
+    panic!("append ack did not arrive within the first {EARLY} frames (queued behind the read)");
+}
+
+#[test]
+fn a_read_past_the_inflight_and_overflow_budgets_is_rejected() {
+    // With one in-flight permit and one overflow slot, the third concurrent read on a connection is
+    // rejected rather than parking the reader. That the rejection arrives at all proves the reader
+    // never blocked on read admission (the old blocking acquire would have wedged on the second).
+    //
+    // Determinism: a read's permit is released only when its worker *finishes*, so the first read
+    // must stay in flight while reads 2 and 3 are admitted. Small frames, a shallow bulk lane, and a
+    // small client receive buffer put the first read's worker into hard TCP backpressure (blocked
+    // mid-stream, permit held) rather than letting it complete in microseconds and free the permit.
+    let server_config = ServerConfig {
+        max_inflight_requests_per_conn: 1,
+        read_batch_bytes: 8 * 1024,
+        frame_queue_depth: 8,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+    // Far more than the bulk lane + receive buffer can hold, so read 1's worker blocks mid-stream.
+    seed_bulk(&mut ts.client(), 16, 16, 8 * 1024);
+
+    // A raw socket with a small receive buffer we deliberately do not drain, so read 1 cannot finish
+    // (its permit stays held) and read 2 keeps its overflow slot.
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    socket2::SockRef::from(&stream)
+        .set_recv_buffer_size(32 * 1024)
+        .unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(&mut writer, &read_all_frame(2, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    write_frame(&mut writer, &read_all_frame(3, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+
+    // Read 3's rejection rides the priority control lane, so it arrives ahead of reads 1/2's bulk.
+    let mut reader = BufReader::new(stream);
+    loop {
+        let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+            .unwrap()
+            .expect("server closed without rejecting the third read");
+        if resp.request_id() == 3 {
+            match resp.kind() {
+                pb::response::KindOneof::Error(error) => {
+                    let message = error.message().to_str().unwrap_or("");
+                    assert!(
+                        message.contains("too many in-flight reads"),
+                        "unexpected rejection message: {message}",
+                    );
+                    return;
+                }
+                other => panic!("expected the third read to be rejected, got {other:?}"),
+            }
+        }
+    }
 }

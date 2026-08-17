@@ -170,8 +170,9 @@ pub struct ServerSettings {
     /// milliseconds. Keeps a subscription with no events flowing responsive to shutdown
     /// without a heartbeat frame.
     pub subscribe_wait_tick_ms: u64,
-    /// Most appends + reads a single connection may have in flight at once (backpressure and a
-    /// bound on read threads and the append-reply backlog).
+    /// Per-connection in-flight budget, applied separately to appends and reads: this many appends
+    /// awaiting a reply (then the reader backpressures), and this many concurrent reads plus this
+    /// many queued for a slot (then a further read is rejected, never blocking the reader).
     pub max_inflight_requests_per_conn: usize,
     /// Most live subscriptions a single connection may hold at once; one over the limit is
     /// rejected.
@@ -180,8 +181,8 @@ pub struct ServerSettings {
     /// CPU. Warm reads are short and CPU-bound, so one per core reaches the read-parallelism
     /// ceiling; raise it for slow-client streaming-read workloads.
     pub read_worker_threads: usize,
-    /// Depth of a connection's outbound frame queue (buffered response frames before a slow
-    /// client applies backpressure).
+    /// Depth of a connection's outbound bulk frame queue: read and subscription frames buffered
+    /// before a slow client applies backpressure. Small control frames use a separate priority lane.
     pub frame_queue_depth: usize,
     /// TCP keepalive idle time before the first probe on an accepted connection, in seconds.
     /// The OS default (~2h on Linux) is too long to reap a silently-dead subscription
