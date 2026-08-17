@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/tqwewe/tephra/compare/tephra-client-v0.4.0...tephra-client-v0.4.1) - 2026-08-17
+
+### Other
+
+- *(client)* default AsyncClient to a pool of 4 bulk read sockets
+
 ## [0.4.0](https://github.com/tqwewe/tephra/compare/tephra-client-v0.3.3...tephra-client-v0.4.0) - 2026-08-17
 
 ### Added
