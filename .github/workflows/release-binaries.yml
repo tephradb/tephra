@@ -74,11 +74,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Download the pinned protoc for the runner's own arch (build.rs runs it on the host),
+      # mirroring the Dockerfile. Avoids arduino/setup-protoc, whose version-resolution API call
+      # is broken under the Node 24 action runtime.
       - name: Install protoc ${{ env.PROTOC_VERSION }}
-        uses: arduino/setup-protoc@v3
-        with:
-          version: ${{ env.PROTOC_VERSION }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  protoc_arch=x86_64 ;;
+            aarch64) protoc_arch=aarch_64 ;;
+            *) echo "::error::unsupported runner arch $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          rm /tmp/protoc.zip
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+          protoc --version
 
       - name: Install musl toolchain
         if: matrix.musl
