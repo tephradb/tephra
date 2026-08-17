@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/tqwewe/tephra/compare/tephra-v0.3.3...tephra-v0.3.4) - 2026-08-17
+
+### Added
+
+- eliminate read head-of-line blocking on the TCP connection ([#20](https://github.com/tqwewe/tephra/pull/20))
+
 ## [0.3.3](https://github.com/tqwewe/tephra/compare/tephra-v0.3.2...tephra-v0.3.3) - 2026-08-15
 
 ### Added
