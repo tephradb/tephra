@@ -12,7 +12,7 @@ This page runs start to finish against a real server. Everything after "Run the 
 
 ## Run the server
 
-The server is a synchronous, thread-per-connection TCP server. There are three ways to start it,
+The server is a synchronous, thread-per-connection TCP server. There are four ways to start it,
 none needing a checkout of the workspace. Pick whichever fits how you already run things.
 
 <Tabs>
@@ -32,9 +32,23 @@ none needing a checkout of the workspace. Pick whichever fits how you already ru
     tephra-server
     ```
   </TabItem>
+  <TabItem label="Binary">
+    ```sh
+    # Prebuilt Linux binaries (x86_64/aarch64, glibc or static musl) are on each GitHub release.
+    VERSION=0.3.6
+    TARGET=x86_64-unknown-linux-musl
+    BASE="https://github.com/tqwewe/tephra/releases/download/v${VERSION}"
+    curl -fsSLO "${BASE}/tephra-server-v${VERSION}-${TARGET}.tar.gz"
+    tar -xzf "tephra-server-v${VERSION}-${TARGET}.tar.gz"
+    ./tephra-server-v${VERSION}-${TARGET}/tephra-server
+
+    # Or fetch the same archive via cargo-binstall:
+    cargo binstall tephra-server
+    ```
+  </TabItem>
 </Tabs>
 
-Run through Nix or Cargo, the server binds `127.0.0.1:9000` and writes its log and index segments
+Run through Nix, Cargo, or a prebuilt binary, the server binds `127.0.0.1:9000` and writes its log and index segments
 under `tephra-data` in the working directory. The Docker image publishes on `0.0.0.0:9000` and
 keeps its data in the `/data` volume, mapped above to a named `tephra-data` volume. Bind address,
 data directory, and everything else are configurable by flag, environment variable, or a TOML

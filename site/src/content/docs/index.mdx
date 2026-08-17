@@ -106,10 +106,11 @@ would need to be true before it starts.
 ## Install
 
 ```sh
-# Run the server, whichever way suits you (Docker, Nix, or Cargo):
+# Run the server, whichever way suits you (Docker, Nix, Cargo, or a prebuilt binary):
 docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
 nix run github:tqwewe/tephra
 cargo install tephra-server
+cargo binstall tephra-server   # no-compile: grabs a prebuilt binary from the GitHub releases
 
 # Then talk to it with the client:
 cargo add tephra-client

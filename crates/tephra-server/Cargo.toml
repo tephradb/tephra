@@ -7,6 +7,11 @@ version = "0.3.6"
 rust-version = "1.95.0"
 repository.workspace = true
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+
 [dependencies]
 tephra.workspace = true
 tephra-proto.workspace = true
