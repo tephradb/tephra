@@ -16,12 +16,14 @@ rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt", "sync", "io-util"] }
+tokio-rustls = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 
 [features]
 # A multiplexing async client (`AsyncClient`) built on tokio, alongside the blocking one.
 async = ["dep:tokio", "dep:tokio-stream", "dep:futures-core", "tephra-proto/tokio"]
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pemfile", "tephra-proto/tls"]
+async-tls = ["async", "tls", "dep:tokio-rustls"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

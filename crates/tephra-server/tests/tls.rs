@@ -11,7 +11,7 @@ use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::writer::{WriteCoordinator, WriterConfig};
 
 use tempfile::{NamedTempFile, TempDir};
-use tephra_client::{Client, Event, Position, Query, SubEvent};
+use tephra_client::{AsyncClient, Client, Event, Position, Query, SubEvent};
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, TlsConn, read_frame, tephra as pb, write_frame};
 use tephra_server::tls::build_server_config;
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
@@ -130,6 +130,27 @@ fn tls_survives_a_large_read_over_the_encrypted_stream() {
     let (events, _watermark) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
     assert_eq!(events.len(), 256);
     assert!(events.iter().all(|e| e.event().payload().len() == 4 * 1024));
+}
+
+#[tokio::test]
+async fn async_client_round_trips_over_tls() {
+    // The multiplexing async client (tokio-rustls) over the same TLS server: append on the control
+    // socket, then drain a read over the bulk pool, all encrypted.
+    let ts = TlsTestServer::start();
+    let config = tephra_client::tls::config_with_custom_ca(ts.certs.cert.path()).unwrap();
+    let client = AsyncClient::connect_tls(ts.addr, "localhost", config)
+        .await
+        .unwrap();
+    client
+        .append([ev("E", &["t"], b"async-tls")], None)
+        .await
+        .unwrap();
+    let (events, _watermark) = client
+        .read_all(Query::all(), Position::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event().payload(), b"async-tls");
 }
 
 #[test]

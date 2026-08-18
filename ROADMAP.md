@@ -377,7 +377,11 @@ The server-layer work that makes the store safe to expose on a real network, abo
 - [ ] Mutual TLS: verify a client certificate and expose its identity, the foundation for
       authn/authz. A config-time swap of the `rustls::ServerConfig` verifier; the record-layer
       threading is unchanged
-- [ ] Async-client TLS (via `tokio-rustls`), a separate increment from the blocking client
+- [x] Async-client TLS (`tokio-rustls`) behind an `async-tls` feature: the reader/writer tasks are
+      generic over the transport, so plaintext stays monomorphised to the TCP halves and TLS drives
+      a `tokio::io::split` of a `TlsStream`; `AsyncClient::connect_tls` handshakes each control and
+      bulk socket. The runtime handles the read/write concurrency, so the blocking side's
+      shared-session split is not needed here
 - [ ] TLS 1.2 opt-in, session resumption / tickets, runtime certificate reload, and TLS on the
       `/metrics` and `--healthcheck` endpoints
 

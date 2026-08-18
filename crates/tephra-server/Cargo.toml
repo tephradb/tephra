@@ -29,7 +29,7 @@ tracing-subscriber.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
-tephra-client = { workspace = true, features = ["async", "tls"] }
+tephra-client = { workspace = true, features = ["async", "tls", "async-tls"] }
 
 rcgen.workspace = true
 rustls = { workspace = true }
