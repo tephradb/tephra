@@ -41,6 +41,9 @@ futures-core = "0.3"
 nix = "0.31"
 protobuf = "=4.35.1-release"
 protobuf-codegen = "=4.35.1-release"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 serde = "1"
 smallvec = "1"
 socket2 = "0.6.5"
@@ -52,4 +55,5 @@ tracing-subscriber = "0.3"
 
 # Dev
 criterion = "0.8"
+rcgen = "0.13"
 tempfile = "3"

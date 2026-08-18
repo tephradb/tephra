@@ -29,6 +29,8 @@ mod convert;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod stats;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 use std::collections::HashMap;
 use std::io;
@@ -249,6 +251,8 @@ pub struct Server {
     metrics_listener: Option<TcpListener>,
     #[cfg(feature = "metrics")]
     metrics_addr: Option<SocketAddr>,
+    #[cfg(feature = "tls")]
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -273,7 +277,18 @@ impl Server {
             metrics_listener: None,
             #[cfg(feature = "metrics")]
             metrics_addr: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         })
+    }
+
+    /// Serves every connection over TLS using `tls_config` (built from a certificate and key by
+    /// [`tls::build_server_config`]). Without this the server speaks plaintext; with it, plaintext
+    /// clients are rejected at the handshake. The plaintext transport is unchanged either way.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls_config: Arc<rustls::ServerConfig>) -> Server {
+        self.tls = Some(tls_config);
+        self
     }
 
     /// Records the data directory the store lives in, so the stats op can report the on-disk
@@ -327,6 +342,11 @@ impl Server {
             self.data_dir.clone(),
             self.config.max_connections as u64,
         ));
+
+        // Snapshot the TLS acceptor before any field of `self` is moved below; each connection
+        // thread gets a cheap clone.
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self.tls.clone();
 
         // Optional Prometheus endpoint on its own thread and port. Absent unless a metrics
         // address was bound, so a deployment that does not want it runs nothing extra.
@@ -443,13 +463,24 @@ impl Server {
             // even when no events flow and the socket is idle.
             let running = Arc::clone(&self.running);
             let read_pool = read_pool.sender();
+            #[cfg(feature = "tls")]
+            let tls = tls_acceptor.clone();
             let thread = thread::Builder::new()
                 .name("tephra-conn".to_string())
                 .spawn(move || {
                     // The permit (an RAII guard, not a bare fetch_sub) holds the connection slot
                     // and the gauge for the whole connection, so an unwind out of
                     // serve_connection cannot leak a slot or inflate the gauge.
-                    conn::serve_connection(stream, handle, config, running, read_pool, &permit.0);
+                    conn::serve_connection(
+                        stream,
+                        handle,
+                        config,
+                        running,
+                        read_pool,
+                        &permit.0,
+                        #[cfg(feature = "tls")]
+                        tls,
+                    );
                     drop(permit);
                     connections.remove(id);
                 })?;

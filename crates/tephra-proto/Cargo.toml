@@ -11,6 +11,7 @@ repository.workspace = true
 tephra-types.workspace = true
 
 protobuf.workspace = true
+rustls = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util"] }
 
 [build-dependencies]
@@ -19,6 +20,7 @@ protobuf-codegen.workspace = true
 [features]
 # Async (tokio) framing helpers alongside the synchronous ones.
 tokio = ["dep:tokio"]
+tls = ["dep:rustls"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "io-util"] }

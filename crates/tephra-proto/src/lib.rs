@@ -10,6 +10,8 @@
 
 pub mod convert;
 mod framing;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use framing::{
     DEFAULT_MAX_FRAME_LEN, FrameError, FramePoll, FrameReader, read_frame, write_frame,
@@ -17,6 +19,9 @@ pub use framing::{
 
 #[cfg(feature = "tokio")]
 pub use framing::{read_frame_async, write_frame_async};
+
+#[cfg(feature = "tls")]
+pub use tls::{TlsConn, TlsReadHalf, TlsWriteHalf};
 
 /// The generated protobuf message types (`package tephra.v1`).
 #[allow(clippy::all, clippy::pedantic, clippy::nursery)]

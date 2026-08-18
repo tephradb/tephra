@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::panic::{self, AssertUnwindSafe};
@@ -43,6 +43,12 @@ use tephra::read::WaitOutcome;
 use tephra::writer::{AppendError, WriteHandle};
 use tephra::{Event, Position};
 
+#[cfg(feature = "tls")]
+use rustls::ServerConnection;
+#[cfg(feature = "tls")]
+use std::io::ErrorKind;
+#[cfg(feature = "tls")]
+use tephra_proto::TlsConn;
 use tephra_proto::tephra as pb;
 use tephra_proto::{FrameError, FramePoll, FrameReader, write_frame};
 
@@ -54,8 +60,9 @@ use crate::{ServerConfig, SharedStats};
 type AppendReply = (u64, Result<PositionRange, AppendError>);
 
 /// Serves one connection until the client disconnects, the socket is shut down, or a transport
-/// error occurs. Spawns the writer, the append pump, and per-request workers, then reads and
-/// dispatches requests until the stream ends, and finally tears everything down and joins.
+/// error occurs. Splits the socket into a read and a write half, arms the read-side timeout, and
+/// hands both to [`serve_over`], which owns the reader/writer threads and the request loop. With a
+/// TLS acceptor, the handshake and split happen in [`serve_tls`] first.
 pub(crate) fn serve_connection(
     stream: TcpStream,
     handle: WriteHandle,
@@ -63,10 +70,19 @@ pub(crate) fn serve_connection(
     running: Arc<AtomicBool>,
     read_pool: Sender<ReadJob>,
     stats: &Arc<SharedStats>,
+    #[cfg(feature = "tls")] tls: Option<Arc<rustls::ServerConfig>>,
 ) {
     let peer = stream.peer_addr().ok();
     if let Err(err) = stream.set_nodelay(true) {
         tracing::warn!(?peer, %err, "failed to set TCP_NODELAY");
+    }
+
+    #[cfg(feature = "tls")]
+    if let Some(tls_config) = tls {
+        serve_tls(
+            stream, tls_config, handle, config, running, read_pool, stats,
+        );
+        return;
     }
 
     let read_half = match stream.try_clone() {
@@ -83,6 +99,62 @@ pub(crate) fn serve_connection(
             return;
         }
     };
+    let writer_shutdown = stream.try_clone().ok();
+
+    // Arm the read side with a poll interval when any connection timeout is enabled, so the reader
+    // wakes periodically to enforce its deadlines. With all timeouts disabled it blocks normally and
+    // the poll simply never yields a would-block. Set on the raw socket so it also bounds the
+    // per-byte wait once a TLS transport wraps this half.
+    let timeouts_enabled = !config.incomplete_frame_timeout.is_zero()
+        || !config.handshake_timeout.is_zero()
+        || !config.idle_timeout.is_zero();
+    if timeouts_enabled && let Err(err) = read_half.set_read_timeout(Some(TIMEOUT_POLL_INTERVAL)) {
+        tracing::warn!(?peer, %err, "failed to arm read timeout; this connection will not be reaped");
+    }
+
+    serve_over(
+        Transport {
+            reader: read_half,
+            writer: write_half,
+            shutdown: writer_shutdown,
+        },
+        handle,
+        config,
+        running,
+        read_pool,
+        stats,
+        peer,
+    );
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// The two halves of a split connection plus a raw-socket handle for shutdown. Bundled so
+/// [`serve_over`] stays generic over the transport (plaintext or TLS) behind one parameter.
+struct Transport<R, W> {
+    reader: R,
+    writer: W,
+    /// A handle to the raw socket, used to `shutdown(Both)` on a transport failure.
+    shutdown: Option<TcpStream>,
+}
+
+/// Runs the connection over an already-split transport: spawns the writer and append-pump threads,
+/// then reads and dispatches request frames on this thread until the stream ends, and finally tears
+/// everything down and joins. Generic over the read and write halves so the same logic serves a
+/// plaintext `TcpStream` and a TLS-wrapped stream identically.
+fn serve_over<R: Read, W: Write + Send + 'static>(
+    transport: Transport<R, W>,
+    handle: WriteHandle,
+    config: ServerConfig,
+    running: Arc<AtomicBool>,
+    read_pool: Sender<ReadJob>,
+    stats: &Arc<SharedStats>,
+    peer: Option<SocketAddr>,
+) {
+    let Transport {
+        reader: reader_half,
+        writer: write_half,
+        shutdown: writer_shutdown,
+    } = transport;
 
     let alive = Arc::new(AtomicBool::new(true));
     // Two egress lanes: a control lane the writer drains first (append acks, stats, errors) and the
@@ -107,7 +179,7 @@ pub(crate) fn serve_connection(
 
     let writer_thread = {
         let alive = Arc::clone(&alive);
-        let shutdown = stream.try_clone().ok();
+        let shutdown = writer_shutdown;
         let max = config.max_frame_len;
         thread::Builder::new()
             .name("tephra-conn-writer".to_string())
@@ -141,17 +213,7 @@ pub(crate) fn serve_connection(
         read_pool,
     };
 
-    // Arm the read side with a poll interval when any connection timeout is enabled, so the reader
-    // wakes periodically to enforce its deadlines. With all timeouts disabled it blocks normally
-    // and the poll simply never yields a would-block.
-    let timeouts_enabled = !config.incomplete_frame_timeout.is_zero()
-        || !config.handshake_timeout.is_zero()
-        || !config.idle_timeout.is_zero();
-    if timeouts_enabled && let Err(err) = read_half.set_read_timeout(Some(TIMEOUT_POLL_INTERVAL)) {
-        tracing::warn!(?peer, %err, "failed to arm read timeout; this connection will not be reaped");
-    }
-
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::new(reader_half);
     let mut frames = FrameReader::new();
     let conn_start = Instant::now();
     let mut established = false;
@@ -292,6 +354,108 @@ pub(crate) fn serve_connection(
     workers.wait();
     let _ = pump_thread.join();
     let _ = writer_thread.join();
+}
+
+/// Runs a connection over TLS: completes the handshake single-threaded on this thread (bounded by
+/// the handshake deadline), then splits the session into a read and write half over independent
+/// socket handles and hands them to [`serve_over`], exactly as the plaintext path does.
+#[cfg(feature = "tls")]
+fn serve_tls(
+    stream: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    handle: WriteHandle,
+    config: ServerConfig,
+    running: Arc<AtomicBool>,
+    read_pool: Sender<ReadJob>,
+    stats: &Arc<SharedStats>,
+) {
+    let peer = stream.peer_addr().ok();
+    let mut session = match ServerConnection::new(tls_config) {
+        Ok(session) => session,
+        Err(err) => {
+            tracing::warn!(?peer, %err, "failed to start tls session");
+            return;
+        }
+    };
+
+    // Bound the handshake so a client that connects but never finishes it cannot pin a connection
+    // thread: prefer the handshake timeout, else the incomplete-frame timeout (on by default). A
+    // poll-interval read timeout lets the wall-clock deadline be checked between handshake flights.
+    let deadline = if !config.handshake_timeout.is_zero() {
+        Some(config.handshake_timeout)
+    } else if !config.incomplete_frame_timeout.is_zero() {
+        Some(config.incomplete_frame_timeout)
+    } else {
+        None
+    };
+    if let Err(err) = stream.set_read_timeout(Some(TIMEOUT_POLL_INTERVAL)) {
+        tracing::warn!(?peer, %err, "failed to arm tls handshake timeout");
+    }
+    let mut stream = stream;
+    let started = Instant::now();
+    while session.is_handshaking() {
+        if let Some(deadline) = deadline
+            && started.elapsed() > deadline
+        {
+            stats.connections_reaped.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(?peer, "reaping connection on timeout: tls handshake");
+            return;
+        }
+        match session.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(ref err)
+                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
+            Err(err) => {
+                tracing::debug!(?peer, %err, "tls handshake failed");
+                return;
+            }
+        }
+    }
+
+    // Independent socket handles for the reader and writer, plus a shutdown handle, so the blocking
+    // reads and writes stay independent at the kernel level as they are on the plaintext path.
+    let read_sock = match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => {
+            tracing::warn!(?peer, %err, "failed to clone connection stream");
+            return;
+        }
+    };
+    let write_sock = match stream.try_clone() {
+        Ok(clone) => clone,
+        Err(err) => {
+            tracing::warn!(?peer, %err, "failed to clone connection stream");
+            return;
+        }
+    };
+    let writer_shutdown = stream.try_clone().ok();
+
+    // Arm the request-loop read timeout on the reader's own handle (a blocking read when no timeout
+    // is enabled), matching the plaintext path. Socket options are shared across the clones, so this
+    // also clears the handshake timeout from the write handle.
+    let timeouts_enabled = !config.incomplete_frame_timeout.is_zero()
+        || !config.handshake_timeout.is_zero()
+        || !config.idle_timeout.is_zero();
+    let request_timeout = timeouts_enabled.then_some(TIMEOUT_POLL_INTERVAL);
+    if let Err(err) = read_sock.set_read_timeout(request_timeout) {
+        tracing::warn!(?peer, %err, "failed to arm read timeout; this connection will not be reaped");
+    }
+
+    let session = TlsConn::new(session);
+    let (reader, writer) = session.split(read_sock, write_sock);
+    serve_over(
+        Transport {
+            reader,
+            writer,
+            shutdown: writer_shutdown,
+        },
+        handle,
+        config,
+        running,
+        read_pool,
+        stats,
+        peer,
+    );
     let _ = stream.shutdown(Shutdown::Both);
 }
 
@@ -780,8 +944,8 @@ fn reap_connection(conn: &ConnCtx, peer: Option<SocketAddr>, reason: &'static st
 /// The writer thread: drains the two egress lanes and writes them, prioritizing control so a small
 /// ack never queues behind a large read. On a transport failure it marks the connection dead and
 /// shuts the socket, unblocking the reader and any parked worker.
-fn writer_loop(
-    write_half: TcpStream,
+fn writer_loop<W: Write>(
+    write_half: W,
     control_rx: Receiver<pb::Response>,
     bulk_rx: Receiver<pb::Response>,
     shutdown: Option<TcpStream>,
@@ -800,8 +964,11 @@ fn writer_loop(
             tracing::debug!(?peer, %err, "writer ended after the connection was closed");
         }
     }
-    // Any exit means the output side is done: mark dead and wake the rest of the connection.
+    // Any exit means the output side is done: mark dead and wake the rest of the connection. Flush
+    // first so a TLS transport drains any session output the read half produced (a fatal alert on a
+    // rejected record) before the socket is shut down; on plaintext this is a spent no-op.
     alive.store(false, Ordering::Release);
+    let _ = writer.flush();
     if let Some(stream) = shutdown {
         let _ = stream.shutdown(Shutdown::Both);
     }

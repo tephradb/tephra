@@ -901,8 +901,15 @@ codec stays in the engine (`tephra`).
   `tephra_types::Query`. It keeps the packed `Event`/`EventRef` codec (the on-disk record form,
   deliberately not a DTO) and the match predicate.
 - `crates/tephra-proto` depends on `tephra-types` (not the engine) and owns the wire<->vocabulary
-  conversions (`convert`), reused by both server and client. `crates/tephra-client` speaks the
-  vocabulary plus its own friendly owned `Event`, with the protobuf types hidden.
+  conversions (`convert`) and the length-prefixed framing, reused by both server and client.
+  Behind a `tls` feature it also holds the rustls transport adapters (`TlsReadHalf`/`TlsWriteHalf`):
+  a session is one non-clonable object, so rather than `try_clone`-splitting it the two raw socket
+  handles are kept and only the in-memory session is shared, behind a mutex held for a record-layer
+  step and never across a syscall, with the writer the sole socket-writer so records reach the wire
+  in encryption order. The framing is generic over `Read`/`Write`, so the same reader/writer loops
+  drive a plaintext `TcpStream` and a TLS half with no behavioural difference (see ROADMAP phase 8).
+  `crates/tephra-client` speaks the vocabulary plus its own friendly owned `Event`, with the
+  protobuf types hidden.
 
 The engine's own module layout:
 

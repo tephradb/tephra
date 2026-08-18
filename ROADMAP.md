@@ -351,7 +351,39 @@ This is subtle and is where event stores usually have bugs. Budget accordingly.
 
 ---
 
-## Phase 8: Deferred (no design debt)
+## Phase 8: Transport security and deployment hardening
+
+The server-layer work that makes the store safe to expose on a real network, above the engine.
+
+- [x] Total concurrent-connection cap (`max_connections`), enforced before any per-connection
+      setup, so a client fleet cannot exhaust threads and file descriptors
+- [x] Connection reaping on a wall-clock deadline: `incomplete_frame_timeout` (slow-loris
+      trickle defense, on by default), plus opt-in `handshake_timeout` and `idle_timeout`. The
+      `FrameReader` issues one read per poll so the reader enforces deadlines between bytes,
+      which a per-read socket timeout (reset on every byte) cannot
+- [x] Server-authenticated TLS (rustls, TLS 1.3 only, `ring` provider), behind a default-on
+      `tls` feature. A rustls session is one non-clonable object, so the plaintext
+      `TcpStream::try_clone` reader/writer split does not translate: instead both raw socket
+      handles are kept and only the in-memory session is shared, behind a mutex held for a
+      record-layer step and never across a syscall, with the writer as the sole socket-writer so
+      records reach the wire in encryption order (`tephra-proto::tls`, `TlsReadHalf`/
+      `TlsWriteHalf`). The handshake runs single-threaded up front, bounded by the handshake
+      deadline; the generic `serve_over` then serves plaintext and TLS identically. The
+      plaintext path is untouched (monomorphised over the transport, `try_clone` as before), and
+      a `--no-default-features` build links no rustls
+- [x] Config (`[tls]` cert + key, both-or-neither), a `Server::with_tls` builder, a
+      `build_server_config` PEM loader that fails fast at startup, and a sync client
+      `connect_tls` with native-root or custom-CA trust
+- [ ] Mutual TLS: verify a client certificate and expose its identity, the foundation for
+      authn/authz. A config-time swap of the `rustls::ServerConfig` verifier; the record-layer
+      threading is unchanged
+- [ ] Async-client TLS (via `tokio-rustls`), a separate increment from the blocking client
+- [ ] TLS 1.2 opt-in, session resumption / tickets, runtime certificate reload, and TLS on the
+      `/metrics` and `--healthcheck` endpoints
+
+---
+
+## Phase 9: Deferred (no design debt)
 
 Ordered by likely usefulness, not urgency. None of these are blocked by anything above,
 and none block anything.
