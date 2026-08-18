@@ -2000,11 +2000,11 @@ async fn wait_active_connections(client: &AsyncClient, want: u64) -> u64 {
 
 #[test]
 fn a_small_response_interleaves_with_a_large_read_on_one_socket() {
-    // A multi-megabyte read and a small append pipelined on one socket: the append ack must reach
-    // the client near the front, not queued behind the whole read (the head-of-line defect). Small
-    // frames plus a small client receive buffer hold the read in hard TCP backpressure so it stays
-    // in flight, and a brief pause lets the append commit; the ack then rides the priority control
-    // lane and lands within the first few frames rather than after the ~hundreds the read queues.
+    // A multi-megabyte read and a small append pipelined on one socket: the append ack must
+    // interleave ahead of the read's completion, not queue behind the whole read (the head-of-line
+    // defect). Small frames plus a small client receive buffer hold the read in hard TCP
+    // backpressure so it stays in flight, and a brief pause lets the append commit; the ack then
+    // rides the priority control lane and arrives before the read's terminating ReadEnd.
     let server_config = ServerConfig {
         read_batch_bytes: 8 * 1024,
         ..ServerConfig::default()
@@ -2032,22 +2032,28 @@ fn a_small_response_interleaves_with_a_large_read_on_one_socket() {
     // its ack is queued on the control lane before we start reading.
     thread::sleep(Duration::from_millis(50));
 
-    // The ack must appear near the front, well before the read's hundreds of frames drain. The bound
-    // (a small multiple of what the receive buffer pre-holds) is far below the read's frame count,
-    // so a regression that queued the ack behind the read would blow past it.
-    const EARLY: usize = 64;
+    // Read frames until either the ack or the read's ReadEnd arrives. The ack riding the priority
+    // control lane must beat the read's terminating frame; a regression that queued it behind the
+    // read on one lane would surface ReadEnd first. This invariant is timing-robust: however many
+    // read frames the kernel pre-buffers ahead of the ack, the ack still precedes ReadEnd, which the
+    // ~3 MiB read cannot reach while backpressured through the small receive buffer.
     let mut reader = BufReader::new(stream);
-    for _ in 0..EARLY {
+    loop {
         let resp = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
             .unwrap()
             .expect("server closed before the append ack arrived");
-        if let pb::response::KindOneof::Append(_) = resp.kind()
-            && resp.request_id() == 2
-        {
-            return; // interleaved near the front, ahead of the read's hundreds of frames
+        match resp.kind() {
+            pb::response::KindOneof::Append(_) if resp.request_id() == 2 => {
+                return; // interleaved ahead of the read's completion: no head-of-line block
+            }
+            pb::response::KindOneof::ReadEnd(_) if resp.request_id() == 1 => {
+                panic!(
+                    "append ack arrived only after the read fully drained (head-of-line blocked)"
+                );
+            }
+            _ => {}
         }
     }
-    panic!("append ack did not arrive within the first {EARLY} frames (queued behind the read)");
 }
 
 #[test]
