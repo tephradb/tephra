@@ -4,6 +4,7 @@
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -237,12 +238,73 @@ fn an_unfinished_tls_handshake_is_reaped() {
     );
 }
 
+#[test]
+fn a_partial_tls_handshake_is_reaped() {
+    // A client that sends part of a ClientHello then stalls must be reaped by the handshake
+    // deadline, not pinned. rustls `complete_io` would loop internally over reads while bytes keep
+    // arriving; the server drives the handshake one read at a time so the wall-clock deadline is
+    // enforced even with a record in flight.
+    let config = ServerConfig {
+        handshake_timeout: Duration::from_secs(1),
+        ..ServerConfig::default()
+    };
+    let ts = TlsTestServer::start_with(config);
+    let mut raw = TcpStream::connect(ts.addr).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    // A TLS handshake record header claiming a 512-byte body, then only a couple of body bytes: the
+    // server can never assemble a complete ClientHello from it.
+    raw.write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
+        .unwrap();
+    raw.flush().unwrap();
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let read = raw.read(&mut buf);
+    assert!(
+        matches!(read, Ok(0)),
+        "server should reap the stalled handshake, got {read:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "partial handshake reap took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_idle_timeout_bounds_the_tls_handshake() {
+    // With only idle_timeout configured (handshake and incomplete-frame off), a silent client must
+    // still be reaped during the handshake: the deadline folds in idle_timeout, matching the
+    // plaintext reader, which bounds an accept-to-first-frame gap via idle_timeout too.
+    let config = ServerConfig {
+        incomplete_frame_timeout: Duration::ZERO,
+        idle_timeout: Duration::from_secs(1),
+        ..ServerConfig::default()
+    };
+    let ts = TlsTestServer::start_with(config);
+    let mut raw = TcpStream::connect(ts.addr).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+
+    let started = Instant::now();
+    let mut buf = [0u8; 1];
+    let read = raw.read(&mut buf);
+    assert!(
+        matches!(read, Ok(0)),
+        "server should reap the idle handshake, got {read:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "idle handshake reap took {:?}",
+        started.elapsed()
+    );
+}
+
 /// Opens a raw TLS client connection, returning framing-ready read and write halves plus a handle
 /// kept alive for the connection's lifetime. `recv_buffer` bounds the client's kernel receive
 /// buffer so a large read stays in TCP backpressure.
 fn raw_tls_client(
     addr: SocketAddr,
-    ca: &std::path::Path,
+    ca: &Path,
     recv_buffer: usize,
 ) -> (
     BufReader<tephra_proto::TlsReadHalf>,

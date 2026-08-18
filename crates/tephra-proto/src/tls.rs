@@ -12,8 +12,9 @@
 //! `TcpStream`, with no behavioural difference beyond the crypto.
 
 use std::io::{self, ErrorKind, Read, Write};
+use std::mem;
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rustls::Connection;
 
@@ -39,6 +40,15 @@ impl TlsConn {
         Arc::new(TlsConn {
             conn: Mutex::new(conn.into()),
         })
+    }
+
+    /// Locks the session, recovering from a poisoned lock rather than propagating the panic. A
+    /// panic in one half must not cascade into the other (which would kill both connection threads
+    /// and skip the writer's teardown flush); the connection is being torn down regardless.
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Splits into a read half and a write half. `read_sock` and `write_sock` must be independent
@@ -91,7 +101,7 @@ impl Read for TlsReadHalf {
             // never dropped. `read_tls` reads from an in-memory slice, so the lock is not held
             // across a syscall.
             if self.rx_pos < self.rx_len {
-                let mut conn = self.conn.conn.lock().unwrap();
+                let mut conn = self.conn.lock();
                 let mut cursor: &[u8] = &self.rx[self.rx_pos..self.rx_len];
                 self.rx_pos += conn.read_tls(&mut cursor)?;
                 conn.process_new_packets()
@@ -132,7 +142,7 @@ impl TlsReadHalf {
     /// is `n` bytes of data, and `Ok(None)` means no plaintext is buffered yet (the connection is
     /// live). A peer that dropped without a `close_notify` is reported as a clean end of stream.
     fn serve_plaintext(&self, out: &mut [u8]) -> io::Result<Option<usize>> {
-        let mut conn = self.conn.conn.lock().unwrap();
+        let mut conn = self.conn.lock();
         match conn.reader().read(out) {
             Ok(n) => Ok(Some(n)),
             Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
@@ -164,7 +174,7 @@ impl Write for TlsWriteHalf {
         while offset < buf.len() {
             let end = (offset + TX_CHUNK).min(buf.len());
             {
-                let mut conn = self.conn.conn.lock().unwrap();
+                let mut conn = self.conn.lock();
                 conn.writer().write_all(&buf[offset..end])?;
             }
             self.drain()?;
@@ -186,10 +196,10 @@ impl TlsWriteHalf {
     /// it outside the lock, one buffer at a time.
     fn drain(&mut self) -> io::Result<()> {
         loop {
-            let mut cipher = std::mem::take(&mut self.tx);
+            let mut cipher = mem::take(&mut self.tx);
             cipher.clear();
             let produced = {
-                let mut conn = self.conn.conn.lock().unwrap();
+                let mut conn = self.conn.lock();
                 if !conn.wants_write() {
                     self.tx = cipher;
                     return Ok(());

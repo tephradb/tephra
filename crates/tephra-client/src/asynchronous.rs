@@ -178,7 +178,14 @@ impl Conn {
     ) -> io::Result<Conn> {
         let stream = connect_any(addrs).await?;
         stream.set_nodelay(true)?;
-        let tls = connector.connect(server_name, stream).await?;
+        // Bound the handshake so a server that accepts the TCP connection but stalls cannot leave
+        // the connect future pending forever.
+        let tls = tokio::time::timeout(
+            crate::TLS_HANDSHAKE_TIMEOUT,
+            connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
         let (read_half, write_half) = tokio::io::split(tls);
         Ok(Conn::spawn(read_half, write_half, config))
     }

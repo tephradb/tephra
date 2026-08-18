@@ -15,7 +15,7 @@ futures-core = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["net", "rt", "sync", "io-util"] }
+tokio = { workspace = true, optional = true, features = ["net", "rt", "sync", "io-util", "time"] }
 tokio-rustls = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 

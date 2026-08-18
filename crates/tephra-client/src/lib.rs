@@ -29,6 +29,8 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
+#[cfg(feature = "tls")]
+use std::time::Duration;
 use std::{error, fmt};
 
 use tephra_proto::convert as wire;
@@ -63,6 +65,11 @@ pub mod tls;
 /// so this sentinel never collides with a real one, and such an error is accepted as applying
 /// to the request currently in flight.
 const UNATTRIBUTED_REQUEST_ID: u64 = 0;
+
+/// How long a TLS handshake may take before it is abandoned, so a server that accepts the TCP
+/// connection but stalls the handshake cannot hang the caller.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -375,10 +382,17 @@ impl Client {
             })?;
         let mut session = rustls::ClientConnection::new(tls_config, name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {err}")))?;
+        // Bound the handshake so a server that accepts the TCP connection but stalls (or a
+        // black-hole/plaintext port) cannot hang the caller thread forever. Socket options are
+        // shared across the clones below, so clear them before the blocking request phase begins.
+        stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
+        stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
         let mut handshake = stream.try_clone()?;
         while session.is_handshaking() {
             session.complete_io(&mut handshake)?;
         }
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
         let read_sock = stream.try_clone()?;
         let write_sock = stream.try_clone()?;
         let session = tephra_proto::TlsConn::new(session);
