@@ -165,6 +165,8 @@ pub struct Stats {
     pub active_subscriptions: u64,
     /// Connections refused because the server was at its connection cap. Monotonic.
     pub connections_refused: u64,
+    /// Connections reaped for exceeding a handshake, idle, or incomplete-frame timeout. Monotonic.
+    pub connections_reaped: u64,
     /// The server's configured maximum concurrent connections, or `0` when unlimited.
     pub max_connections: u64,
     /// The server's crate version.
@@ -799,6 +801,7 @@ fn stats_from_pb(stats: pb::StatsResponseView<'_>) -> Stats {
         active_connections: stats.active_connections(),
         active_subscriptions: stats.active_subscriptions(),
         connections_refused: stats.connections_refused(),
+        connections_reaped: stats.connections_reaped(),
         max_connections: stats.max_connections(),
         version: stats.version().to_str().unwrap_or_default().to_string(),
     }

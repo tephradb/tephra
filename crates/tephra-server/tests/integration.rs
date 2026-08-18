@@ -2,12 +2,12 @@
 //! by the blocking `tephra-client`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::writer::{WriteCoordinator, WriterConfig};
@@ -266,7 +266,7 @@ fn max_connections_refuses_over_the_cap() {
 
     // The refusal is counted and the live gauge never exceeded the cap (the refused connection
     // never took a slot). The counter is bumped on the accept thread, so poll for visibility.
-    let stats = poll_connections_refused(&mut first, 1);
+    let stats = poll_stats(&mut first, |s| s.connections_refused, 1);
     assert!(
         stats.connections_refused >= 1,
         "the refusal must be counted"
@@ -274,18 +274,223 @@ fn max_connections_refuses_over_the_cap() {
     assert_eq!(stats.active_connections, 1, "the cap was never exceeded");
 }
 
-/// Polls the stats until the refused-connection counter reaches at least `expected` (it is bumped
-/// on the server's accept thread, so it may lag the client observing the closed socket).
-fn poll_connections_refused(client: &mut Client, expected: u64) -> tephra_client::Stats {
+/// Polls the stats (over the given client's own connection) until `get` reads at least `expected`,
+/// returning the last snapshot. Server-side gauges are bumped on other threads, so a counter may
+/// lag the observable effect briefly.
+fn poll_stats(
+    client: &mut Client,
+    get: impl Fn(&tephra_client::Stats) -> u64,
+    expected: u64,
+) -> tephra_client::Stats {
     let mut stats = client.stats().unwrap();
-    for _ in 0..100 {
-        if stats.connections_refused >= expected {
+    for _ in 0..300 {
+        if get(&stats) >= expected {
             break;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(20));
         stats = client.stats().unwrap();
     }
     stats
+}
+
+/// Connects a raw socket, sends `prelude`, then waits for the server to close it (via the reaper),
+/// asserting the close is observed within `within`. The socket read timeout is set to `within * 3`,
+/// so the bound has teeth: a never-reaped connection blocks the full read timeout instead and fails
+/// the `elapsed < within` assertion rather than passing on the client's own timeout.
+fn expect_reaped_within(addr: SocketAddr, prelude: &[u8], within: Duration) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    if !prelude.is_empty() {
+        sock.write_all(prelude).unwrap();
+        sock.flush().unwrap();
+    }
+    sock.set_read_timeout(Some(within * 3)).unwrap();
+    let start = Instant::now();
+    let mut buf = [0u8; 1];
+    let read = sock.read(&mut buf);
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(read, Ok(0)) || read.is_err(),
+        "the reaper must close the connection, got {read:?}"
+    );
+    assert!(
+        elapsed < within,
+        "reaping took {elapsed:?}, expected under {within:?}"
+    );
+}
+
+#[test]
+fn a_stalled_partial_frame_is_reaped() {
+    // A short incomplete-frame timeout: a client that sends a length prefix then stalls mid-frame
+    // is reaped promptly, so a slow-loris cannot pin a connection slot.
+    let server_config = ServerConfig {
+        incomplete_frame_timeout: Duration::from_secs(1),
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    // A 4-byte length prefix promising a 1 KiB body, then nothing. Reaped within ~2s (deadline plus
+    // one poll interval); the 5s bound fails if reaping never happens.
+    expect_reaped_within(ts.addr, &1024u32.to_be_bytes(), Duration::from_secs(5));
+
+    let mut client = ts.client();
+    let stats = poll_stats(&mut client, |s| s.connections_reaped, 1);
+    assert!(stats.connections_reaped >= 1, "the reap must be counted");
+}
+
+#[test]
+fn a_slow_loris_trickle_is_reaped() {
+    // The core defense: a body trickled one byte at a time, each delivered within the per-read
+    // socket timeout, must still be reaped by the wall-clock incomplete-frame deadline. A per-read
+    // timeout alone never fires here, since every byte resets it.
+    let server_config = ServerConfig {
+        incomplete_frame_timeout: Duration::from_secs(2),
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    let mut sock = TcpStream::connect(ts.addr).unwrap();
+    // Announce a large body, then trickle it a byte every 300ms, well under the 1s poll interval.
+    sock.write_all(&4096u32.to_be_bytes()).unwrap();
+    sock.flush().unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let mut trickler = sock.try_clone().unwrap();
+    let trickle = thread::spawn(move || {
+        for _ in 0..4096 {
+            if trickler.write_all(&[0u8]).is_err() || trickler.flush().is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+    });
+
+    let start = Instant::now();
+    let mut buf = [0u8; 1];
+    let read = sock.read(&mut buf);
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(read, Ok(0)) || read.is_err(),
+        "the trickle must be reaped, got {read:?}"
+    );
+    // Reaped by the 2s wall-clock deadline (plus a poll interval and slack), not the ~20 minutes it
+    // would take to trickle 4096 bytes at 300ms each.
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "trickle reaping took {elapsed:?}, deadline was 2s"
+    );
+    let _ = trickle.join();
+
+    let mut client = ts.client();
+    assert!(poll_stats(&mut client, |s| s.connections_reaped, 1).connections_reaped >= 1);
+}
+
+#[test]
+fn a_partial_first_frame_is_reaped_by_the_handshake_timeout() {
+    // handshake_timeout with the incomplete-frame timeout disabled: a connection that sends a single
+    // byte (a partial length prefix) then stalls must still be reaped, so a partial first frame
+    // cannot bypass the handshake deadline.
+    let server_config = ServerConfig {
+        handshake_timeout: Duration::from_secs(1),
+        incomplete_frame_timeout: Duration::ZERO,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    expect_reaped_within(ts.addr, &[0u8], Duration::from_secs(5));
+
+    let mut client = ts.client();
+    assert!(poll_stats(&mut client, |s| s.connections_reaped, 1).connections_reaped >= 1);
+}
+
+#[test]
+fn idle_timeout_reaps_a_silent_unestablished_connection() {
+    // idle_timeout alone (handshake and incomplete disabled): a connection that connects and sends
+    // nothing is still reaped, since the idle clock starts at accept rather than at the first frame.
+    let server_config = ServerConfig {
+        idle_timeout: Duration::from_secs(1),
+        incomplete_frame_timeout: Duration::ZERO,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    expect_reaped_within(ts.addr, &[], Duration::from_secs(5));
+
+    let mut client = ts.client();
+    assert!(poll_stats(&mut client, |s| s.connections_reaped, 1).connections_reaped >= 1);
+}
+
+#[test]
+fn idle_timeout_reaps_a_stalled_mid_frame_when_incomplete_is_disabled() {
+    // With the incomplete-frame timeout disabled and idle_timeout set, a connection that sends part
+    // of a frame then stalls mid-frame must still be reaped by idle_timeout (a stall is "no complete
+    // frame"), rather than being pinned indefinitely because idle was only checked at a boundary.
+    let server_config = ServerConfig {
+        incomplete_frame_timeout: Duration::ZERO,
+        idle_timeout: Duration::from_secs(1),
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    // A length prefix promising a body, then a stall: mid-frame (in progress), not a boundary.
+    expect_reaped_within(ts.addr, &1024u32.to_be_bytes(), Duration::from_secs(5));
+
+    let mut client = ts.client();
+    assert!(poll_stats(&mut client, |s| s.connections_reaped, 1).connections_reaped >= 1);
+}
+
+#[test]
+fn an_idle_connection_is_reaped_but_a_subscription_is_exempt() {
+    // A short idle timeout: a connection sitting idle with no work is reaped, but a live
+    // subscription counts as activity and is left alone.
+    let server_config = ServerConfig {
+        idle_timeout: Duration::from_secs(1),
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    let mut appender = ts.client();
+    appender.append([ev("E", &["k:1"], b"x")], None).unwrap();
+
+    // A subscription must survive well past the idle timeout (it is activity, so it is exempt).
+    let (item_tx, item_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let subscriber = spawn_subscriber(
+        ts.client(),
+        Query::all(),
+        Position::ZERO,
+        item_tx,
+        cancel_tx,
+    );
+    let cancel = cancel_rx.recv().unwrap();
+    match item_rx.recv().unwrap() {
+        Ok(SubEvent::Event(_)) => {}
+        other => panic!("expected the seeded event, got {other:?}"),
+    }
+
+    // A plain connection that goes idle (no request in flight, no subscription) is reaped.
+    let mut idle = Client::connect(ts.addr).unwrap();
+    idle.stats().unwrap();
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        idle.stats().is_err(),
+        "an idle connection past the idle timeout must be reaped"
+    );
+
+    // The subscription is still live: a new append is delivered to it (proving it was not reaped).
+    // Skip the caught-up live-edge marker emitted while the stream was idle at the tip.
+    let mut appender2 = ts.client();
+    appender2.append([ev("E", &["k:2"], b"y")], None).unwrap();
+    loop {
+        match item_rx.recv().unwrap() {
+            Ok(SubEvent::Event(_)) => break,
+            Ok(SubEvent::CaughtUp(_)) => continue,
+            other => panic!("the subscription was reaped despite being active: {other:?}"),
+        }
+    }
+
+    cancel.cancel();
+    subscriber.join().unwrap();
 }
 
 #[cfg(feature = "metrics")]

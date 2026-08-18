@@ -154,6 +154,13 @@ fn render(snap: &StatsSnapshot) -> String {
         "Connections refused because the server was at max_connections.",
         snap.connections_refused,
     );
+    metric(
+        &mut out,
+        "tephra_connections_reaped_total",
+        "counter",
+        "Connections reaped for exceeding a handshake, idle, or incomplete-frame timeout.",
+        snap.connections_reaped,
+    );
     // A bounded resource with no configured limit is +Inf, not 0. Emitting the internal 0
     // sentinel here would make a utilization panel (active / max) divide by zero; Prometheus
     // treats `x / +Inf` as 0, the intended "0% of an unbounded pool" reading.
@@ -203,6 +210,7 @@ mod tests {
             active_connections: 3,
             active_subscriptions: 1,
             connections_refused: 7,
+            connections_reaped: 4,
             max_connections: 1024,
             version: "9.9.9",
         }
@@ -217,6 +225,8 @@ mod tests {
         assert!(out.contains("\ntephra_active_subscriptions 1\n"));
         assert!(out.contains("# TYPE tephra_connections_refused_total counter\n"));
         assert!(out.contains("\ntephra_connections_refused_total 7\n"));
+        assert!(out.contains("# TYPE tephra_connections_reaped_total counter\n"));
+        assert!(out.contains("\ntephra_connections_reaped_total 4\n"));
         assert!(out.contains("\ntephra_max_connections 1024\n"));
         assert!(out.contains("tephra_build_info{version=\"9.9.9\"} 1\n"));
     }

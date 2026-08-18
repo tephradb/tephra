@@ -119,6 +119,8 @@ message StatsResponse {
   uint64 connections_refused = 8;
   // The configured maximum concurrent connections, or 0 when unlimited.
   uint64 max_connections = 9;
+  // Connections reaped for exceeding a handshake, idle, or incomplete-frame timeout. Monotonic.
+  uint64 connections_reaped = 10;
 }
 
 enum ErrorCode {

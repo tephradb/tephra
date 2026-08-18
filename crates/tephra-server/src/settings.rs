@@ -193,6 +193,17 @@ pub struct ServerSettings {
     /// Most connections served at once, across all clients. A connection over the cap is closed
     /// immediately, before any request is read. `0` means unlimited (an explicit opt-out).
     pub max_connections: usize,
+    /// Seconds a partial request frame may take to finish once its first byte has arrived, before
+    /// the connection is reaped (slow-loris trickle defense). `0` disables it.
+    pub incomplete_frame_timeout_secs: u64,
+    /// Seconds a freshly accepted connection may take to send its first complete frame before being
+    /// reaped. `0` disables it (the default): a pooling client may hold a connection open before
+    /// its first request, so enable this only where clients do not.
+    pub handshake_timeout_secs: u64,
+    /// Seconds a connection with no request in flight and no live subscription may sit idle before
+    /// being reaped. `0` disables it (the default), for the same pooling reason as
+    /// `handshake_timeout_secs`.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for ServerSettings {
@@ -209,6 +220,9 @@ impl Default for ServerSettings {
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
             max_connections: 1024,
+            incomplete_frame_timeout_secs: 30,
+            handshake_timeout_secs: 0,
+            idle_timeout_secs: 0,
         }
     }
 }
@@ -249,6 +263,11 @@ impl Settings {
             keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
             keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
             max_connections: self.server.max_connections,
+            incomplete_frame_timeout: Duration::from_secs(
+                self.server.incomplete_frame_timeout_secs,
+            ),
+            handshake_timeout: Duration::from_secs(self.server.handshake_timeout_secs),
+            idle_timeout: Duration::from_secs(self.server.idle_timeout_secs),
         }
     }
 
@@ -375,6 +394,12 @@ mod tests {
         assert_eq!(server.keepalive_idle, server_default.keepalive_idle);
         assert_eq!(server.keepalive_interval, server_default.keepalive_interval);
         assert_eq!(server.max_connections, server_default.max_connections);
+        assert_eq!(
+            server.incomplete_frame_timeout,
+            server_default.incomplete_frame_timeout
+        );
+        assert_eq!(server.handshake_timeout, server_default.handshake_timeout);
+        assert_eq!(server.idle_timeout, server_default.idle_timeout);
 
         assert_eq!(settings.bind, "127.0.0.1:9000");
         assert_eq!(settings.data_dir, "tephra-data");

@@ -15,6 +15,13 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Connects to `bind`, asks for stats, and returns `Ok` only if the server replies with a
 /// stats response. Any transport error, timeout, or unexpected reply is a failure.
 pub fn probe(bind: &str) -> Result<(), String> {
+    probe_with_timeout(bind, TIMEOUT)
+}
+
+/// [`probe`] with an explicit timeout, so tests can drive the read-timeout path quickly. A server
+/// that accepts the connection but never answers must fail here within `timeout` rather than hang:
+/// `read_frame` surfaces the socket read timeout as an error instead of looping on it.
+fn probe_with_timeout(bind: &str, timeout: Duration) -> Result<(), String> {
     let addr = connect_addr(bind);
     // connect_timeout needs a resolved SocketAddr, and resolving also bounds the connect for a
     // black-holed host (a plain TcpStream::connect would wait the OS default, up to minutes).
@@ -23,10 +30,10 @@ pub fn probe(bind: &str) -> Result<(), String> {
         .map_err(|err| format!("resolve {addr}: {err}"))?
         .next()
         .ok_or_else(|| format!("no address resolved for {addr}"))?;
-    let stream = TcpStream::connect_timeout(&target, TIMEOUT)
+    let stream = TcpStream::connect_timeout(&target, timeout)
         .map_err(|err| format!("connect to {addr}: {err}"))?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok();
-    stream.set_write_timeout(Some(TIMEOUT)).ok();
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
     stream.set_nodelay(true).ok();
 
     let read_half = stream.try_clone().map_err(|err| err.to_string())?;
@@ -66,7 +73,44 @@ fn connect_addr(bind: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::connect_addr;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{connect_addr, probe_with_timeout};
+
+    #[test]
+    fn probe_fails_fast_on_a_silent_server() {
+        // A server that accepts the connection but never responds must be reported unhealthy within
+        // the timeout, not hang forever. Guards the regression where read_frame looped on a read
+        // timeout instead of surfacing it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept the probe's connection and hold it open, silent, so the read times out (dropping
+        // it instead would send EOF, a different failure path).
+        let accepter = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Outlive the probe's short timeout, then close.
+                thread::sleep(Duration::from_secs(1));
+                drop(stream);
+            }
+        });
+
+        let timeout = Duration::from_millis(500);
+        let start = Instant::now();
+        let result = probe_with_timeout(&addr.to_string(), timeout);
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a silent server must be reported unhealthy"
+        );
+        assert!(
+            elapsed < timeout * 4,
+            "probe hung for {elapsed:?} instead of failing near its {timeout:?} timeout"
+        );
+        let _ = accepter.join();
+    }
 
     #[test]
     fn unspecified_bind_dials_loopback() {

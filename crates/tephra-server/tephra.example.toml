@@ -72,6 +72,20 @@ keepalive_interval_secs = 15
 # this caps total server resources independent of any per-connection budget. A connection over the
 # cap is closed immediately, before a request is read. 0 = unlimited (an explicit opt-out).
 max_connections = 1024
+# Seconds a partial request frame may take to finish once its first byte arrives, before the
+# connection is reaped. Defends against a slow-loris trickle (which a per-read socket timeout misses,
+# since it resets on every byte). Only ever touches a partial frame in flight, so a connection idling
+# silently at a frame boundary is unaffected. 0 disables it.
+incomplete_frame_timeout_secs = 30
+# Seconds a freshly accepted connection may take to send its first complete frame before being
+# reaped. 0 disables it (the default). Off by default because a pooling client (such as the async
+# client's idle bulk sockets) legitimately opens a connection and sends nothing until its first read;
+# enable it only where clients do not hold connections open before using them.
+handshake_timeout_secs = 0
+# Seconds a connection with no request in flight and no live subscription may sit idle before being
+# reaped. 0 disables it (the default), for the same pooling reason as handshake_timeout_secs.
+# Subscriptions and in-flight requests count as activity, so a long-lived subscription is never reaped.
+idle_timeout_secs = 0
 
 [metrics]
 # Address for the Prometheus /metrics HTTP endpoint, on its own port. Omitted (disabled) by
