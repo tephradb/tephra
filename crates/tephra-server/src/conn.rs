@@ -33,7 +33,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flume::{Receiver, Selector, Sender, TryRecvError};
 
@@ -44,7 +44,7 @@ use tephra::writer::{AppendError, WriteHandle};
 use tephra::{Event, Position};
 
 use tephra_proto::tephra as pb;
-use tephra_proto::{FrameError, read_frame, write_frame};
+use tephra_proto::{FrameError, FramePoll, FrameReader, write_frame};
 
 use crate::convert;
 use crate::stats;
@@ -141,14 +141,117 @@ pub(crate) fn serve_connection(
         read_pool,
     };
 
+    // Arm the read side with a poll interval when any connection timeout is enabled, so the reader
+    // wakes periodically to enforce its deadlines. With all timeouts disabled it blocks normally
+    // and the poll simply never yields a would-block.
+    let timeouts_enabled = !config.incomplete_frame_timeout.is_zero()
+        || !config.handshake_timeout.is_zero()
+        || !config.idle_timeout.is_zero();
+    if timeouts_enabled && let Err(err) = read_half.set_read_timeout(Some(TIMEOUT_POLL_INTERVAL)) {
+        tracing::warn!(?peer, %err, "failed to arm read timeout; this connection will not be reaped");
+    }
+
     let mut reader = BufReader::new(read_half);
+    let mut frames = FrameReader::new();
+    let conn_start = Instant::now();
+    let mut established = false;
+    let mut last_frame_at = conn_start;
+    // When a partial frame is mid-flight, the instant it first stalled (for the incomplete-frame
+    // deadline). Cleared whenever the connection is not mid-frame.
+    let mut frame_started_at: Option<Instant> = None;
     loop {
-        let request = match read_frame::<pb::Request, _>(&mut reader, config.max_frame_len) {
-            Ok(Some(request)) => request,
-            Ok(None) => {
+        match frames.poll::<pb::Request, _>(&mut reader, config.max_frame_len) {
+            Ok(FramePoll::Frame(request)) => {
+                established = true;
+                last_frame_at = Instant::now();
+                frame_started_at = None;
+                dispatch(&request, &conn, &reply_tx);
+            }
+            Ok(FramePoll::Eof) => {
                 // Clean close at a frame boundary (the peer closed between frames).
                 tracing::debug!(?peer, "connection closed by peer at a frame boundary");
                 break;
+            }
+            Ok(FramePoll::Progress) => {
+                // A byte of the current frame arrived: activity. Advance the idle clock so a
+                // *progressing* frame is never idle-reaped, then bound the frame's completion time.
+                if !conn.running.load(Ordering::Acquire) || !alive.load(Ordering::Acquire) {
+                    break;
+                }
+                last_frame_at = Instant::now();
+                if let Some(reason) = mid_frame_reason(
+                    &config,
+                    established,
+                    conn_start,
+                    last_frame_at,
+                    &mut frame_started_at,
+                ) {
+                    reap_connection(&conn, peer, reason);
+                    break;
+                }
+            }
+            Ok(FramePoll::WouldBlock { in_progress: true }) => {
+                // A partial frame is stalled (no byte within the poll interval). Bound it by the
+                // incomplete-frame and (first-frame) handshake deadlines, plus idle_timeout: unlike
+                // Progress this does not advance last_frame_at, so a stall of idle_timeout is reaped
+                // even with the incomplete-frame timeout disabled. Never exempt: a stalled partial
+                // frame is never legitimate, regardless of any concurrent subscription.
+                if !conn.running.load(Ordering::Acquire) || !alive.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(reason) = mid_frame_reason(
+                    &config,
+                    established,
+                    conn_start,
+                    last_frame_at,
+                    &mut frame_started_at,
+                ) {
+                    reap_connection(&conn, peer, reason);
+                    break;
+                }
+            }
+            Ok(FramePoll::WouldBlock { in_progress: false }) => {
+                // Idle at a frame boundary. Compute the cheap deadline first; only consult
+                // has_activity (which locks the permit budgets) once a deadline is breached, so the
+                // common idle poll does no lock traffic. The handshake deadline covers the pre-first-
+                // frame window; the idle deadline covers every silent gap after (and, since
+                // last_frame_at starts at accept, a silent connection that never sends).
+                if !conn.running.load(Ordering::Acquire) || !alive.load(Ordering::Acquire) {
+                    break;
+                }
+                frame_started_at = None;
+                let breached = if !established
+                    && !config.handshake_timeout.is_zero()
+                    && conn_start.elapsed() > config.handshake_timeout
+                {
+                    Some("handshake timeout")
+                } else if !config.idle_timeout.is_zero()
+                    && last_frame_at.elapsed() > config.idle_timeout
+                {
+                    Some("idle timeout")
+                } else {
+                    None
+                };
+                let reason = match breached {
+                    // In-flight work or a live subscription counts as activity: not idle. Refresh
+                    // the idle clock so we neither reap it nor re-lock every tick until the deadline
+                    // lapses again. Activity only begins after a frame dispatches (which sets
+                    // `established`), so this only ever exempts an idle breach on a busy connection,
+                    // never a handshake breach.
+                    Some(_) if conn.has_activity() => {
+                        debug_assert!(
+                            established,
+                            "activity implies a frame already established the connection"
+                        );
+                        last_frame_at = Instant::now();
+                        None
+                    }
+                    other => other,
+                };
+                if let Some(reason) = reason {
+                    reap_connection(&conn, peer, reason);
+                    break;
+                }
             }
             Err(err) => {
                 // Name the failure to the client when the frame boundary allows it. The frame
@@ -164,7 +267,7 @@ pub(crate) fn serve_connection(
                 }
                 // A transport error (reset, broken pipe, torn frame) is not an orderly close;
                 // surface it so a load-induced drop is not silent. A plain end-of-stream still
-                // arrives as `Ok(None)` above, so this only fires on a genuine failure.
+                // arrives as `Eof` above, so this only fires on a genuine failure.
                 if alive.load(Ordering::Acquire) {
                     tracing::warn!(?peer, %err, "closing connection: reader failed");
                 } else {
@@ -174,9 +277,7 @@ pub(crate) fn serve_connection(
                 }
                 break;
             }
-        };
-
-        dispatch(&request, &conn, &reply_tx);
+        }
     }
 
     // Drain before closing so a queued response (e.g. a frame-error reply) still reaches the
@@ -231,6 +332,16 @@ impl ConnCtx {
         self.running.load(Ordering::Acquire)
             && self.alive.load(Ordering::Acquire)
             && !cancel.load(Ordering::Acquire)
+    }
+
+    /// Whether the connection is doing work that counts as activity for the idle reaper: an append
+    /// or read in flight, or a live subscription. A pooled connection idling between uses has none
+    /// of these, so it is a reaping candidate once its idle deadline passes.
+    fn has_activity(&self) -> bool {
+        !self.append_inflight.is_idle()
+            || !self.read_inflight.is_idle()
+            || !self.read_overflow.is_idle()
+            || !self.subscriptions.is_idle()
     }
 
     /// Sends a control-lane frame. Blocking, like the append pump: a full control lane means the
@@ -293,6 +404,7 @@ fn handle_stats(request_id: u64, conn: &ConnCtx) {
     stats.set_active_connections(snap.active_connections);
     stats.set_active_subscriptions(snap.active_subscriptions);
     stats.set_connections_refused(snap.connections_refused);
+    stats.set_connections_reaped(snap.connections_reaped);
     stats.set_max_connections(snap.max_connections);
     stats.set_version(snap.version.to_string());
     conn.send_control(make_response(request_id, ResponseKind::Stats(stats)));
@@ -622,6 +734,49 @@ const MAX_CONTROL_RUN: usize = 64;
 /// gives its worker back.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// How often the connection reader wakes from a blocked read to re-check its timeout deadlines.
+/// Reaping is enforced within one interval of the configured deadline.
+const TIMEOUT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The reap reason for a connection that is mid-frame (a byte just arrived, or a partial frame is
+/// stalled). Bounds the frame's completion time (`incomplete_frame_timeout`, from its first byte),
+/// the first frame against `handshake_timeout`, and a stall against `idle_timeout` (the caller does
+/// not advance `last_frame_at` while stalled, so an idle-length stall trips this even with the
+/// incomplete-frame timeout disabled). No activity exemption: a stalled partial frame is never
+/// legitimate. Stamps `frame_started_at` at the first byte of the frame.
+fn mid_frame_reason(
+    config: &ServerConfig,
+    established: bool,
+    conn_start: Instant,
+    last_frame_at: Instant,
+    frame_started_at: &mut Option<Instant>,
+) -> Option<&'static str> {
+    let started = *frame_started_at.get_or_insert_with(Instant::now);
+    if !config.incomplete_frame_timeout.is_zero()
+        && started.elapsed() > config.incomplete_frame_timeout
+    {
+        return Some("incomplete frame");
+    }
+    if !established
+        && !config.handshake_timeout.is_zero()
+        && conn_start.elapsed() > config.handshake_timeout
+    {
+        return Some("handshake timeout");
+    }
+    if !config.idle_timeout.is_zero() && last_frame_at.elapsed() > config.idle_timeout {
+        return Some("idle timeout");
+    }
+    None
+}
+
+/// Counts and logs a connection reaped for exceeding a timeout.
+fn reap_connection(conn: &ConnCtx, peer: Option<SocketAddr>, reason: &'static str) {
+    conn.stats
+        .connections_reaped
+        .fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(?peer, reason, "reaping connection on timeout");
+}
+
 /// The writer thread: drains the two egress lanes and writes them, prioritizing control so a small
 /// ack never queues behind a large read. On a transport failure it marks the connection dead and
 /// shuts the socket, unblocking the reader and any parked worker.
@@ -947,15 +1102,24 @@ impl Drop for SubGauge {
 struct Semaphore {
     permits: Mutex<usize>,
     available: Condvar,
+    capacity: usize,
 }
 
 impl Semaphore {
     fn new(permits: usize) -> Semaphore {
+        // At least one, so a misconfigured zero cannot wedge the connection.
+        let capacity = permits.max(1);
         Semaphore {
-            // At least one, so a misconfigured zero cannot wedge the connection.
-            permits: Mutex::new(permits.max(1)),
+            permits: Mutex::new(capacity),
             available: Condvar::new(),
+            capacity,
         }
+    }
+
+    /// Whether every permit is free, i.e. nothing is currently using this budget. Used by the
+    /// idle-connection reaper to treat in-flight work as activity.
+    fn is_idle(&self) -> bool {
+        *self.permits.lock().unwrap() == self.capacity
     }
 
     fn acquire(&self) {
@@ -1058,6 +1222,8 @@ impl WaitGroup {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use tephra_proto::read_frame;
 
     use super::*;
 

@@ -95,6 +95,21 @@ pub struct ServerConfig {
     /// accepted over this cap is closed immediately, before any request is read. `0` means
     /// unlimited (an explicit operator opt-out; the per-connection budgets still apply).
     pub max_connections: usize,
+    /// Once a connection has sent the first byte of a request frame, the whole frame must arrive
+    /// within this long or the connection is reaped. Bounds a slow-loris trickle that a per-read
+    /// socket timeout cannot (that resets on every byte). Only ever applies to a partial frame in
+    /// flight, so a connection idling silently at a frame boundary is untouched. `0` disables it.
+    pub incomplete_frame_timeout: Duration,
+    /// A freshly accepted connection must send its first complete request frame within this long
+    /// or be reaped. `0` disables it. Off by default: a pooling client (such as the async client's
+    /// idle bulk sockets) legitimately opens a connection and sends nothing until its first read,
+    /// so enable this only where clients do not hold connections open before using them.
+    pub handshake_timeout: Duration,
+    /// A connection with no request in flight and no live subscription that sends no frame for this
+    /// long is reaped. `0` disables it. Off by default for the same reason as `handshake_timeout`:
+    /// it would reap a legitimately idle pooled connection. Subscriptions and in-flight requests
+    /// count as activity, so a long-lived subscription is never reaped.
+    pub idle_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -111,6 +126,9 @@ impl Default for ServerConfig {
             keepalive_idle: Duration::from_secs(60),
             keepalive_interval: Duration::from_secs(15),
             max_connections: 1024,
+            incomplete_frame_timeout: Duration::from_secs(30),
+            handshake_timeout: Duration::ZERO,
+            idle_timeout: Duration::ZERO,
         }
     }
 }
@@ -173,6 +191,7 @@ pub(crate) struct SharedStats {
     active_connections: AtomicU64,
     active_subscriptions: AtomicU64,
     connections_refused: AtomicU64,
+    connections_reaped: AtomicU64,
     max_connections: u64,
 }
 
@@ -184,6 +203,7 @@ impl SharedStats {
             active_connections: AtomicU64::new(0),
             active_subscriptions: AtomicU64::new(0),
             connections_refused: AtomicU64::new(0),
+            connections_reaped: AtomicU64::new(0),
             max_connections,
         }
     }

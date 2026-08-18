@@ -20,6 +20,9 @@ pub(crate) struct StatsSnapshot {
     pub active_subscriptions: u64,
     /// Connections refused because the server was at `max_connections`. Monotonic.
     pub connections_refused: u64,
+    /// Connections reaped for exceeding a connection timeout (handshake, idle, or incomplete
+    /// frame). Monotonic.
+    pub connections_reaped: u64,
     /// The configured connection cap, or `0` when unlimited.
     pub max_connections: u64,
     pub version: &'static str,
@@ -40,6 +43,7 @@ pub(crate) fn gather(stats: &SharedStats, handle: &WriteHandle) -> StatsSnapshot
         active_connections: stats.active_connections.load(Ordering::Relaxed),
         active_subscriptions: stats.active_subscriptions.load(Ordering::Relaxed),
         connections_refused: stats.connections_refused.load(Ordering::Relaxed),
+        connections_reaped: stats.connections_reaped.load(Ordering::Relaxed),
         max_connections: stats.max_connections,
         version: env!("CARGO_PKG_VERSION"),
     }
