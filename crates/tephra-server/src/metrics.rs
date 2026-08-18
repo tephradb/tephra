@@ -147,6 +147,28 @@ fn render(snap: &StatsSnapshot) -> String {
         "Live subscriptions across all connections.",
         snap.active_subscriptions,
     );
+    metric(
+        &mut out,
+        "tephra_connections_refused_total",
+        "counter",
+        "Connections refused because the server was at max_connections.",
+        snap.connections_refused,
+    );
+    // A bounded resource with no configured limit is +Inf, not 0. Emitting the internal 0
+    // sentinel here would make a utilization panel (active / max) divide by zero; Prometheus
+    // treats `x / +Inf` as 0, the intended "0% of an unbounded pool" reading.
+    let max_connections = if snap.max_connections == 0 {
+        "+Inf".to_string()
+    } else {
+        snap.max_connections.to_string()
+    };
+    metric_text(
+        &mut out,
+        "tephra_max_connections",
+        "gauge",
+        "Configured maximum concurrent connections; +Inf when unlimited.",
+        &max_connections,
+    );
     let version = snap.version;
     out.push_str("# HELP tephra_build_info Build metadata; the value is always 1.\n");
     out.push_str("# TYPE tephra_build_info gauge\n");
@@ -156,6 +178,12 @@ fn render(snap: &StatsSnapshot) -> String {
 
 /// Appends the `# HELP` / `# TYPE` / sample lines for one scalar metric.
 fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
+    metric_text(out, name, kind, help, &value.to_string());
+}
+
+/// Like [`metric`], but takes the sample value already rendered as text, so a non-integer
+/// exposition value (such as `+Inf` for an unbounded gauge) can be emitted.
+fn metric_text(out: &mut String, name: &str, kind: &str, help: &str, value: &str) {
     out.push_str(&format!(
         "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
     ));
@@ -174,6 +202,8 @@ mod tests {
             uptime_seconds: 12,
             active_connections: 3,
             active_subscriptions: 1,
+            connections_refused: 7,
+            max_connections: 1024,
             version: "9.9.9",
         }
     }
@@ -185,7 +215,28 @@ mod tests {
         assert!(out.contains("\ntephra_events_total 5\n"));
         assert!(out.contains("# TYPE tephra_active_subscriptions gauge\n"));
         assert!(out.contains("\ntephra_active_subscriptions 1\n"));
+        assert!(out.contains("# TYPE tephra_connections_refused_total counter\n"));
+        assert!(out.contains("\ntephra_connections_refused_total 7\n"));
+        assert!(out.contains("\ntephra_max_connections 1024\n"));
         assert!(out.contains("tephra_build_info{version=\"9.9.9\"} 1\n"));
+    }
+
+    #[test]
+    fn unlimited_max_connections_renders_as_plus_inf() {
+        // 0 is the internal "unlimited" sentinel; the gauge must not leak it as a literal 0, which
+        // would break an `active / max` utilization panel by dividing by zero. +Inf is the
+        // idiomatic unbounded value and Prometheus reads `active / +Inf` as 0.
+        let mut snap = snapshot();
+        snap.max_connections = 0;
+        let out = render(&snap);
+        assert!(
+            out.contains("\ntephra_max_connections +Inf\n"),
+            "body: {out}"
+        );
+        assert!(
+            !out.contains("tephra_max_connections 0"),
+            "the 0 sentinel must not leak into the gauge",
+        );
     }
 
     #[test]

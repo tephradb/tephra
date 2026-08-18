@@ -89,6 +89,12 @@ pub struct ServerConfig {
     pub keepalive_idle: Duration,
     /// Interval between TCP keepalive probes once they start.
     pub keepalive_interval: Duration,
+    /// Most connections served at once, across all clients. Each connection costs several OS
+    /// threads (reader, writer, append pump, plus one per live subscription), so an unbounded
+    /// client fleet would otherwise exhaust threads, file descriptors, and memory. A connection
+    /// accepted over this cap is closed immediately, before any request is read. `0` means
+    /// unlimited (an explicit operator opt-out; the per-connection budgets still apply).
+    pub max_connections: usize,
 }
 
 impl Default for ServerConfig {
@@ -104,6 +110,7 @@ impl Default for ServerConfig {
             frame_queue_depth: 256,
             keepalive_idle: Duration::from_secs(60),
             keepalive_interval: Duration::from_secs(15),
+            max_connections: 1024,
         }
     }
 }
@@ -157,38 +164,53 @@ impl Connections {
 }
 
 // Server-wide state sampled by the stats op: the data directory (stat'd for segment count and
-// disk usage), the start instant for uptime, and the live connection/subscription gauges.
-// Shared behind an `Arc` and read with plain atomic loads.
+// disk usage), the start instant for uptime, the live connection/subscription gauges, the
+// running total of refused connections, and the configured connection cap. Shared behind an
+// `Arc` and read with plain atomic loads.
 pub(crate) struct SharedStats {
     data_dir: Option<PathBuf>,
     start_time: Instant,
     active_connections: AtomicU64,
     active_subscriptions: AtomicU64,
+    connections_refused: AtomicU64,
+    max_connections: u64,
 }
 
 impl SharedStats {
-    fn new(data_dir: Option<PathBuf>) -> SharedStats {
+    fn new(data_dir: Option<PathBuf>, max_connections: u64) -> SharedStats {
         SharedStats {
             data_dir,
             start_time: Instant::now(),
             active_connections: AtomicU64::new(0),
             active_subscriptions: AtomicU64::new(0),
+            connections_refused: AtomicU64::new(0),
+            max_connections,
         }
     }
 }
 
-// Holds the live-connection gauge up for one connection: increments on construction and
-// decrements on drop, so an unwind out of `serve_connection` cannot inflate it.
-struct ConnGuard(Arc<SharedStats>);
+// Holds a connection slot for the life of one connection: the `active_connections` gauge is the
+// cap counter, so acquiring both enforces `max_connections` and drives the gauge. Increments on
+// a successful acquire and decrements on drop, so an unwind out of `serve_connection` (or a
+// failed thread spawn) cannot inflate the gauge or leak a slot.
+struct ConnPermit(Arc<SharedStats>);
 
-impl ConnGuard {
-    fn new(stats: Arc<SharedStats>) -> ConnGuard {
+impl ConnPermit {
+    /// Takes a connection slot if the server is under `max_connections`, returning `None` when at
+    /// capacity (`0` means unlimited). The accept loop is the sole incrementer, so the
+    /// load-then-add cannot overshoot the cap: concurrent drops only lower the count, and no other
+    /// thread raises it.
+    fn acquire(stats: &Arc<SharedStats>) -> Option<ConnPermit> {
+        let max = stats.max_connections;
+        if max != 0 && stats.active_connections.load(Ordering::Relaxed) >= max {
+            return None;
+        }
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
-        ConnGuard(stats)
+        Some(ConnPermit(Arc::clone(stats)))
     }
 }
 
-impl Drop for ConnGuard {
+impl Drop for ConnPermit {
     fn drop(&mut self) {
         self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
@@ -281,7 +303,10 @@ impl Server {
         tracing::info!(addr = %self.local_addr, "tephra server listening");
         let next_id = AtomicU64::new(0);
         let mut threads = Vec::new();
-        let stats = Arc::new(SharedStats::new(self.data_dir.clone()));
+        let stats = Arc::new(SharedStats::new(
+            self.data_dir.clone(),
+            self.config.max_connections as u64,
+        ));
 
         // Optional Prometheus endpoint on its own thread and port. Absent unless a metrics
         // address was bound, so a deployment that does not want it runs nothing extra.
@@ -317,6 +342,10 @@ impl Server {
         let read_pool = conn::ReadPool::new(read_workers);
         tracing::info!(read_workers, "read worker pool started");
 
+        // Edge-triggered so a sustained connection flood does not itself flood the log: the warn
+        // fires once when the cap is first hit and re-arms only after a connection is admitted
+        // again. The `connections_refused` counter still records every refusal for metrics.
+        let mut at_cap = false;
         for stream in self.listener.incoming() {
             if !self.running.load(Ordering::Acquire) {
                 break;
@@ -328,6 +357,35 @@ impl Server {
                     continue;
                 }
             };
+
+            // Enforce the global connection cap before doing any per-connection setup. Over the
+            // cap the connection is closed immediately, before a request is ever read, so a
+            // client fleet cannot exhaust threads and file descriptors. The permit rides into the
+            // connection thread and releases the slot (and the gauge) when the connection ends.
+            let permit = match ConnPermit::acquire(&stats) {
+                Some(permit) => {
+                    at_cap = false;
+                    permit
+                }
+                None => {
+                    let refused = stats.connections_refused.fetch_add(1, Ordering::Relaxed) + 1;
+                    if !at_cap {
+                        at_cap = true;
+                        tracing::warn!(
+                            max = self.config.max_connections,
+                            refused_total = refused,
+                            "at max_connections; refusing new connections until one frees"
+                        );
+                    }
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+            };
+
+            // Reap the handles of connections that have already finished so the vector stays
+            // bounded by the live (capped) connection count rather than every connection ever
+            // served. The remainder is joined after the accept loop ends.
+            threads.retain(|thread: &thread::JoinHandle<()>| !thread.is_finished());
 
             // Explicit TCP keepalive so a silently-dead connection (for example a subscriber
             // whose client vanished) is eventually reaped by the OS, rather than after the
@@ -365,14 +423,14 @@ impl Server {
             // even when no events flow and the socket is idle.
             let running = Arc::clone(&self.running);
             let read_pool = read_pool.sender();
-            let stats = Arc::clone(&stats);
             let thread = thread::Builder::new()
                 .name("tephra-conn".to_string())
                 .spawn(move || {
-                    // A guard, not a bare fetch_sub, so an unwind out of serve_connection (e.g. a
-                    // failed thread spawn under load) cannot leave the gauge inflated.
-                    let guard = ConnGuard::new(stats);
-                    conn::serve_connection(stream, handle, config, running, read_pool, &guard.0);
+                    // The permit (an RAII guard, not a bare fetch_sub) holds the connection slot
+                    // and the gauge for the whole connection, so an unwind out of
+                    // serve_connection cannot leak a slot or inflate the gauge.
+                    conn::serve_connection(stream, handle, config, running, read_pool, &permit.0);
+                    drop(permit);
                     connections.remove(id);
                 })?;
             threads.push(thread);

@@ -190,6 +190,9 @@ pub struct ServerSettings {
     pub keepalive_idle_secs: u64,
     /// Interval between TCP keepalive probes once they start, in seconds.
     pub keepalive_interval_secs: u64,
+    /// Most connections served at once, across all clients. A connection over the cap is closed
+    /// immediately, before any request is read. `0` means unlimited (an explicit opt-out).
+    pub max_connections: usize,
 }
 
 impl Default for ServerSettings {
@@ -205,6 +208,7 @@ impl Default for ServerSettings {
             frame_queue_depth: 256,
             keepalive_idle_secs: 60,
             keepalive_interval_secs: 15,
+            max_connections: 1024,
         }
     }
 }
@@ -244,6 +248,7 @@ impl Settings {
             frame_queue_depth: self.server.frame_queue_depth,
             keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
             keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
+            max_connections: self.server.max_connections,
         }
     }
 
@@ -369,6 +374,7 @@ mod tests {
         assert_eq!(server.frame_queue_depth, server_default.frame_queue_depth);
         assert_eq!(server.keepalive_idle, server_default.keepalive_idle);
         assert_eq!(server.keepalive_interval, server_default.keepalive_interval);
+        assert_eq!(server.max_connections, server_default.max_connections);
 
         assert_eq!(settings.bind, "127.0.0.1:9000");
         assert_eq!(settings.data_dir, "tephra-data");

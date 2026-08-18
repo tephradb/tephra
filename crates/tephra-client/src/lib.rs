@@ -163,6 +163,10 @@ pub struct Stats {
     pub active_connections: u64,
     /// Live subscriptions across all connections.
     pub active_subscriptions: u64,
+    /// Connections refused because the server was at its connection cap. Monotonic.
+    pub connections_refused: u64,
+    /// The server's configured maximum concurrent connections, or `0` when unlimited.
+    pub max_connections: u64,
     /// The server's crate version.
     pub version: String,
 }
@@ -794,6 +798,8 @@ fn stats_from_pb(stats: pb::StatsResponseView<'_>) -> Stats {
         uptime_seconds: stats.uptime_seconds(),
         active_connections: stats.active_connections(),
         active_subscriptions: stats.active_subscriptions(),
+        connections_refused: stats.connections_refused(),
+        max_connections: stats.max_connections(),
         version: stats.version().to_str().unwrap_or_default().to_string(),
     }
 }

@@ -18,6 +18,10 @@ pub(crate) struct StatsSnapshot {
     pub uptime_seconds: u64,
     pub active_connections: u64,
     pub active_subscriptions: u64,
+    /// Connections refused because the server was at `max_connections`. Monotonic.
+    pub connections_refused: u64,
+    /// The configured connection cap, or `0` when unlimited.
+    pub max_connections: u64,
     pub version: &'static str,
 }
 
@@ -35,6 +39,8 @@ pub(crate) fn gather(stats: &SharedStats, handle: &WriteHandle) -> StatsSnapshot
         uptime_seconds: stats.start_time.elapsed().as_secs(),
         active_connections: stats.active_connections.load(Ordering::Relaxed),
         active_subscriptions: stats.active_subscriptions.load(Ordering::Relaxed),
+        connections_refused: stats.connections_refused.load(Ordering::Relaxed),
+        max_connections: stats.max_connections,
         version: env!("CARGO_PKG_VERSION"),
     }
 }

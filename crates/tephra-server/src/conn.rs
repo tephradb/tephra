@@ -292,6 +292,8 @@ fn handle_stats(request_id: u64, conn: &ConnCtx) {
     stats.set_uptime_seconds(snap.uptime_seconds);
     stats.set_active_connections(snap.active_connections);
     stats.set_active_subscriptions(snap.active_subscriptions);
+    stats.set_connections_refused(snap.connections_refused);
+    stats.set_max_connections(snap.max_connections);
     stats.set_version(snap.version.to_string());
     conn.send_control(make_response(request_id, ResponseKind::Stats(stats)));
 }

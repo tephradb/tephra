@@ -238,6 +238,56 @@ fn poll_active_subscriptions(client: &mut Client, expected: u64) -> u64 {
     seen
 }
 
+#[test]
+fn max_connections_refuses_over_the_cap() {
+    // A one-connection server: the first client holds the only slot, and a second connection is
+    // closed before a request is served, so a client fleet cannot exhaust server threads.
+    let server_config = ServerConfig {
+        max_connections: 1,
+        ..ServerConfig::default()
+    };
+    let ts = TestServer::start_with(server_config, 16 * 1024 * 1024, WriterConfig::default());
+
+    // The first client takes the sole slot; a round-trip proves the server is serving it, so the
+    // slot is held before the second connection is attempted.
+    let mut first = ts.client();
+    let stats = first.stats().unwrap();
+    assert_eq!(stats.active_connections, 1);
+    assert_eq!(stats.max_connections, 1);
+    assert_eq!(stats.connections_refused, 0);
+
+    // A second connection completes at the TCP layer but is refused (closed) by the server before
+    // any request is served, so the first operation over it fails.
+    let mut second = Client::connect(ts.addr).unwrap();
+    assert!(
+        second.stats().is_err(),
+        "a connection over the cap must be refused, not served"
+    );
+
+    // The refusal is counted and the live gauge never exceeded the cap (the refused connection
+    // never took a slot). The counter is bumped on the accept thread, so poll for visibility.
+    let stats = poll_connections_refused(&mut first, 1);
+    assert!(
+        stats.connections_refused >= 1,
+        "the refusal must be counted"
+    );
+    assert_eq!(stats.active_connections, 1, "the cap was never exceeded");
+}
+
+/// Polls the stats until the refused-connection counter reaches at least `expected` (it is bumped
+/// on the server's accept thread, so it may lag the client observing the closed socket).
+fn poll_connections_refused(client: &mut Client, expected: u64) -> tephra_client::Stats {
+    let mut stats = client.stats().unwrap();
+    for _ in 0..100 {
+        if stats.connections_refused >= expected {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+        stats = client.stats().unwrap();
+    }
+    stats
+}
+
 #[cfg(feature = "metrics")]
 #[test]
 fn metrics_endpoint_serves_prometheus_exposition() {

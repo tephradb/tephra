@@ -68,6 +68,10 @@ frame_queue_depth = 256
 keepalive_idle_secs = 60
 # Interval between TCP keepalive probes once they start, in seconds.
 keepalive_interval_secs = 15
+# Most connections served at once, across all clients. Each connection costs a few OS threads, so
+# this caps total server resources independent of any per-connection budget. A connection over the
+# cap is closed immediately, before a request is read. 0 = unlimited (an explicit opt-out).
+max_connections = 1024
 
 [metrics]
 # Address for the Prometheus /metrics HTTP endpoint, on its own port. Omitted (disabled) by
