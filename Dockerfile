@@ -28,9 +28,10 @@ ARG PROTOC_VERSION
 ARG TARGETARCH
 
 # protoc, pinned to the version the protobuf crates are locked against. Downloaded from the
-# release rather than apt so the version matches exactly across distributions.
+# release rather than apt so the version matches exactly across distributions. make builds the
+# vendored C in tikv-jemalloc-sys (the default jemalloc allocator), which the slim image lacks.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip make \
     && rm -rf /var/lib/apt/lists/* \
     && case "${TARGETARCH}" in \
          amd64) protoc_arch=x86_64 ;; \
