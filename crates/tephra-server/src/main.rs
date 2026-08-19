@@ -73,15 +73,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initialises tracing. An explicit `log` setting (from `--log`, the file, or the env) wins;
-/// otherwise `RUST_LOG` is honoured, falling back to `info`. Uses `Targets` rather than
+/// Initialises tracing. An explicit `log` setting (from `--log`, the file, or `TEPHRA__LOG`) wins;
+/// otherwise `TEPHRA_LOG` is honoured, falling back to `info`. Uses `Targets` rather than
 /// `EnvFilter` so the binary carries no regex engine; the `target=level` directive syntax is the
 /// same.
 fn init_tracing(settings: &Settings) {
     let directives = settings
         .log
         .clone()
-        .or_else(|| env::var("RUST_LOG").ok())
+        .or_else(|| env::var("TEPHRA_LOG").ok())
         .unwrap_or_else(|| "info".to_string());
     let targets = directives
         .parse::<Targets>()

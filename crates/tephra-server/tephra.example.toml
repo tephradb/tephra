@@ -10,7 +10,7 @@
 bind = "127.0.0.1:9000"
 # Directory holding the log (and index) segment files.
 data_dir = "tephra-data"
-# Tracing filter. Omit to fall back to RUST_LOG, then to "info".
+# Tracing filter. Omit to fall back to TEPHRA_LOG, then to "info".
 # log = "tephra=debug"
 
 [segment]
@@ -42,50 +42,61 @@ scan_bias = 4
 [server]
 # Largest single frame accepted or produced, in bytes.
 max_frame_len = 16777216   # 16 MiB
+
+[server.reads]
 # A streamed read (or subscription) is flushed as a frame once it holds this many events.
-read_batch_events = 1024
-# A streamed read (or subscription) is flushed as a frame once its buffered events reach this
-# many bytes.
-read_batch_bytes = 524288  # 512 KiB
-# How often an idle subscription's blocking wait wakes to re-check server shutdown, in
-# milliseconds. Keeps a subscription with no events flowing responsive to shutdown without a
-# heartbeat frame.
-subscribe_wait_tick_ms = 250
-# Most appends + reads a single connection may have in flight at once. Once reached, the reader
-# blocks (backpressure) until one finishes, bounding read threads and the append-reply backlog.
-max_inflight_requests_per_conn = 256
-# Most live subscriptions a single connection may hold at once; one over the limit is rejected.
-max_concurrent_subscriptions = 64
+batch_events = 1024
+# ...or once its buffered events reach this many bytes.
+batch_bytes = 524288       # 512 KiB
 # Reusable worker threads in the shared read pool. 0 = auto (one per logical CPU). Warm reads are
 # short and CPU-bound, so one per core reaches the read-parallelism ceiling; raise it for
 # slow-client streaming-read workloads.
-read_worker_threads = 0
+worker_threads = 0
+
+[server.subscriptions]
+# How often an idle subscription's blocking wait wakes to re-check server shutdown, in
+# milliseconds. Keeps a subscription with no events flowing responsive to shutdown without a
+# heartbeat frame.
+wait_tick_ms = 250
+# Most live subscriptions a single connection may hold at once; one over the limit is rejected.
+max_concurrent = 64
+
+[server.backpressure]
+# Most appends + reads a single connection may have in flight at once. Once reached, the reader
+# blocks (backpressure) until one finishes, bounding read threads and the append-reply backlog.
+max_inflight_per_conn = 256
 # Depth of a connection's outbound bulk frame queue (read/subscription frames buffered before
 # backpressure). Small control frames (acks, stats, errors) use a separate priority lane.
 frame_queue_depth = 256
-# TCP keepalive idle time before the first probe on an accepted connection, in seconds. The OS
-# default (~2h on Linux) is too long to reap a silently-dead subscription promptly.
-keepalive_idle_secs = 60
-# Interval between TCP keepalive probes once they start, in seconds.
-keepalive_interval_secs = 15
+
+[server.limits]
 # Most connections served at once, across all clients. Each connection costs a few OS threads, so
 # this caps total server resources independent of any per-connection budget. A connection over the
 # cap is closed immediately, before a request is read. 0 = unlimited (an explicit opt-out).
 max_connections = 1024
+
+[server.keepalive]
+# TCP keepalive idle time before the first probe on an accepted connection, in seconds. The OS
+# default (~2h on Linux) is too long to reap a silently-dead subscription promptly.
+idle_secs = 60
+# Interval between TCP keepalive probes once they start, in seconds.
+interval_secs = 15
+
+[server.timeouts]
 # Seconds a partial request frame may take to finish once its first byte arrives, before the
 # connection is reaped. Defends against a slow-loris trickle (which a per-read socket timeout misses,
 # since it resets on every byte). Only ever touches a partial frame in flight, so a connection idling
 # silently at a frame boundary is unaffected. 0 disables it.
-incomplete_frame_timeout_secs = 30
+incomplete_frame_secs = 30
 # Seconds a freshly accepted connection may take to send its first complete frame before being
 # reaped. 0 disables it (the default). Off by default because a pooling client (such as the async
 # client's idle bulk sockets) legitimately opens a connection and sends nothing until its first read;
 # enable it only where clients do not hold connections open before using them.
-handshake_timeout_secs = 0
+handshake_secs = 0
 # Seconds a connection with no request in flight and no live subscription may sit idle before being
-# reaped. 0 disables it (the default), for the same pooling reason as handshake_timeout_secs.
-# Subscriptions and in-flight requests count as activity, so a long-lived subscription is never reaped.
-idle_timeout_secs = 0
+# reaped. 0 disables it (the default), for the same pooling reason as handshake_secs. Subscriptions
+# and in-flight requests count as activity, so a long-lived subscription is never reaped.
+idle_secs = 0
 
 [metrics]
 # Address for the Prometheus /metrics HTTP endpoint, on its own port. Omitted (disabled) by

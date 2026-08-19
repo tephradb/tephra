@@ -38,7 +38,7 @@ pub struct Args {
     #[argh(option, short = 'd')]
     pub data_dir: Option<String>,
 
-    /// tracing filter, overriding RUST_LOG (e.g. "info" or "tephra=debug")
+    /// tracing filter, overriding TEPHRA_LOG (e.g. "info" or "tephra=debug")
     #[argh(option, short = 'l')]
     pub log: Option<String>,
 
@@ -58,7 +58,7 @@ pub struct Settings {
     pub bind: String,
     /// Directory holding the log (and index) segment files.
     pub data_dir: String,
-    /// Tracing filter. `None` falls back to `RUST_LOG`, then to `info`.
+    /// Tracing filter. `None` falls back to `TEPHRA_LOG`, then to `info`.
     pub log: Option<String>,
     pub segment: SegmentSettings,
     pub writer: WriterSettings,
@@ -192,76 +192,159 @@ impl Default for ReadSettings {
     }
 }
 
-/// TCP server tuning: frame limit, streamed-read flush thresholds, subscription pacing, and
-/// TCP keepalive. Durations are expressed as integers with an explicit unit suffix so they
-/// stay natural TOML/env scalars (there is no bare `Duration` on the wire).
+/// TCP server tuning, grouped by concern into nested tables. Durations are expressed as integers
+/// with an explicit unit suffix so they stay natural TOML/env scalars (there is no bare `Duration`
+/// on the wire).
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSettings {
     /// Largest single frame accepted or produced, in bytes.
     pub max_frame_len: u32,
-    /// A streamed read (or subscription) is flushed as a frame once it holds this many events.
-    pub read_batch_events: usize,
-    /// A streamed read (or subscription) is flushed as a frame once its buffered events reach
-    /// this many bytes.
-    pub read_batch_bytes: usize,
-    /// How often an idle subscription's blocking wait wakes to re-check server shutdown, in
-    /// milliseconds. Keeps a subscription with no events flowing responsive to shutdown
-    /// without a heartbeat frame.
-    pub subscribe_wait_tick_ms: u64,
-    /// Per-connection in-flight budget, applied separately to appends and reads: this many appends
-    /// awaiting a reply (then the reader backpressures), and this many concurrent reads plus this
-    /// many queued for a slot (then a further read is rejected, never blocking the reader).
-    pub max_inflight_requests_per_conn: usize,
-    /// Most live subscriptions a single connection may hold at once; one over the limit is
-    /// rejected.
-    pub max_concurrent_subscriptions: usize,
-    /// Number of reusable worker threads in the shared read pool. 0 means auto: one per logical
-    /// CPU. Warm reads are short and CPU-bound, so one per core reaches the read-parallelism
-    /// ceiling; raise it for slow-client streaming-read workloads.
-    pub read_worker_threads: usize,
-    /// Depth of a connection's outbound bulk frame queue: read and subscription frames buffered
-    /// before a slow client applies backpressure. Small control frames use a separate priority lane.
-    pub frame_queue_depth: usize,
-    /// TCP keepalive idle time before the first probe on an accepted connection, in seconds.
-    /// The OS default (~2h on Linux) is too long to reap a silently-dead subscription
-    /// promptly.
-    pub keepalive_idle_secs: u64,
-    /// Interval between TCP keepalive probes once they start, in seconds.
-    pub keepalive_interval_secs: u64,
-    /// Most connections served at once, across all clients. A connection over the cap is closed
-    /// immediately, before any request is read. `0` means unlimited (an explicit opt-out).
-    pub max_connections: usize,
-    /// Seconds a partial request frame may take to finish once its first byte has arrived, before
-    /// the connection is reaped (slow-loris trickle defense). `0` disables it.
-    pub incomplete_frame_timeout_secs: u64,
-    /// Seconds a freshly accepted connection may take to send its first complete frame before being
-    /// reaped. `0` disables it (the default): a pooling client may hold a connection open before
-    /// its first request, so enable this only where clients do not.
-    pub handshake_timeout_secs: u64,
-    /// Seconds a connection with no request in flight and no live subscription may sit idle before
-    /// being reaped. `0` disables it (the default), for the same pooling reason as
-    /// `handshake_timeout_secs`.
-    pub idle_timeout_secs: u64,
+    pub reads: ReadsSettings,
+    pub subscriptions: SubscriptionsSettings,
+    pub backpressure: BackpressureSettings,
+    pub limits: LimitsSettings,
+    pub keepalive: KeepaliveSettings,
+    pub timeouts: TimeoutsSettings,
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
         ServerSettings {
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
-            read_batch_events: 1024,
-            read_batch_bytes: 512 * 1024,
-            subscribe_wait_tick_ms: 250,
-            max_inflight_requests_per_conn: 256,
-            max_concurrent_subscriptions: 64,
-            read_worker_threads: 0,
+            reads: ReadsSettings::default(),
+            subscriptions: SubscriptionsSettings::default(),
+            backpressure: BackpressureSettings::default(),
+            limits: LimitsSettings::default(),
+            keepalive: KeepaliveSettings::default(),
+            timeouts: TimeoutsSettings::default(),
+        }
+    }
+}
+
+/// Streamed-read flush thresholds and the shared read-worker pool.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReadsSettings {
+    /// A streamed read (or subscription) is flushed as a frame once it holds this many events.
+    pub batch_events: usize,
+    /// A streamed read (or subscription) is flushed as a frame once its buffered events reach this
+    /// many bytes.
+    pub batch_bytes: usize,
+    /// Reusable worker threads in the shared read pool. `0` means one per logical CPU.
+    pub worker_threads: usize,
+}
+
+impl Default for ReadsSettings {
+    fn default() -> Self {
+        ReadsSettings {
+            batch_events: 1024,
+            batch_bytes: 512 * 1024,
+            worker_threads: 0,
+        }
+    }
+}
+
+/// Live-subscription pacing and the per-connection subscription cap.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubscriptionsSettings {
+    /// How often an idle subscription's blocking wait wakes to re-check server shutdown, in
+    /// milliseconds.
+    pub wait_tick_ms: u64,
+    /// Most live subscriptions a single connection may hold at once; one over the limit is rejected.
+    pub max_concurrent: usize,
+}
+
+impl Default for SubscriptionsSettings {
+    fn default() -> Self {
+        SubscriptionsSettings {
+            wait_tick_ms: 250,
+            max_concurrent: 64,
+        }
+    }
+}
+
+/// Per-connection backpressure bounds.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackpressureSettings {
+    /// Per-connection in-flight budget, applied separately to appends and reads: this many appends
+    /// awaiting a reply (then the reader backpressures), and this many concurrent reads plus this
+    /// many queued for a slot (then a further read is rejected, never blocking the reader).
+    pub max_inflight_per_conn: usize,
+    /// Depth of a connection's outbound bulk frame queue: read and subscription frames buffered
+    /// before a slow client applies backpressure. Small control frames use a separate priority lane.
+    pub frame_queue_depth: usize,
+}
+
+impl Default for BackpressureSettings {
+    fn default() -> Self {
+        BackpressureSettings {
+            max_inflight_per_conn: 256,
             frame_queue_depth: 256,
-            keepalive_idle_secs: 60,
-            keepalive_interval_secs: 15,
+        }
+    }
+}
+
+/// Server-wide connection limits.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsSettings {
+    /// Most connections served at once, across all clients. A connection over the cap is closed
+    /// immediately, before any request is read. `0` means unlimited (an explicit opt-out).
+    pub max_connections: usize,
+}
+
+impl Default for LimitsSettings {
+    fn default() -> Self {
+        LimitsSettings {
             max_connections: 1024,
-            incomplete_frame_timeout_secs: 30,
-            handshake_timeout_secs: 0,
-            idle_timeout_secs: 0,
+        }
+    }
+}
+
+/// TCP keepalive timers.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeepaliveSettings {
+    /// Idle time before the first keepalive probe on an accepted connection, in seconds. The OS
+    /// default (~2h on Linux) is too long to reap a silently-dead subscription promptly.
+    pub idle_secs: u64,
+    /// Interval between keepalive probes once they start, in seconds.
+    pub interval_secs: u64,
+}
+
+impl Default for KeepaliveSettings {
+    fn default() -> Self {
+        KeepaliveSettings {
+            idle_secs: 60,
+            interval_secs: 15,
+        }
+    }
+}
+
+/// Connection-reaping timeouts, in seconds. `0` disables the corresponding reaper.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TimeoutsSettings {
+    /// A partial request frame must finish within this long once its first byte arrives, before the
+    /// connection is reaped (slow-loris trickle defense).
+    pub incomplete_frame_secs: u64,
+    /// A freshly accepted connection must send its first complete frame within this long. Off by
+    /// default: a pooling client may hold a connection open before its first request.
+    pub handshake_secs: u64,
+    /// A connection with no request in flight and no live subscription may sit idle this long. Off
+    /// by default, for the same pooling reason as `handshake_secs`.
+    pub idle_secs: u64,
+}
+
+impl Default for TimeoutsSettings {
+    fn default() -> Self {
+        TimeoutsSettings {
+            incomplete_frame_secs: 30,
+            handshake_secs: 0,
+            idle_secs: 0,
         }
     }
 }
@@ -290,23 +373,22 @@ impl Settings {
 
     /// The TCP server config.
     pub fn server_config(&self) -> ServerConfig {
+        let server = &self.server;
         ServerConfig {
-            max_frame_len: self.server.max_frame_len,
-            read_batch_events: self.server.read_batch_events,
-            read_batch_bytes: self.server.read_batch_bytes,
-            subscribe_wait_tick: Duration::from_millis(self.server.subscribe_wait_tick_ms),
-            max_inflight_requests_per_conn: self.server.max_inflight_requests_per_conn,
-            max_concurrent_subscriptions: self.server.max_concurrent_subscriptions,
-            read_worker_threads: self.server.read_worker_threads,
-            frame_queue_depth: self.server.frame_queue_depth,
-            keepalive_idle: Duration::from_secs(self.server.keepalive_idle_secs),
-            keepalive_interval: Duration::from_secs(self.server.keepalive_interval_secs),
-            max_connections: self.server.max_connections,
-            incomplete_frame_timeout: Duration::from_secs(
-                self.server.incomplete_frame_timeout_secs,
-            ),
-            handshake_timeout: Duration::from_secs(self.server.handshake_timeout_secs),
-            idle_timeout: Duration::from_secs(self.server.idle_timeout_secs),
+            max_frame_len: server.max_frame_len,
+            read_batch_events: server.reads.batch_events,
+            read_batch_bytes: server.reads.batch_bytes,
+            subscribe_wait_tick: Duration::from_millis(server.subscriptions.wait_tick_ms),
+            max_inflight_requests_per_conn: server.backpressure.max_inflight_per_conn,
+            max_concurrent_subscriptions: server.subscriptions.max_concurrent,
+            read_worker_threads: server.reads.worker_threads,
+            frame_queue_depth: server.backpressure.frame_queue_depth,
+            keepalive_idle: Duration::from_secs(server.keepalive.idle_secs),
+            keepalive_interval: Duration::from_secs(server.keepalive.interval_secs),
+            max_connections: server.limits.max_connections,
+            incomplete_frame_timeout: Duration::from_secs(server.timeouts.incomplete_frame_secs),
+            handshake_timeout: Duration::from_secs(server.timeouts.handshake_secs),
+            idle_timeout: Duration::from_secs(server.timeouts.idle_secs),
         }
     }
 
@@ -324,25 +406,25 @@ impl Settings {
         // A zero wait tick would make the subscription's bounded wait return immediately and
         // busy-spin; zero keepalive timers are meaningless. Reject rather than let either
         // degrade silently.
-        if self.server.subscribe_wait_tick_ms == 0 {
-            return Err("server.subscribe_wait_tick_ms must be at least 1".to_string());
+        if self.server.subscriptions.wait_tick_ms == 0 {
+            return Err("server.subscriptions.wait_tick_ms must be at least 1".to_string());
         }
         // A zero budget would wedge the connection (no request could ever acquire a permit); a
         // zero frame queue is a rendezvous channel, not the intended bound. Reject both.
-        if self.server.max_inflight_requests_per_conn == 0 {
-            return Err("server.max_inflight_requests_per_conn must be at least 1".to_string());
+        if self.server.backpressure.max_inflight_per_conn == 0 {
+            return Err("server.backpressure.max_inflight_per_conn must be at least 1".to_string());
         }
-        if self.server.max_concurrent_subscriptions == 0 {
-            return Err("server.max_concurrent_subscriptions must be at least 1".to_string());
+        if self.server.subscriptions.max_concurrent == 0 {
+            return Err("server.subscriptions.max_concurrent must be at least 1".to_string());
         }
-        if self.server.frame_queue_depth == 0 {
-            return Err("server.frame_queue_depth must be at least 1".to_string());
+        if self.server.backpressure.frame_queue_depth == 0 {
+            return Err("server.backpressure.frame_queue_depth must be at least 1".to_string());
         }
-        if self.server.keepalive_idle_secs == 0 {
-            return Err("server.keepalive_idle_secs must be at least 1".to_string());
+        if self.server.keepalive.idle_secs == 0 {
+            return Err("server.keepalive.idle_secs must be at least 1".to_string());
         }
-        if self.server.keepalive_interval_secs == 0 {
-            return Err("server.keepalive_interval_secs must be at least 1".to_string());
+        if self.server.keepalive.interval_secs == 0 {
+            return Err("server.keepalive.interval_secs must be at least 1".to_string());
         }
         // A certificate without a key (or the reverse) cannot serve TLS and is almost certainly a
         // mistake; reject it rather than silently fall back to plaintext.
@@ -526,15 +608,15 @@ mod tests {
         // A zero wait tick would busy-spin the subscription loop; zero keepalive timers are
         // meaningless. Each must be rejected at load time.
         let mut settings = Settings::default();
-        settings.server.subscribe_wait_tick_ms = 0;
+        settings.server.subscriptions.wait_tick_ms = 0;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.server.keepalive_idle_secs = 0;
+        settings.server.keepalive.idle_secs = 0;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.server.keepalive_interval_secs = 0;
+        settings.server.keepalive.interval_secs = 0;
         assert!(settings.validate().is_err());
     }
 
@@ -543,15 +625,15 @@ mod tests {
         // A zero budget would wedge a connection; a zero frame queue changes channel semantics.
         // Each must be rejected at load time rather than degrade at runtime.
         let mut settings = Settings::default();
-        settings.server.max_inflight_requests_per_conn = 0;
+        settings.server.backpressure.max_inflight_per_conn = 0;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.server.max_concurrent_subscriptions = 0;
+        settings.server.subscriptions.max_concurrent = 0;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.server.frame_queue_depth = 0;
+        settings.server.backpressure.frame_queue_depth = 0;
         assert!(settings.validate().is_err());
     }
 
