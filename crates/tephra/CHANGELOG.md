@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/tephradb/tephra/compare/tephra-v0.3.4...tephra-v0.3.5) - 2026-08-19
+
+### Other
+
+- point repository references at the tephradb/tephra org ([#27](https://github.com/tephradb/tephra/pull/27))
+
 ## [0.3.4](https://github.com/tephradb/tephra/compare/tephra-v0.3.3...tephra-v0.3.4) - 2026-08-17
 
 ### Added
