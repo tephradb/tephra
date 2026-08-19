@@ -6,7 +6,7 @@ description = "High-performance segment log with CRC-32 validation - optimized f
 edition = "2024"
 keywords = ["database", "event-sourcing", "event-store", "storage"]
 license = "Apache-2.0"
-version = "0.3.4"
+version = "0.3.5"
 rust-version = "1.95.0"
 repository.workspace = true
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/tephradb/tephra/compare/tephra-proto-v0.1.6...tephra-proto-v0.2.0) - 2026-08-19
+
+### Added
+
+- [**breaking**] authenticate connections with bearer tokens over a mandatory Hello handshake ([#28](https://github.com/tephradb/tephra/pull/28))
+- server-authenticated TLS over rustls (sync + async clients) ([#26](https://github.com/tephradb/tephra/pull/26))
+- *(server)* reap idle, slow-loris, and stalled connections on timeout ([#24](https://github.com/tephradb/tephra/pull/24))
+- *(server)* cap total concurrent connections with max_connections
+
+### Other
+
+- point repository references at the tephradb/tephra org ([#27](https://github.com/tephradb/tephra/pull/27))
+
 ## [0.1.6](https://github.com/tephradb/tephra/compare/tephra-proto-v0.1.5...tephra-proto-v0.1.6) - 2026-08-15
 
 ### Added
