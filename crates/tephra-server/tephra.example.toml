@@ -91,3 +91,9 @@ idle_timeout_secs = 0
 # Address for the Prometheus /metrics HTTP endpoint, on its own port. Omitted (disabled) by
 # default; set it to expose metrics, e.g. for scraping from an internal network only.
 # bind = "127.0.0.1:9100"
+
+[tls]
+# Server-authenticated TLS. Set both to a PEM certificate chain and its private key to serve TLS;
+# omit both (the default) to serve plaintext. Setting only one is a startup error.
+# cert = "server.crt"
+# key = "server.key"

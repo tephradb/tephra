@@ -25,8 +25,12 @@
 //! ```
 
 use std::collections::VecDeque;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+#[cfg(feature = "tls")]
+use std::sync::Arc;
+#[cfg(feature = "tls")]
+use std::time::{Duration, Instant};
 use std::{error, fmt};
 
 use tephra_proto::convert as wire;
@@ -53,11 +57,25 @@ pub use asynchronous::{
     SubscribeStream as AsyncSubscribeStream,
 };
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
 /// The request id the server uses for an error it cannot attribute to a specific request (an
 /// oversized or unparseable frame it rejected before decoding). Client request ids start at 1,
 /// so this sentinel never collides with a real one, and such an error is accepted as applying
 /// to the request currently in flight.
 const UNATTRIBUTED_REQUEST_ID: u64 = 0;
+
+/// The total wall-clock budget for a TLS handshake, so a server that accepts the TCP connection
+/// but stalls the handshake cannot hang the caller. Enforced across the whole handshake, not per
+/// syscall, so a slow-drip server cannot stretch it.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long each handshake socket read or write may block before the driver re-checks the total
+/// [`TLS_HANDSHAKE_TIMEOUT`] budget. Short enough that the deadline is honoured promptly.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_POLL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -272,10 +290,64 @@ impl From<io::Error> for ClientError {
 // Client
 // ---------------------------------------------------------------------------
 
+/// The read half of a client connection: a plaintext socket, or a TLS session's read half. A
+/// single-variant enum when the `tls` feature is off, so the plaintext path stays a direct call.
+enum Reader {
+    Plain(BufReader<TcpStream>),
+    #[cfg(feature = "tls")]
+    Tls(BufReader<tephra_proto::TlsReadHalf>),
+}
+
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Reader::Plain(reader) => reader.read(buf),
+            #[cfg(feature = "tls")]
+            Reader::Tls(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl Reader {
+    /// A raw-socket handle for out-of-band shutdown (a subscription cancel from another thread).
+    fn socket_handle(&self) -> io::Result<TcpStream> {
+        match self {
+            Reader::Plain(reader) => reader.get_ref().try_clone(),
+            #[cfg(feature = "tls")]
+            Reader::Tls(reader) => reader.get_ref().socket_handle(),
+        }
+    }
+}
+
+/// The write half of a client connection: a plaintext socket, or a TLS session's write half.
+enum Writer {
+    Plain(BufWriter<TcpStream>),
+    #[cfg(feature = "tls")]
+    Tls(BufWriter<tephra_proto::TlsWriteHalf>),
+}
+
+impl Write for Writer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Writer::Plain(writer) => writer.write(buf),
+            #[cfg(feature = "tls")]
+            Writer::Tls(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Writer::Plain(writer) => writer.flush(),
+            #[cfg(feature = "tls")]
+            Writer::Tls(writer) => writer.flush(),
+        }
+    }
+}
+
 /// A connection to a tephra server.
 pub struct Client {
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: Reader,
+    writer: Writer,
     next_id: u64,
     max_frame_len: u32,
 }
@@ -288,9 +360,58 @@ impl Client {
         let reader = BufReader::new(stream.try_clone()?);
         let writer = BufWriter::new(stream);
         Ok(Client {
-            reader,
-            writer,
+            reader: Reader::Plain(reader),
+            writer: Writer::Plain(writer),
             // Ids start at 1 so 0 stays reserved as the unattributed-error sentinel.
+            next_id: 1,
+            max_frame_len: DEFAULT_MAX_FRAME_LEN,
+        })
+    }
+
+    /// Connects to a server over TLS, verifying its certificate against `tls_config` (build one
+    /// with [`tls::config_with_native_roots`] or [`tls::config_with_custom_ca`]). `server_name` is
+    /// the name the certificate must match. The handshake runs before this returns.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<Client> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let name =
+            rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("tls: invalid server name: {err}"),
+                )
+            })?;
+        let session = rustls::ClientConnection::new(tls_config, name)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {err}")))?;
+        let mut conn: rustls::Connection = session.into();
+        // Bound the whole handshake by a total deadline so a server that accepts the TCP connection
+        // but stalls (or a black-hole/plaintext port) cannot hang the caller. The shared driver
+        // steps one socket syscall per iteration, re-checking the deadline before each and pacing
+        // each syscall by the short poll timeout, so even a slow-drip server is bounded. Socket
+        // options are shared across the clones below, so clear them before the request phase begins.
+        let started = Instant::now();
+        stream.set_read_timeout(Some(TLS_HANDSHAKE_POLL))?;
+        stream.set_write_timeout(Some(TLS_HANDSHAKE_POLL))?;
+        tephra_proto::tls::drive_handshake(
+            &mut conn,
+            &mut stream,
+            Some(TLS_HANDSHAKE_TIMEOUT),
+            started,
+        )?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        let read_sock = stream.try_clone()?;
+        let write_sock = stream.try_clone()?;
+        let session = tephra_proto::TlsConn::new(conn);
+        let (read_half, write_half) = session.split(read_sock, write_sock);
+        Ok(Client {
+            reader: Reader::Tls(BufReader::new(read_half)),
+            writer: Writer::Tls(BufWriter::new(write_half)),
             next_id: 1,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
         })
@@ -483,7 +604,7 @@ impl Client {
         // A clone of the socket for out-of-band cancellation: shutting it down unblocks the
         // stream's in-flight `read_frame`. Taken before borrowing the reader for the stream.
         let cancel = SubscribeCancel {
-            stream: self.reader.get_ref().try_clone()?,
+            stream: self.reader.socket_handle()?,
         };
         let stream = SubscribeStream {
             reader: &mut self.reader,
@@ -523,7 +644,7 @@ impl SubscribeCancel {
 /// re-armed caught-up markers) until the connection closes, the store shuts down, an error
 /// frame arrives, or a [`SubscribeCancel`] stops it.
 pub struct SubscribeStream<'a> {
-    reader: &'a mut BufReader<TcpStream>,
+    reader: &'a mut Reader,
     max_frame_len: u32,
     request_id: u64,
     buffered: VecDeque<SubEvent>,
@@ -610,7 +731,7 @@ impl Iterator for SubscribeStream<'_> {
 /// order, then ends; [`watermark`](ReadStream::watermark) is available once the stream has
 /// finished (it is carried on the terminating frame).
 pub struct ReadStream<'a> {
-    reader: &'a mut BufReader<TcpStream>,
+    reader: &'a mut Reader,
     max_frame_len: u32,
     request_id: u64,
     buffered: VecDeque<SequencedEvent>,

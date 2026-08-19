@@ -16,6 +16,8 @@ mod settings;
 
 use std::env;
 use std::error::Error;
+#[cfg(feature = "tls")]
+use std::path::Path;
 use std::process::{self, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,6 +119,19 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
         Some(addr) => server.with_metrics_addr(addr)?,
         None => server,
     };
+    #[cfg(feature = "tls")]
+    let server = match (&settings.tls.cert, &settings.tls.key) {
+        (Some(cert), Some(key)) => {
+            let tls = tephra_server::tls::build_server_config(Path::new(cert), Path::new(key))?;
+            tracing::info!("serving over tls");
+            server.with_tls(tls)
+        }
+        _ => server,
+    };
+    #[cfg(not(feature = "tls"))]
+    if settings.tls.cert.is_some() {
+        tracing::warn!("tls is configured but this binary was built without the tls feature");
+    }
     let shutdown = server.shutdown_handle();
 
     // SIGINT (Ctrl-C) and SIGTERM (the signal `docker stop`, systemd, and Kubernetes send)

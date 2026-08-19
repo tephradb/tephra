@@ -65,6 +65,7 @@ pub struct Settings {
     pub read: ReadSettings,
     pub server: ServerSettings,
     pub metrics: MetricsSettings,
+    pub tls: TlsSettings,
 }
 
 impl Default for Settings {
@@ -78,6 +79,7 @@ impl Default for Settings {
             read: ReadSettings::default(),
             server: ServerSettings::default(),
             metrics: MetricsSettings::default(),
+            tls: TlsSettings::default(),
         }
     }
 }
@@ -88,6 +90,17 @@ impl Default for Settings {
 pub struct MetricsSettings {
     /// Address for the `/metrics` HTTP endpoint, e.g. `127.0.0.1:9100`. `None` disables it.
     pub bind: Option<String>,
+}
+
+/// TLS transport. A certificate and key together enable TLS; both absent leaves the server
+/// plaintext. Exactly one set is a configuration error.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsSettings {
+    /// Path to the PEM certificate chain. Set with `key` to serve TLS.
+    pub cert: Option<String>,
+    /// Path to the PEM private key.
+    pub key: Option<String>,
 }
 
 /// Log-segment sizing options.
@@ -305,6 +318,11 @@ impl Settings {
         if self.server.keepalive_interval_secs == 0 {
             return Err("server.keepalive_interval_secs must be at least 1".to_string());
         }
+        // A certificate without a key (or the reverse) cannot serve TLS and is almost certainly a
+        // mistake; reject it rather than silently fall back to plaintext.
+        if self.tls.cert.is_some() != self.tls.key.is_some() {
+            return Err("tls.cert and tls.key must be set together".to_string());
+        }
         Ok(())
     }
 }
@@ -481,5 +499,22 @@ mod tests {
         let mut settings = Settings::default();
         settings.server.frame_queue_depth = 0;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn tls_cert_and_key_must_be_set_together() {
+        // Both unset (plaintext) and both set (TLS) are valid; exactly one is a misconfiguration.
+        let mut settings = Settings::default();
+        settings.tls.cert = Some("server.crt".to_string());
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.tls.key = Some("server.key".to_string());
+        assert!(settings.validate().is_err());
+
+        let mut settings = Settings::default();
+        settings.tls.cert = Some("server.crt".to_string());
+        settings.tls.key = Some("server.key".to_string());
+        assert!(settings.validate().is_ok());
     }
 }

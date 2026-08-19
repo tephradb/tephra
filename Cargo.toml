@@ -41,15 +41,19 @@ futures-core = "0.3"
 nix = "0.31"
 protobuf = "=4.35.1-release"
 protobuf-codegen = "=4.35.1-release"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-native-certs = "0.8"
 serde = "1"
 smallvec = "1"
 socket2 = "0.6.5"
 thiserror = "2"
 tokio = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # Dev
 criterion = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"

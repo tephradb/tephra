@@ -44,11 +44,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_core::Stream;
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(feature = "async-tls")]
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpStream, ToSocketAddrs, lookup_host};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
+#[cfg(feature = "async-tls")]
+use tokio_rustls::TlsConnector;
 use tokio_stream::StreamExt;
 
 use tephra_proto::convert as wire;
@@ -162,7 +165,38 @@ impl Conn {
         let stream = connect_any(addrs).await?;
         stream.set_nodelay(true)?;
         let (read_half, write_half) = stream.into_split();
+        Ok(Conn::spawn(read_half, write_half, config))
+    }
 
+    /// Connects one socket and completes a TLS handshake before spawning its tasks.
+    #[cfg(feature = "async-tls")]
+    async fn connect_tls(
+        addrs: &[SocketAddr],
+        server_name: ServerName<'static>,
+        connector: TlsConnector,
+        config: AsyncClientConfig,
+    ) -> io::Result<Conn> {
+        let stream = connect_any(addrs).await?;
+        stream.set_nodelay(true)?;
+        // Bound the handshake so a server that accepts the TCP connection but stalls cannot leave
+        // the connect future pending forever.
+        let tls = tokio::time::timeout(
+            crate::TLS_HANDSHAKE_TIMEOUT,
+            connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
+        let (read_half, write_half) = tokio::io::split(tls);
+        Ok(Conn::spawn(read_half, write_half, config))
+    }
+
+    /// Spawns the reader and writer tasks over an already-connected transport (plaintext or TLS) and
+    /// returns the multiplexed connection.
+    fn spawn<R, W>(read_half: R, write_half: W, config: AsyncClientConfig) -> Conn
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (out_tx, out_rx) = mpsc::channel(config.request_queue_depth.max(1));
         let shared = Arc::new(Shared {
             // Ids start at 1 so 0 stays reserved as the unattributed-error sentinel.
@@ -175,7 +209,7 @@ impl Conn {
         tokio::spawn(reader_task(read_half, Arc::clone(&shared)));
         tokio::spawn(writer_task(write_half, out_rx, shared.max_frame_len));
 
-        Ok(Conn { shared, out_tx })
+        Conn { shared, out_tx }
     }
 
     /// Acquires a permit from this connection's outstanding-request budget, awaiting at the
@@ -236,6 +270,56 @@ impl AsyncClient {
         for _ in 0..config.bulk_connections {
             let addrs = addrs.clone();
             dialing.spawn(async move { Conn::connect(&addrs, config).await });
+        }
+        let mut bulk = Vec::with_capacity(config.bulk_connections);
+        while let Some(joined) = dialing.join_next().await {
+            bulk.push(joined.map_err(io::Error::other)??);
+        }
+        Ok(AsyncClient {
+            control,
+            bulk: Arc::new(bulk),
+            next_bulk: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// Connects to a server over TLS with the default [`AsyncClientConfig`], verifying its
+    /// certificate against `tls_config` (build one with [`crate::tls::config_with_native_roots`] or
+    /// [`crate::tls::config_with_custom_ca`]). `server_name` is the name the certificate must match.
+    #[cfg(feature = "async-tls")]
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<AsyncClient> {
+        AsyncClient::connect_tls_with(addr, server_name, tls_config, AsyncClientConfig::default())
+            .await
+    }
+
+    /// [`connect_tls`](Self::connect_tls) with an explicit [`AsyncClientConfig`]. Each of the control
+    /// and bulk sockets completes its own TLS handshake, dialed concurrently.
+    #[cfg(feature = "async-tls")]
+    pub async fn connect_tls_with(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+        config: AsyncClientConfig,
+    ) -> io::Result<AsyncClient> {
+        let addrs: Vec<SocketAddr> = lookup_host(addr).await?.collect();
+        let name = ServerName::try_from(server_name.to_owned()).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tls: invalid server name: {err}"),
+            )
+        })?;
+        let connector = TlsConnector::from(tls_config);
+        let control =
+            Arc::new(Conn::connect_tls(&addrs, name.clone(), connector.clone(), config).await?);
+        let mut dialing = JoinSet::new();
+        for _ in 0..config.bulk_connections {
+            let addrs = addrs.clone();
+            let name = name.clone();
+            let connector = connector.clone();
+            dialing.spawn(async move { Conn::connect_tls(&addrs, name, connector, config).await });
         }
         let mut bulk = Vec::with_capacity(config.bulk_connections);
         while let Some(joined) = dialing.join_next().await {
@@ -480,8 +564,8 @@ impl AsyncClient {
 
 /// The writer task: drains outbound requests and writes them as frames, flushing once per burst
 /// so a pipeline of requests costs one syscall rather than one per frame.
-async fn writer_task(
-    write_half: OwnedWriteHalf,
+async fn writer_task<W: AsyncWrite + Unpin>(
+    write_half: W,
     mut out_rx: mpsc::Receiver<pb::Request>,
     max_frame_len: u32,
 ) {
@@ -510,7 +594,7 @@ async fn writer_task(
 
 /// The reader task: reads response frames and routes each by `request_id`. On EOF or a transport
 /// error it fails every still-waiting request so no caller hangs.
-async fn reader_task(mut read_half: OwnedReadHalf, shared: Arc<Shared>) {
+async fn reader_task<R: AsyncRead + Unpin>(mut read_half: R, shared: Arc<Shared>) {
     let max = shared.max_frame_len;
     let mut last_error: Option<String> = None;
     loop {
