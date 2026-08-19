@@ -24,6 +24,7 @@
 //! coordinator.shutdown();
 //! ```
 
+pub mod auth;
 mod conn;
 mod convert;
 #[cfg(feature = "metrics")]
@@ -253,6 +254,7 @@ pub struct Server {
     metrics_addr: Option<SocketAddr>,
     #[cfg(feature = "tls")]
     tls: Option<Arc<rustls::ServerConfig>>,
+    auth: Option<Arc<auth::AuthConfig>>,
 }
 
 impl Server {
@@ -279,6 +281,7 @@ impl Server {
             metrics_addr: None,
             #[cfg(feature = "tls")]
             tls: None,
+            auth: None,
         })
     }
 
@@ -288,6 +291,14 @@ impl Server {
     #[cfg(feature = "tls")]
     pub fn with_tls(mut self, tls_config: Arc<rustls::ServerConfig>) -> Server {
         self.tls = Some(tls_config);
+        self
+    }
+
+    /// Requires every connection to authenticate with a bearer token from `auth` (built by
+    /// [`auth::AuthConfig::new`]) in its opening Hello, before any request is served. Without this
+    /// the server accepts any connection (the Hello still runs, for protocol-version negotiation).
+    pub fn with_auth(mut self, auth: Arc<auth::AuthConfig>) -> Server {
+        self.auth = Some(auth);
         self
     }
 
@@ -343,10 +354,11 @@ impl Server {
             self.config.max_connections as u64,
         ));
 
-        // Snapshot the TLS acceptor before any field of `self` is moved below; each connection
-        // thread gets a cheap clone.
+        // Snapshot the TLS acceptor and auth config before any field of `self` is moved below;
+        // each connection thread gets a cheap clone.
         #[cfg(feature = "tls")]
         let tls_acceptor = self.tls.clone();
+        let auth = self.auth.clone();
 
         // Optional Prometheus endpoint on its own thread and port. Absent unless a metrics
         // address was bound, so a deployment that does not want it runs nothing extra.
@@ -463,6 +475,7 @@ impl Server {
             // even when no events flow and the socket is idle.
             let running = Arc::clone(&self.running);
             let read_pool = read_pool.sender();
+            let auth = auth.clone();
             #[cfg(feature = "tls")]
             let tls = tls_acceptor.clone();
             let thread = thread::Builder::new()
@@ -478,6 +491,7 @@ impl Server {
                         running,
                         read_pool,
                         &permit.0,
+                        auth,
                         #[cfg(feature = "tls")]
                         tls,
                     );

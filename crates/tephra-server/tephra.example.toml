@@ -97,3 +97,16 @@ idle_timeout_secs = 0
 # omit both (the default) to serve plaintext. Setting only one is a startup error.
 # cert = "server.crt"
 # key = "server.key"
+
+[auth]
+# Bearer-token authentication. With no tokens (the default) the server is open. Add one table per
+# accepted token; any of them authenticates a connection in its opening Hello. List several to
+# rotate without downtime: add the new token, roll clients over, then remove the old.
+# [[auth.tokens]]
+# token = "a-long-random-secret"
+# [[auth.tokens]]
+# token = "the-next-secret-during-rotation"
+#
+# Tokens are secrets, so by default they require TLS. Set this to permit them over a plaintext
+# listener, for a deployment that terminates TLS at a proxy or mesh in front of tephra.
+# allow_insecure = false

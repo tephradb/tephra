@@ -127,6 +127,7 @@ pub enum ErrorCode {
     BadRequest,
     Internal,
     Shutdown,
+    Unauthenticated,
     Unknown,
 }
 
@@ -140,6 +141,7 @@ impl From<pb::ErrorCode> for ErrorCode {
             pb::ErrorCode::BadRequest => ErrorCode::BadRequest,
             pb::ErrorCode::Internal => ErrorCode::Internal,
             pb::ErrorCode::Shutdown => ErrorCode::Shutdown,
+            pb::ErrorCode::Unauthenticated => ErrorCode::Unauthenticated,
             // The unspecified value and any code this build does not recognise (the wire
             // enum is an open i32) both decode to Unknown.
             _ => ErrorCode::Unknown,
@@ -158,6 +160,7 @@ impl ErrorCode {
             ErrorCode::BadRequest => pb::ErrorCode::BadRequest,
             ErrorCode::Internal => pb::ErrorCode::Internal,
             ErrorCode::Shutdown => pb::ErrorCode::Shutdown,
+            ErrorCode::Unauthenticated => pb::ErrorCode::Unauthenticated,
             ErrorCode::Unknown => pb::ErrorCode::Unspecified,
         }
     }
@@ -236,6 +239,7 @@ mod tests {
             ErrorCode::BadRequest,
             ErrorCode::Internal,
             ErrorCode::Shutdown,
+            ErrorCode::Unauthenticated,
             ErrorCode::Unknown,
         ] {
             assert_eq!(ErrorCode::from(code.to_pb()), code);

@@ -119,6 +119,15 @@ pub fn bad_request(message: impl fmt::Display) -> pb::ErrorResponse {
     resp
 }
 
+/// Builds an `UNAUTHENTICATED` error response for a connection that failed the Hello handshake
+/// (a non-Hello first frame, or a missing or invalid auth token).
+pub fn unauthenticated(message: impl fmt::Display) -> pb::ErrorResponse {
+    let mut resp = pb::ErrorResponse::new();
+    resp.set_code(pb::ErrorCode::Unauthenticated);
+    resp.set_message(message.to_string());
+    resp
+}
+
 /// Builds a `TOO_LARGE` error response for an oversized inbound frame.
 pub fn too_large(message: impl fmt::Display) -> pb::ErrorResponse {
     let mut resp = pb::ErrorResponse::new();

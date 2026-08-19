@@ -16,7 +16,6 @@ mod settings;
 
 use std::env;
 use std::error::Error;
-#[cfg(feature = "tls")]
 use std::path::Path;
 use std::process::{self, ExitCode};
 use std::sync::Arc;
@@ -25,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tephra::log::set::SegmentSet;
 use tephra::writer::WriteCoordinator;
 use tephra_server::Server;
+use tephra_server::auth::AuthConfig;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -49,7 +49,11 @@ fn main() -> ExitCode {
     // `--healthcheck` runs as a client, not a server: probe the configured bind address and
     // exit, without opening the store or standing up the listener.
     if args.healthcheck {
-        return match healthcheck::probe(&settings.bind) {
+        // Authenticate the probe with the first configured token, so a healthcheck against an
+        // auth-enabled server passes its opening Hello, and probe over TLS (pinning the configured
+        // certificate) when the server serves TLS.
+        let tls_cert = settings.tls.cert.as_deref().map(Path::new);
+        return match healthcheck::probe(&settings.bind, settings.first_auth_token(), tls_cert) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("healthcheck failed: {err}");
@@ -132,6 +136,16 @@ fn run(settings: Settings) -> Result<(), Box<dyn Error>> {
     if settings.tls.cert.is_some() {
         tracing::warn!("tls is configured but this binary was built without the tls feature");
     }
+    let server = match settings.auth_tokens() {
+        Some(tokens) => {
+            tracing::info!(
+                tokens = tokens.len(),
+                "requiring bearer-token authentication"
+            );
+            server.with_auth(Arc::new(AuthConfig::new(tokens)))
+        }
+        None => server,
+    };
     let shutdown = server.shutdown_handle();
 
     // SIGINT (Ctrl-C) and SIGTERM (the signal `docker stop`, systemd, and Kubernetes send)

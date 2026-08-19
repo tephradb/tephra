@@ -42,14 +42,12 @@ message ReadRequest {
   // bound: return matches before this position, descending; read from the tip by sending the
   // maximum position (`u64::MAX`), and `0` therefore returns nothing (before the first position).
   uint64 after = 2;
-  // Caps the number of matched events returned. Absent means unlimited (an old client, which
-  // never sets it, keeps the full-history behavior); explicit presence distinguishes a real
-  // cap of 0 (return nothing) from "no cap". Composes with `after` as a stateless pagination
-  // cursor: read a page, then read again with `after` set to the last position returned (the
-  // oldest, for a backward read).
+  // Caps the number of matched events returned. Absent means unlimited; explicit presence
+  // distinguishes a real cap of 0 (return nothing) from "no cap". Composes with `after` as a
+  // stateless pagination cursor: read a page, then read again with `after` set to the last
+  // position returned (the oldest, for a backward read).
   optional uint64 limit = 3;
-  // Read backwards: matched events descending by position, before the `after` cursor. Defaults
-  // to false, so an old client that never sets it keeps the forward, ascending behavior.
+  // Read backwards: matched events descending by position, before the `after` cursor.
   bool reverse = 4;
 }
 
@@ -123,6 +121,24 @@ message StatsResponse {
   uint64 connections_reaped = 10;
 }
 
+// The mandatory first frame on a connection: the client announces its protocol version and,
+// when authenticating, its bearer token. The server answers with a HelloAck or an error, and
+// accepts no other request until this succeeds.
+message Hello {
+  // The protocol version the client speaks. The single compatibility mechanism: the server
+  // rejects a version it does not support rather than relying on field-presence heuristics.
+  uint32 protocol_version = 1;
+  // The bearer token, present when the client is authenticating. Absent leaves the connection
+  // unauthenticated, which the server accepts only when it has no tokens configured.
+  optional string auth_token = 2;
+}
+
+// The reply to a successful Hello: the server's protocol version and crate version.
+message HelloAck {
+  uint32 protocol_version = 1;
+  string server_version = 2;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_CONFLICT = 1;
@@ -132,6 +148,8 @@ enum ErrorCode {
   ERROR_CODE_BAD_REQUEST = 5;
   ERROR_CODE_INTERNAL = 6;
   ERROR_CODE_SHUTDOWN = 7;
+  // The connection failed authentication: a missing or invalid token, or a non-Hello first frame.
+  ERROR_CODE_UNAUTHENTICATED = 8;
 }
 
 message ErrorResponse {
@@ -151,6 +169,7 @@ message Request {
     SubscribeRequest subscribe = 4;
     CancelRequest cancel = 5;
     StatsRequest stats = 6;
+    Hello hello = 7;
   }
 }
 
@@ -163,5 +182,6 @@ message Response {
     ErrorResponse error = 5;
     SubscribeCaughtUp caught_up = 6;
     StatsResponse stats = 7;
+    HelloAck hello_ack = 8;
   }
 }
