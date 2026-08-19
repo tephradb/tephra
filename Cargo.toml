@@ -55,5 +55,5 @@ tracing-subscriber = "0.3"
 
 # Dev
 criterion = "0.8"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"

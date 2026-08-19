@@ -35,7 +35,7 @@ impl TestCerts {
         cert.write_all(generated.cert.pem().as_bytes()).unwrap();
         cert.flush().unwrap();
         let mut key = NamedTempFile::new().unwrap();
-        key.write_all(generated.key_pair.serialize_pem().as_bytes())
+        key.write_all(generated.signing_key.serialize_pem().as_bytes())
             .unwrap();
         key.flush().unwrap();
         TestCerts { cert, key }
