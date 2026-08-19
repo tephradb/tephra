@@ -1016,8 +1016,10 @@ fn subscribe_streams_catch_up_then_live() {
     let mut positions = Vec::new();
     let mut caught_up = Vec::new();
 
-    // Catch-up phase: the two pre-appended events arrive in order.
-    while positions.len() < 2 {
+    // Catch-up phase: the two pre-appended events arrive in order, then a caught-up marker once
+    // the subscription drains to the live edge. Wait for that marker before appending the live
+    // events below, so those appends cannot race ahead of the live-edge signal and starve it.
+    while positions.len() < 2 || caught_up.is_empty() {
         match item_rx.recv().unwrap() {
             Ok(SubEvent::Event(ev)) => positions.push(ev.position().get()),
             Ok(SubEvent::CaughtUp(w)) => caught_up.push(w),
