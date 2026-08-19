@@ -79,10 +79,14 @@ RUN apt-get update \
     && rustup target add "${rust_target}" \
     && echo "${rust_target}" > /rust_target
 
+# On aarch64, GCC's default outline atomics call glibc's __getauxval, which musl lacks, so
+# jemalloc's configure atomics probe fails to link and the build aborts. -mno-outline-atomics
+# forces inline atomics; it is scoped to the aarch64 target and ignored on x86_64.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=tephra-cargo-registry \
     --mount=type=cache,target=/build/target,id=tephra-target-musl \
     rust_target="$(cat /rust_target)" \
     && export "CC_$(echo "${rust_target}" | tr - _)=musl-gcc" \
+    && case "${rust_target}" in aarch64-*) export CFLAGS_aarch64_unknown_linux_musl="-mno-outline-atomics" ;; esac \
     && cargo build --release --locked --target "${rust_target}" --bin tephra-server \
     && cp "target/${rust_target}/release/tephra-server" /usr/local/bin/tephra-server
 

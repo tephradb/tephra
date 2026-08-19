@@ -93,6 +93,9 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # jemalloc's atomics probe fails to link on aarch64-musl because GCC outline atomics call
+          # glibc's __getauxval; inline atomics avoid it. Scoped to that target, ignored elsewhere.
+          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
         run: cargo build --release --locked -p tephra-server --target ${{ matrix.target }}
 
       - name: Package archive
