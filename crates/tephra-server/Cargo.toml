@@ -24,6 +24,8 @@ protobuf.workspace = true
 rustls = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 socket2.workspace = true
@@ -39,9 +41,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 
 [features]
-default = ["metrics", "tls"]
+default = ["metrics", "tls", "jemalloc"]
 metrics = []
 tls = ["dep:rustls", "tephra-proto/tls"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 crash-points = ["tephra/crash-points"]
 
 [[bin]]

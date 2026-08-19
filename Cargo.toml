@@ -48,6 +48,8 @@ sha2 = "0.10"
 smallvec = "1"
 socket2 = "0.6.5"
 thiserror = "2"
+tikv-jemalloc-ctl = "0.6"
+tikv-jemallocator = "0.6"
 tokio = { version = "1", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio-stream = "0.1"

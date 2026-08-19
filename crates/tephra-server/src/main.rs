@@ -14,6 +14,10 @@
 mod healthcheck;
 mod settings;
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::env;
 use std::error::Error;
 use std::path::Path;
@@ -63,6 +67,11 @@ fn main() -> ExitCode {
     }
 
     init_tracing(&settings);
+
+    #[cfg(feature = "jemalloc")]
+    if let Err(err) = tikv_jemalloc_ctl::background_thread::write(true) {
+        tracing::warn!(%err, "failed to enable jemalloc background threads");
+    }
 
     match run(settings) {
         Ok(()) => ExitCode::SUCCESS,
