@@ -22,7 +22,6 @@ ctrlc.workspace = true
 flume = { workspace = true, features = ["select"] }
 protobuf.workspace = true
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -41,7 +40,7 @@ tokio-stream.workspace = true
 [features]
 default = ["metrics", "tls"]
 metrics = []
-tls = ["dep:rustls", "dep:rustls-pemfile", "tephra-proto/tls"]
+tls = ["dep:rustls", "tephra-proto/tls"]
 crash-points = ["tephra/crash-points"]
 
 [[bin]]

@@ -3,10 +3,12 @@
 //! CA server). Pass the result to [`Client::connect_tls`](crate::Client::connect_tls).
 
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
 
 /// A client configuration trusting the platform's native root certificate store.
@@ -29,16 +31,22 @@ pub fn config_with_native_roots() -> io::Result<Arc<ClientConfig>> {
 /// self-signed server certificate (the certificate is its own trust anchor) or a private CA.
 pub fn config_with_custom_ca(ca_pem: &Path) -> io::Result<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
-    let mut reader = BufReader::new(File::open(ca_pem).map_err(|err| {
+    let file = File::open(ca_pem).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("tls: open ca {}: {err}", ca_pem.display()),
         )
-    })?);
+    })?;
     let mut added = 0;
-    for cert in rustls_pemfile::certs(&mut reader) {
+    for cert in CertificateDer::pem_reader_iter(file) {
+        let cert = cert.map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tls: parse ca {}: {err}", ca_pem.display()),
+            )
+        })?;
         roots
-            .add(cert?)
+            .add(cert)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {err}")))?;
         added += 1;
     }
