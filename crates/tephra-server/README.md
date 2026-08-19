@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tephra-server.svg)](https://crates.io/crates/tephra-server)
 [![Documentation](https://docs.rs/tephra-server/badge.svg)](https://docs.rs/tephra-server)
-[![License](https://img.shields.io/crates/l/tephra-server.svg)](https://github.com/tqwewe/tephra/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/tephra-server.svg)](https://github.com/tephradb/tephra/blob/main/LICENSE)
 
 A synchronous, thread-per-connection TCP server exposing a
 [tephra](https://crates.io/crates/tephra) event store over the length-prefixed protobuf
@@ -47,4 +47,4 @@ surface, where every value shown is the built-in default.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/tephradb/tephra/blob/main/LICENSE).

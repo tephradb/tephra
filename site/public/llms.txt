@@ -23,6 +23,6 @@
 
 ## Source
 
-- [Repository](https://github.com/tqwewe/tephra)
+- [Repository](https://github.com/tephradb/tephra)
 - [Benchmark harness](https://github.com/tqwewe/event-store-benchmark/tree/fair-benchmarks-web-ui)
 - [Benchmark dashboard](https://event-store-benchmark.tqwewe.com)

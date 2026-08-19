@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tephra.svg)](https://crates.io/crates/tephra)
 [![Documentation](https://docs.rs/tephra/badge.svg)](https://docs.rs/tephra)
-[![License](https://img.shields.io/crates/l/tephra.svg)](https://github.com/tqwewe/tephra/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/tephra.svg)](https://github.com/tephradb/tephra/blob/main/LICENSE)
 
 A DCB-compliant, immutable event store with global ordering.
 
@@ -23,7 +23,7 @@ The log is the source of truth and everything else is derived. Data is written o
 updated and never deleted, keyed by a dense monotonic position assigned by the single writer.
 Indexes need no write-ahead log and no fsync on the write path, because they can be rebuilt by
 replaying the log. See
-[`ARCHITECTURE.md`](https://github.com/tqwewe/tephra/blob/main/ARCHITECTURE.md) for the full
+[`ARCHITECTURE.md`](https://github.com/tephradb/tephra/blob/main/ARCHITECTURE.md) for the full
 rationale and the alternatives that were rejected.
 
 ## Example
@@ -71,4 +71,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/tephradb/tephra/blob/main/LICENSE).

@@ -14,7 +14,7 @@ hero:
       icon: open-book
       variant: minimal
     - text: GitHub
-      link: https://github.com/tqwewe/tephra
+      link: https://github.com/tephradb/tephra
       icon: external
       variant: minimal
 ---
@@ -107,8 +107,8 @@ would need to be true before it starts.
 
 ```sh
 # Run the server, whichever way suits you (Docker, Nix, Cargo, or a prebuilt binary):
-docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
-nix run github:tqwewe/tephra
+docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tephradb/tephra:latest
+nix run github:tephradb/tephra
 cargo install tephra-server
 cargo binstall tephra-server   # no-compile: grabs a prebuilt binary from the GitHub releases
 

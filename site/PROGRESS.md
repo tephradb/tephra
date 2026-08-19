@@ -119,7 +119,7 @@ passes (every shown snippet is a compiled, run test).
 
 ## Flagged for the human
 
-- Repo URLs use `github.com/tqwewe/tephra` (the public repo; `dcbdb` was the old name). External
+- Repo URLs use `github.com/tephradb/tephra` (the public repo; `dcbdb` was the old name). External
   link checks pass only once that repo and the benchmark repo are public.
 - Every performance figure traces to the benchmark harness output (not committed to this repo) and
   carries hardware, storage, fsync latency, event size, run duration, and versions. No figure is

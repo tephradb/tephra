@@ -17,7 +17,7 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace.package]
-repository = "https://github.com/tqwewe/tephra"
+repository = "https://github.com/tephradb/tephra"
 
 [workspace.dependencies]
 # Internal crates
