@@ -30,7 +30,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 #[cfg(feature = "tls")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{error, fmt};
 
 use tephra_proto::convert as wire;
@@ -66,10 +66,16 @@ pub mod tls;
 /// to the request currently in flight.
 const UNATTRIBUTED_REQUEST_ID: u64 = 0;
 
-/// How long a TLS handshake may take before it is abandoned, so a server that accepts the TCP
-/// connection but stalls the handshake cannot hang the caller.
+/// The total wall-clock budget for a TLS handshake, so a server that accepts the TCP connection
+/// but stalls the handshake cannot hang the caller. Enforced across the whole handshake, not per
+/// syscall, so a slow-drip server cannot stretch it.
 #[cfg(feature = "tls")]
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long each handshake socket read or write may block before the driver re-checks the total
+/// [`TLS_HANDSHAKE_TIMEOUT`] budget. Short enough that the deadline is honoured promptly.
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_POLL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -371,7 +377,7 @@ impl Client {
         server_name: &str,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<Client> {
-        let stream = TcpStream::connect(addr)?;
+        let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         let name =
             rustls::pki_types::ServerName::try_from(server_name.to_owned()).map_err(|err| {
@@ -380,22 +386,28 @@ impl Client {
                     format!("tls: invalid server name: {err}"),
                 )
             })?;
-        let mut session = rustls::ClientConnection::new(tls_config, name)
+        let session = rustls::ClientConnection::new(tls_config, name)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("tls: {err}")))?;
-        // Bound the handshake so a server that accepts the TCP connection but stalls (or a
-        // black-hole/plaintext port) cannot hang the caller thread forever. Socket options are
-        // shared across the clones below, so clear them before the blocking request phase begins.
-        stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
-        stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
-        let mut handshake = stream.try_clone()?;
-        while session.is_handshaking() {
-            session.complete_io(&mut handshake)?;
-        }
+        let mut conn: rustls::Connection = session.into();
+        // Bound the whole handshake by a total deadline so a server that accepts the TCP connection
+        // but stalls (or a black-hole/plaintext port) cannot hang the caller. The shared driver
+        // steps one socket syscall per iteration, re-checking the deadline before each and pacing
+        // each syscall by the short poll timeout, so even a slow-drip server is bounded. Socket
+        // options are shared across the clones below, so clear them before the request phase begins.
+        let started = Instant::now();
+        stream.set_read_timeout(Some(TLS_HANDSHAKE_POLL))?;
+        stream.set_write_timeout(Some(TLS_HANDSHAKE_POLL))?;
+        tephra_proto::tls::drive_handshake(
+            &mut conn,
+            &mut stream,
+            Some(TLS_HANDSHAKE_TIMEOUT),
+            started,
+        )?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
         let read_sock = stream.try_clone()?;
         let write_sock = stream.try_clone()?;
-        let session = tephra_proto::TlsConn::new(session);
+        let session = tephra_proto::TlsConn::new(conn);
         let (read_half, write_half) = session.split(read_sock, write_sock);
         Ok(Client {
             reader: Reader::Tls(BufReader::new(read_half)),

@@ -15,6 +15,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::mem;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use rustls::Connection;
 
@@ -218,4 +219,99 @@ impl TlsWriteHalf {
             }
         }
     }
+}
+
+/// Drives a rustls handshake to completion on a blocking, timeout-bounded socket, one socket
+/// syscall per loop iteration so the total `deadline` (measured from `started`) is re-checked
+/// before every syscall.
+///
+/// This is deliberately not rustls's own `complete_io`: that helper loops internally, doing many
+/// reads per call, so a deadline checked only around it is evadable by a client that dribbles one
+/// byte per timeout to stretch the handshake without bound. Stepping one syscall at a time closes
+/// that gap on both the read and the write side, since a peer that stops reading mid-handshake is
+/// bounded here too.
+///
+/// `deadline` is the total budget (`None` means unbounded); `started` is when the connection was
+/// accepted, so time already spent before the handshake counts against it. The socket is expected
+/// to carry a read/write timeout, so a retryable error only surfaces after that timeout elapses,
+/// never as a busy-spin.
+pub fn drive_handshake(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    deadline: Option<Duration>,
+    started: Instant,
+) -> io::Result<()> {
+    // Only the handshake proper is bound by the deadline. All of our mandatory flights are queued
+    // while `is_handshaking()` is still true, so they flush inside this loop; the flight queued as
+    // it clears (the peer is authenticated by then) is handled best-effort below.
+    while conn.is_handshaking() {
+        check_deadline(deadline, started)?;
+        // Flush queued handshake output first, one write syscall at a time, so a peer that stops
+        // reading mid-handshake cannot park us in an unbounded write.
+        if conn.wants_write() {
+            match conn.write_tls(sock) {
+                Ok(_) => {}
+                Err(err) if is_retryable(&err) => {}
+                Err(err) => return Err(err),
+            }
+            continue;
+        }
+        // Nothing to send: read one batch of handshake input and process it.
+        match conn.read_tls(sock) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed during tls handshake",
+                ));
+            }
+            Ok(_) => {
+                conn.process_new_packets()
+                    .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
+            }
+            Err(err) if is_retryable(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    flush_final_flight(conn, sock)
+}
+
+/// Pushes whatever the session queued as `is_handshaking()` cleared: the client's own Finished
+/// (which the server is still blocked on), or on the server the optional NewSessionTicket flight.
+/// Best-effort and not bound by the handshake deadline: the peer is authenticated now, so a slow
+/// reader is handed to the request-phase writer rather than reaped, and any bytes left unsent here
+/// flush there under ordinary backpressure. In practice this flight is a few hundred bytes and
+/// clears in one write.
+fn flush_final_flight(conn: &mut Connection, sock: &mut TcpStream) -> io::Result<()> {
+    while conn.wants_write() {
+        match conn.write_tls(sock) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if is_retryable(&err) => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Returns `TimedOut` once `started.elapsed()` reaches `deadline`; a `None` deadline never trips.
+fn check_deadline(deadline: Option<Duration>, started: Instant) -> io::Result<()> {
+    if let Some(deadline) = deadline {
+        if started.elapsed() >= deadline {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "tls handshake exceeded its deadline",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a socket error should be retried within the handshake loop rather than surfaced. A
+/// would-block or timed-out read/write is retried so the loop re-checks the total deadline; an
+/// interrupted syscall (EINTR) is always retried.
+fn is_retryable(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    )
 }

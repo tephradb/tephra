@@ -44,9 +44,9 @@ use tephra::writer::{AppendError, WriteHandle};
 use tephra::{Event, Position};
 
 #[cfg(feature = "tls")]
-use rustls::ServerConnection;
+use rustls::{Connection, ServerConnection};
 #[cfg(feature = "tls")]
-use std::io::{Error, ErrorKind};
+use std::io::ErrorKind;
 #[cfg(feature = "tls")]
 use tephra_proto::TlsConn;
 use tephra_proto::tephra as pb;
@@ -376,13 +376,14 @@ fn serve_tls(
     // From here (≈ accept), so the handshake deadline and the first-frame deadline are one budget,
     // matching the plaintext path's accept-to-first-frame `handshake_timeout`.
     let conn_start = Instant::now();
-    let mut session = match ServerConnection::new(tls_config) {
+    let session = match ServerConnection::new(tls_config) {
         Ok(session) => session,
         Err(err) => {
             tracing::warn!(?peer, %err, "failed to start tls session");
             return;
         }
     };
+    let mut conn: Connection = session.into();
 
     // Bound both directions of the handshake so a client that connects but never finishes it cannot
     // pin a connection thread: reads bound a stalled or slow-drip client, writes bound a peer that
@@ -395,14 +396,18 @@ fn serve_tls(
     if let Err(err) = stream.set_write_timeout(Some(TIMEOUT_POLL_INTERVAL)) {
         tracing::warn!(?peer, %err, "failed to arm tls handshake write timeout");
     }
-    match drive_handshake(&mut session, &mut stream, deadline, conn_start) {
-        HandshakeOutcome::Done => {}
-        HandshakeOutcome::TimedOut => {
+    // The shared driver steps one socket syscall per iteration, re-checking `deadline` before each,
+    // so neither a slow-drip reader nor a peer that stops reading our flight can run past it.
+    if let Err(err) =
+        tephra_proto::tls::drive_handshake(&mut conn, &mut stream, deadline, conn_start)
+    {
+        if err.kind() == ErrorKind::TimedOut {
             stats.connections_reaped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(?peer, "reaping connection on timeout: tls handshake");
-            return;
+        } else {
+            tracing::debug!(?peer, %err, "tls handshake failed");
         }
-        HandshakeOutcome::Failed => return,
+        return;
     }
 
     // Handshake done. Clear the write timeout so the request-phase writer blocks on backpressure
@@ -435,7 +440,7 @@ fn serve_tls(
         tracing::warn!(?peer, %err, "failed to arm read timeout; this connection will not be reaped");
     }
 
-    let session = TlsConn::new(session);
+    let session = TlsConn::new(conn);
     let (reader, writer) = session.split(read_sock, write_sock);
     serve_over(
         Transport {
@@ -476,79 +481,6 @@ fn handshake_deadline(config: &ServerConfig) -> Option<Duration> {
     ]
     .into_iter()
     .find(|timeout| !timeout.is_zero())
-}
-
-/// The result of driving a TLS handshake to a conclusion.
-#[cfg(feature = "tls")]
-enum HandshakeOutcome {
-    /// The handshake completed.
-    Done,
-    /// The wall-clock deadline lapsed; the caller reaps the connection.
-    TimedOut,
-    /// A transport or protocol error ended it (already logged).
-    Failed,
-}
-
-/// Drives the TLS handshake with one socket read or write per step so the wall-clock deadline is
-/// re-checked between syscalls (rustls's `complete_io` loops internally, letting a slow-drip client
-/// evade a deadline checked only between its calls). Each read is paced by the socket read timeout
-/// and each write by the write timeout, so neither a stalled reader nor a stalled writer runs past
-/// `deadline`.
-#[cfg(feature = "tls")]
-fn drive_handshake(
-    session: &mut ServerConnection,
-    stream: &mut TcpStream,
-    deadline: Option<Duration>,
-    started: Instant,
-) -> HandshakeOutcome {
-    while session.is_handshaking() {
-        if let Some(deadline) = deadline
-            && started.elapsed() > deadline
-        {
-            return HandshakeOutcome::TimedOut;
-        }
-        // Flush the pending handshake flight; a peer that stopped reading would-blocks here (bounded
-        // by the write timeout), so break to re-check the deadline rather than block indefinitely.
-        while session.wants_write() {
-            match session.write_tls(stream) {
-                Ok(_) => {}
-                Err(ref err) if is_would_block(err) => break,
-                Err(err) => {
-                    tracing::debug!(%err, "tls handshake write failed");
-                    return HandshakeOutcome::Failed;
-                }
-            }
-        }
-        if !session.is_handshaking() {
-            break;
-        }
-        // One read into the session; the poll-interval timeout paces it so the deadline is checked
-        // within an interval of the socket going quiet.
-        match session.read_tls(stream) {
-            Ok(0) => {
-                tracing::debug!("peer closed during tls handshake");
-                return HandshakeOutcome::Failed;
-            }
-            Ok(_) => {
-                if let Err(err) = session.process_new_packets() {
-                    tracing::debug!(%err, "tls handshake failed");
-                    return HandshakeOutcome::Failed;
-                }
-            }
-            Err(ref err) if is_would_block(err) => {}
-            Err(err) => {
-                tracing::debug!(%err, "tls handshake read failed");
-                return HandshakeOutcome::Failed;
-            }
-        }
-    }
-    HandshakeOutcome::Done
-}
-
-/// Whether an I/O error is a timeout or would-block (the socket's read/write deadline firing).
-#[cfg(feature = "tls")]
-fn is_would_block(err: &Error) -> bool {
-    err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut
 }
 
 /// The shared per-connection context handed to workers. Cheap to clone (handles and `Arc`s).
