@@ -14,6 +14,7 @@ export default defineConfig({
       title: "Tephra",
       description:
         "An immutable event store with global ordering, built for the Dynamic Consistency Boundary.",
+      favicon: "/favicon.ico",
       logo: {
         src: "./src/assets/tephra-mark.png",
         alt: "Tephra",
