@@ -25,7 +25,7 @@ seglog = { path = "crates/seglog", version = "0.3.5" }
 tephra = { path = "crates/tephra", version = "0.3.5" }
 tephra-client = { path = "crates/tephra-client", version = "0.5.0" }
 tephra-proto = { path = "crates/tephra-proto", version = "0.2.0" }
-tephra-server = { path = "crates/tephra-server", version = "0.4.0" }
+tephra-server = { path = "crates/tephra-server", version = "0.4.1" }
 tephra-types = { path = "crates/tephra-types", version = "0.1.4" }
 
 # Third-party
