@@ -14,6 +14,27 @@ export default defineConfig({
       title: "Tephra",
       description:
         "An immutable event store with global ordering, built for the Dynamic Consistency Boundary.",
+      logo: {
+        src: "./src/assets/tephra-mark.png",
+        alt: "Tephra",
+      },
+      head: [
+        {
+          tag: "link",
+          attrs: { rel: "apple-touch-icon", sizes: "180x180", href: "/apple-touch-icon.png" },
+        },
+        {
+          tag: "meta",
+          attrs: { property: "og:image", content: "https://tephra.tqwewe.com/og.png" },
+        },
+        { tag: "meta", attrs: { property: "og:image:width", content: "1200" } },
+        { tag: "meta", attrs: { property: "og:image:height", content: "630" } },
+        { tag: "meta", attrs: { name: "twitter:card", content: "summary_large_image" } },
+        {
+          tag: "meta",
+          attrs: { name: "twitter:image", content: "https://tephra.tqwewe.com/og.png" },
+        },
+      ],
       social: [
         {
           icon: "github",

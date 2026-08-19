@@ -4,6 +4,9 @@ description: An immutable event store with global ordering, built for the Dynami
 template: splash
 hero:
   tagline: An immutable event store with global ordering, built for the Dynamic Consistency Boundary.
+  image:
+    alt: The Tephra logo, a low-poly volcanic shard
+    file: ../../assets/tephra.png
   actions:
     - text: Get started
       link: getting-started/
@@ -26,13 +29,13 @@ import heroRaw from '../../../tephra-site-examples/tests/landing.rs?raw';
 ## At a glance
 
 <CardGrid>
-  <Card title="A 2 MB static binary" icon="server">
-    One self-contained musl binary, about 2 MB, with no JVM and no runtime dependencies. Copy it to
-    any Linux host and run it.
+  <Card title="A ~4 MB static binary" icon="server">
+    One self-contained musl binary, about 4 MB with TLS and jemalloc built in, no JVM and no runtime
+    dependencies. Copy it to any Linux host and run it.
   </Card>
   <Card title="Group commit" icon="rocket">
-    One fsync per batch, so batch size is the throughput dial: 796,724 conditional appends per second
-    on one box, batched, against a few thousand unbatched.
+    One fsync per batch, so batch size is the throughput dial: batching lifts conditional appends by
+    two orders of magnitude over committing one at a time.
   </Card>
   <Card title="Dynamic Consistency Boundary" icon="approve-check-circle">
     One query reads exactly the events a decision depends on and guards the append that records it.
@@ -94,11 +97,10 @@ exactly the cross-entity conditions the store exists to check. You scale by runn
 bounded contexts, not by splitting one.
 
 The ceiling is fsync, not ordering. Throughput is set by how many writes coalesce into one
-group-committed fsync. On one Hetzner box (AMD EPYC-Milan, ext4 SSD, about 1.15 ms fsync,
-256-byte events, 16 concurrent writers) the same build records 6,464 conditional appends per
-second when each commits on its own and 796,724 events per second when they batch 512 at a time,
-which is the same disk and the same code separated by two orders of magnitude. Batch, and measure
-on the storage you will actually run on.
+group-committed fsync: on the same disk and the same code, batching conditional appends lifts
+throughput by about two orders of magnitude over committing one at a time. Batch, and measure on
+the storage you will actually run on. The [Operations](operations/) page carries the measured
+figures with their full hardware conditions.
 
 Single node. Replication is not built. See [Status](status/) for what is deferred and what
 would need to be true before it starts.
