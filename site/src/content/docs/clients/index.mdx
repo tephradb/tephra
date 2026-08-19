@@ -1,0 +1,67 @@
+---
+title: Clients
+description: The official Tephra clients for Rust, Go, and JavaScript, and the design they share.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Tephra speaks one protocol: length-prefixed protobuf over TCP. Three official clients implement it,
+and because they share the wire format they share a shape. Pick the one for your language; the
+concepts, method names, and error model line up across all three.
+
+- [Go](/clients/go/) (`tephra-go`): a concurrent-safe client built on the standard library.
+- [JavaScript](/clients/javascript/) (`@tephradb/client`): an async client for Node.js, zero dependencies.
+- [Rust](/clients/rust/) (`tephra-client`): a blocking `Client` and, behind a feature, an async one.
+
+## What they share
+
+Each client (except the Rust blocking `Client`) is a single, concurrent-safe handle that multiplexes
+many requests over one control socket plus a pool of four bulk read sockets. Appends and stats ride
+the control lane; reads and subscriptions spread across the bulk pool. Splitting the lanes keeps a
+large read response from delaying a small append, and each stream buffers its own frames so a slow
+consumer applies backpressure without stalling the shared socket.
+
+Every connection opens with a mandatory `Hello` handshake that negotiates the protocol version, so a
+version mismatch fails the connect rather than a later request. TLS (1.3, server-authenticated) and
+bearer-token authentication are supported by all three; a bad or missing token fails the connect up
+front. None of the clients retries or reconnects on its own: a durable failure surfaces as a typed
+error and leaves the policy to you. See [transport security and
+authentication](/operations/#transport-security-and-authentication) for the server side.
+
+## Install
+
+<Tabs>
+  <TabItem label="Go">
+    ```sh
+    go get github.com/tephradb/tephra-go
+    ```
+  </TabItem>
+  <TabItem label="JavaScript">
+    ```sh
+    npm install @tephradb/client
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```sh
+    cargo add tephra-client
+    ```
+  </TabItem>
+</Tabs>
+
+## Operation reference
+
+The full protocol is available in every client. The method names differ only by each language's
+casing convention.
+
+| Operation | Go | JavaScript | Rust |
+|---|---|---|---|
+| Connect | `tephra.Dial` | `Client.connect` | `Client::connect` |
+| Append | `Append` | `append` | `append` |
+| Read, forward | `Read` / `ReadAll` | `read` / `readAll` | `read` / `read_all` |
+| Read, newest-first | `ReadBack` / `ReadAllBack` | `readBack` / `readAllBack` | `read_back` / `read_all_back` |
+| Subscribe | `Subscribe` | `subscribe` | `subscribe` |
+| Server stats | `Stats` | `stats` | `stats` |
+
+Append conditions (the dynamic consistency boundary guard), forward and backward pagination via
+`after`/`before` and a `limit`, TLS, and bearer tokens work the same way in each. The pages below
+show the idiomatic form for each language.

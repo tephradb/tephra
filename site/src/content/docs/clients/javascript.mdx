@@ -1,0 +1,194 @@
+---
+title: JavaScript client
+description: Connect, append, read, and subscribe from Node.js with @tephradb/client.
+---
+
+`@tephradb/client` is the official JavaScript and TypeScript client. It is a single, concurrent-safe
+`Client` that multiplexes requests over a control socket and a pool of bulk read sockets, built on
+Node's `net` and `tls` with no runtime dependencies.
+
+```sh
+npm install @tephradb/client
+```
+
+Requires Node.js 18 or newer and a Tephra server on 0.4 or above, which speaks the mandatory `Hello`
+handshake this client opens with.
+
+## Quick start
+
+`Client.connect` dials the control and bulk sockets and runs the handshake on each; `close` shuts
+them all down.
+
+```ts
+import { Client, Event, Query, ZERO } from "@tephradb/client";
+
+const client = await Client.connect("127.0.0.1:9000");
+try {
+  const event = Event.create("CourseOpened", ["course:c1"], new TextEncoder().encode(`{"seats":30}`));
+  await client.append([event]);
+
+  const { events, watermark } = await client.readAll(Query.all(), ZERO);
+  for (const seq of events) {
+    console.log(`${seq.position} ${seq.event.type}`);
+  }
+} finally {
+  await client.close();
+}
+```
+
+`Event.create` validates the type and tags exactly as the server does, and holds the payload as a
+`Uint8Array`. A `Position` is a `bigint`; `ZERO` is the start cursor and `MAX` is the "from the tip"
+cursor for a backward read. The event and query model is the same across every client; [Core
+concepts](/core-concepts/) is the precise definition.
+
+## Append with a condition
+
+An `AppendCondition` is a dynamic consistency boundary: the append is rejected if any event matching
+the query already exists after its `after` position. `after` defaults to `ZERO`, which considers the
+whole log, the uniqueness-guard pattern.
+
+```ts
+import { AppendCondition, ErrorCode, Event, Query, QueryItem, ServerError } from "@tephradb/client";
+
+const guard = AppendCondition.create(Query.items(QueryItem.withTags("email:a@example.com")));
+const event = Event.create("Registered", ["email:a@example.com"], new Uint8Array());
+
+try {
+  await client.append([event], guard);
+} catch (err) {
+  if (err instanceof ServerError && err.code === ErrorCode.Conflict) {
+    console.log("email already registered");
+  } else {
+    throw err;
+  }
+}
+```
+
+See [Handling conflicts](/guides/conflicts/) for the retry contract on a same-batch versus a durable
+conflict.
+
+## Reads and pagination
+
+`read` returns a `ReadStream`, an async iterable; drive it with `for await`, then read its
+`watermark` once it ends. `readAll` drains one into an array. `readBack` and `readAllBack` are the
+newest-first duals.
+
+`after` (exclusive) and `limit` compose into a stateless pagination cursor:
+
+```ts
+let cursor = ZERO;
+for (;;) {
+  const page = await client.readAll(query, cursor, 100);
+  if (page.events.length === 0) {
+    break;
+  }
+  for (const seq of page.events) {
+    handle(seq);
+  }
+  cursor = page.events[page.events.length - 1].position; // next page resumes here, no gap or duplicate
+}
+```
+
+A streaming read consumes incrementally:
+
+```ts
+for await (const seq of client.read(Query.all(), ZERO)) {
+  console.log(`${seq.position} ${seq.event.type}`);
+}
+```
+
+## Subscriptions
+
+`subscribe` catches up on matching events, then tails new ones live, delivering a caught-up marker
+each time it reaches the live edge.
+
+```ts
+import { isCaughtUp } from "@tephradb/client";
+
+const subscription = client.subscribe(Query.all(), ZERO);
+for await (const item of subscription) {
+  if (isCaughtUp(item)) {
+    continue;
+  }
+  handle(item.event);
+}
+```
+
+Cancel a stream by calling `close`, by passing an `AbortSignal` and aborting it, or by breaking out
+of the `for await` loop. Each sends a best-effort cancel so the server stops producing frames. Every
+operation also accepts an `AbortSignal` for cancellation and deadlines.
+
+## Server stats
+
+`stats` returns a point-in-time snapshot with `bigint` counters: the event, segment, and
+on-disk-byte counts, uptime, and the live connection and subscription counts.
+
+```ts
+const stats = await client.stats();
+console.log(`${stats.eventCount} events across ${stats.segmentCount} segments`);
+```
+
+## TLS
+
+The server can serve TLS 1.3 (server-authenticated). Enable it with the `tls` option, which passes
+through to Node's `tls.connect`. `servername` defaults to the dial host, so a hostname certificate
+needs no extra configuration.
+
+```ts
+import { readFileSync } from "node:fs";
+
+// Verify against the system roots (a public CA):
+const client = await Client.connect("tephra.example.com:9000", { tls: true });
+
+// Or trust a private CA, and optionally present a client certificate for mutual TLS:
+const client = await Client.connect("tephra.internal:9000", {
+  tls: {
+    ca: readFileSync("ca.pem"),
+    cert: readFileSync("client.pem"),
+    key: readFileSync("client-key.pem"),
+  },
+});
+```
+
+## Authentication
+
+When the server requires bearer tokens, pass one with `authToken`; it is carried in each socket's
+`Hello`. A missing or rejected token fails the connect with a `ServerError` whose `code` is
+`ErrorCode.Unauthenticated`, rather than on the first request. Pair it with `tls` so the token is not
+sent in the clear; a plaintext token is accepted only by a server explicitly configured to allow it.
+
+```ts
+const client = await Client.connect("tephra.example.com:9000", {
+  tls: true,
+  authToken: process.env.TEPHRA_TOKEN,
+});
+```
+
+## Options
+
+`Client.connect` takes an options object; the defaults mirror the reference Rust client.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `bulkConnections` | 4 | Dedicated bulk sockets for reads and subscriptions. `0` folds reads onto the control socket. |
+| `maxInflightRequests` | 1024 | Outstanding requests per socket before backpressure. |
+| `requestQueueDepth` | 256 | Outbound queue depth per socket. |
+| `maxFrameLen` | 16 MiB | Largest frame accepted or produced. |
+| `connectTimeout` | none | Bounds the dial, in milliseconds. |
+| `tls` | off | `true` for the system roots, or an object for a private CA, mutual TLS, or a custom `minVersion`. |
+| `authToken` | none | Bearer token presented in each socket's `Hello`. |
+| `signal` | none | An `AbortSignal` that aborts the connect. |
+
+## Errors
+
+The client throws typed errors, all extending `TephraError`. It performs no automatic retries or
+reconnection.
+
+- `ServerError`: the server returned an error. `code` is an `ErrorCode`, `retryable` marks an
+  advisory same-batch append conflict, and `conflictPosition` is set for a durable one.
+- `ProtocolError`: the peer sent something outside the protocol.
+- `ConnError`: the connection failed with requests in flight; every one is failed with it rather
+  than left hanging. The cause is on `cause`.
+- `FrameTooLargeError`: a frame exceeded the configured maximum (`length` and `max` report the sizes).
+- `ValidationError`: an event type or tag failed validation before it reached the wire.
+- `ClosedError`: the client was closed.

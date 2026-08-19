@@ -18,6 +18,26 @@ embedding gets its own page (`embedded.mdx`) rather than appearing alongside the
 - Why: it matches how the store is actually deployed, and it keeps the least ergonomic corner of
   the API (opening a `SegmentSet`) off the first page a reader hits.
 
+### Clients section and config refresh (2026-08-19)
+
+A `Clients` sidebar group was added: an overview plus one page per language (Go, JavaScript, Rust,
+alphabetical). Getting-started stays the canonical Rust walkthrough (compiled snippets); the client
+pages give each language a self-contained quickstart and reference, adapted from each repo's own
+README/examples in the site voice.
+
+- The Rust page reuses the compiled anchors in `tephra-site-examples/tests/getting_started.rs`
+  (a new `stats` anchor was added there) plus a few plain snippets for the async, TLS, and auth
+  paths that need a live server or feature flags.
+- Go and JavaScript snippets are hand-mirrored from each client repo's committed, tested examples,
+  not compiled by this repo's Rust-only examples harness. No cross-repo test harness was added.
+- Operations was refreshed for drift: the `[server]` config block now shows all fields plus
+  `[metrics]`, and new "Connection limits and reaping" and "Monitoring" (healthcheck, stats,
+  `/metrics`) sections and a signals note on shutdown were added.
+- Server settings were regrouped into nested `[server.*]` sub-tables (`reads`, `subscriptions`,
+  `backpressure`, `limits`, `keepalive`, `timeouts`) and the `RUST_LOG` fallback renamed to
+  `TEPHRA_LOG`. Both are breaking config changes, committed as `feat!`; server-only, no client or
+  wire impact.
+
 ### Engine changes made to support the docs
 
 - Added crate-root re-exports so `tephra::{SegmentSet, SegmentConfig}` resolve (they were only at
@@ -106,6 +126,10 @@ passes (every shown snippet is a compiled, run test).
 | index (landing) | yes | build |
 | introduction | yes | build |
 | getting-started | yes | build |
+| clients (overview) | yes | build |
+| clients/go | yes | build |
+| clients/javascript | yes | build |
+| clients/rust | yes | build |
 | embedded | yes | build |
 | core-concepts | yes | build |
 | guides/decision-models | yes | build |

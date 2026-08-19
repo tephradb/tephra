@@ -112,12 +112,19 @@ nix run github:tephradb/tephra
 cargo install tephra-server
 cargo binstall tephra-server   # no-compile: grabs a prebuilt binary from the GitHub releases
 
-# Then talk to it with the client:
+# Then talk to it with a client. Go:
+go get github.com/tephradb/tephra-go
+# JavaScript:
+npm install @tephradb/client
+# Rust:
 cargo add tephra-client
 
 # Or embed the engine directly in a Rust process:
 cargo add tephra
 ```
+
+Official clients for Go, JavaScript, and Rust all speak the same protocol; see
+[Clients](clients/).
 
 Next: read the [Introduction](introduction/) for what a Dynamic Consistency Boundary is and the
 problem it removes, or jump to [Getting started](getting-started/) to run the server and append

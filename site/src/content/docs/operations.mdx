@@ -11,8 +11,11 @@ happens on a crash.
 The server resolves its settings from, in increasing precedence, built-in defaults, a TOML file
 passed with `--config`, `TEPHRA__*` environment variables, and the command-line flags. The flags
 carry only `--bind`, `--data-dir`, and `--log`; everything else lives in the file or the
-environment. A key like `writer.max_batch_bytes` is the environment variable
-`TEPHRA__WRITER__MAX_BATCH_BYTES`.
+environment. Each config key maps to an environment variable by upper-casing it and joining the
+path with a double underscore, so `writer.max_batch_bytes` is `TEPHRA__WRITER__MAX_BATCH_BYTES` and
+the nested `server.keepalive.idle_secs` is `TEPHRA__SERVER__KEEPALIVE__IDLE_SECS`. The tracing
+filter is the exception: set it with `--log`, the `log` key, or the `TEPHRA_LOG` environment
+variable (single underscore), and it falls back to `info`.
 
 Every value below is the built-in default, so an empty config behaves exactly like no config. The
 full annotated file ships as `tephra.example.toml`.
@@ -35,16 +38,35 @@ condition_force_scan = false
 scan_bias = 4              # index only when the range is >= 4x the estimated result
 
 [server]
-max_frame_len = 16777216           # 16 MiB
-read_batch_events = 1024
-read_batch_bytes = 524288           # 512 KiB
-subscribe_wait_tick_ms = 250
-max_inflight_requests_per_conn = 256 # per-conn budget, applied separately to appends and reads
-max_concurrent_subscriptions = 64   # live subscriptions per connection (excess is rejected)
-read_worker_threads = 0             # shared read pool size; 0 = one worker per logical CPU
+max_frame_len = 16777216            # 16 MiB
+
+[server.reads]
+batch_events = 1024
+batch_bytes = 524288                # 512 KiB
+worker_threads = 0                  # shared read pool size; 0 = one worker per logical CPU
+
+[server.subscriptions]
+wait_tick_ms = 250
+max_concurrent = 64                 # live subscriptions per connection (excess is rejected)
+
+[server.backpressure]
+max_inflight_per_conn = 256         # per-conn budget, applied separately to appends and reads
 frame_queue_depth = 256             # buffered bulk read frames before backpressure (control lane is separate)
-keepalive_idle_secs = 60
-keepalive_interval_secs = 15
+
+[server.limits]
+max_connections = 1024              # total concurrent connections; 0 = unlimited
+
+[server.keepalive]
+idle_secs = 60
+interval_secs = 15
+
+[server.timeouts]
+incomplete_frame_secs = 30          # slow-loris trickle defence; 0 disables
+handshake_secs = 0                  # first-frame deadline; 0 disables (default, for pooling clients)
+idle_secs = 0                       # idle-connection reaper; 0 disables (default)
+
+[metrics]
+# bind = "127.0.0.1:9100"           # Prometheus /metrics on its own port; omitted disables it
 ```
 
 The 256 MiB segment size is the server's default. There is no library-level default: an embedded
@@ -140,29 +162,77 @@ caller slowing to the rate the store can make durable. Batch size grows automati
 latency rises, because a slower disk lets more requests accumulate between syncs.
 
 The network server adds per-connection bounds. A connection serves its requests concurrently and out
-of order, with responses demultiplexed by request id. `max_inflight_requests_per_conn` is applied
-separately to appends and reads. Appends: this many may await their durable reply before the reader
+of order, with responses demultiplexed by request id. `server.backpressure.max_inflight_per_conn`
+is applied separately to appends and reads. Appends: this many may await their durable reply before the reader
 backpressures (an append never blocks behind reads, so it cannot strand a cancel for them). Reads:
 this many run concurrently, plus this many more may queue for a slot without ever blocking the reader,
 and a read past both is rejected, so a read never strands a cancel behind it. (A saturated append
 budget, or a client that has stopped reading its socket, still applies ordinary backpressure that can
 pause the reader.) Response frames leave on two lanes: small control frames (append acks, stats, errors) are
-prioritized so they never queue behind a multi-megabyte read (head-of-line blocking), and
-`frame_queue_depth` bounds the buffered bulk read/subscription frames toward a slow client, applying
-backpressure to the workers producing them. Subscriptions are budgeted separately by
-`max_concurrent_subscriptions`, and one over the limit is rejected with an error rather than blocking
-the connection.
+prioritised so they never queue behind a multi-megabyte read (head-of-line blocking), and
+`server.backpressure.frame_queue_depth` bounds the buffered bulk read/subscription frames toward a
+slow client, applying backpressure to the workers producing them. Subscriptions are budgeted
+separately by `server.subscriptions.max_concurrent`, and one over the limit is rejected with an
+error rather than blocking the connection.
 
 Reads themselves run on a single shared, server-wide pool of reusable worker threads rather than a
-thread spawned per request, so a warm read pays no per-request thread-creation cost. `read_worker_threads`
-sets the pool size; `0` means one worker per logical CPU, which suits short, CPU-bound reads. A slow
-read still runs off the request loop, so it never blocks a connection's other in-flight requests.
+thread spawned per request, so a warm read pays no per-request thread-creation cost.
+`server.reads.worker_threads` sets the pool size; `0` means one worker per logical CPU, which suits
+short, CPU-bound reads. A slow read still runs off the request loop, so it never blocks a
+connection's other in-flight requests.
+
+## Connection limits and reaping
+
+`server.limits.max_connections` caps how many connections the server serves at once across all
+clients. Each connection costs several OS threads (a reader, a writer, an append pump, and one per
+live subscription), so the cap bounds total server resources independently of any per-connection
+budget. A connection accepted over the cap is closed immediately, before a request is read; `0`
+removes the cap as an explicit opt-out.
+
+Three timeouts under `[server.timeouts]` reap a connection that stops making progress, each measured
+in seconds and each disabled by `0`:
+
+- `incomplete_frame_secs` bounds how long a partial request frame may take to finish once its first
+  byte has arrived. It defends against a slow-loris trickle, which a per-read socket timeout misses
+  because that resets on every byte. It only ever touches a partial frame in flight, so a connection
+  idling silently at a frame boundary is untouched. On by default at 30 seconds.
+- `handshake_secs` bounds how long a freshly accepted connection may take to send its first complete
+  frame. Off by default, because a pooling client (such as the async client's idle bulk sockets)
+  legitimately opens a connection and sends nothing until its first read.
+- `idle_secs` reaps a connection that has no request in flight, no live subscription, and has been
+  silent for that long. Off by default, for the same pooling reason. In-flight requests and live
+  subscriptions count as activity, so a long-lived subscription is never reaped.
+
+TCP keepalive is separate and always on: `server.keepalive.idle_secs` and `interval_secs` set when
+probing begins and how often it repeats, so a silently dead peer (a yanked cable, a crashed client)
+is detected without waiting on the OS default of roughly two hours.
+
+## Monitoring
+
+Three mechanisms report on a running server.
+
+`--healthcheck` runs the binary as a client: it connects to the configured bind address, completes
+the `Hello` handshake (with the first configured token, and over TLS pinning the configured
+certificate when TLS is on), issues one stats request, and exits `0` if healthy or `1` if not. It
+opens no store and starts no listener, which suits a container `HEALTHCHECK` or a readiness probe.
+
+The stats request is itself a client call. `Client::stats()` returns a point-in-time snapshot: the
+event, segment, and on-disk-byte counts, the uptime, the live connection and subscription counts,
+the configured connection cap, and the monotonic totals of connections refused at the cap and reaped
+on a timeout. It is the same data the healthcheck reads.
+
+A Prometheus `/metrics` endpoint is served on its own port when `metrics.bind` is set (omitted by
+default). It is separate from the main data listener, so it can be exposed to an internal scraping
+network without opening the data port.
 
 ## Shutdown
 
-Shutting the server down stops the accept loop and unblocks connections parked on a read. Shutting
-the coordinator down (or dropping it) signals the writer thread and joins it, so no committed batch
-is left unflushed. Shutdown is deterministic: it returns once the writer thread has joined.
+The server shuts down gracefully on SIGINT (Ctrl-C) and SIGTERM, the signal `docker stop`, systemd,
+and Kubernetes send. The accept loop stops, connections parked on a read are unblocked, and the
+writer thread is signalled and joined, so no committed batch is left unflushed. A second signal,
+which means an operator gave up waiting on a stuck shutdown, forces an immediate exit (code 143)
+rather than being swallowed. Shutdown is deterministic: the graceful path returns once the writer
+thread has joined.
 
 ## Group commit, measured
 

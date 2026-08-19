@@ -4,19 +4,25 @@
 > type and a set of tags; a query reads exactly the events a decision depends on, and the same
 > query guards the append. A single writer assigns a dense, monotonic position to every event, so
 > the log is one global order and everything else is derived from it. Single node, one logical
-> writer per bounded context. This documentation describes the store at commit b5d2d96.
+> writer per bounded context. It serves its protocol over optional TLS with bearer-token
+> authentication, and has official Go, JavaScript, and Rust clients. This documentation tracks the
+> current `main`.
 
 ## Docs
 
 - [Introduction](https://tephra.tqwewe.com/introduction/): what a Dynamic Consistency Boundary is and the problem it removes, with the course-and-student example.
 - [Getting started](https://tephra.tqwewe.com/getting-started/): run the server, connect with tephra-client, append, read, subscribe.
+- [Clients](https://tephra.tqwewe.com/clients/): the official Go, JavaScript, and Rust clients and the design they share.
+- [Go client](https://tephra.tqwewe.com/clients/go/): connect, append, read, and subscribe from Go with tephra-go.
+- [JavaScript client](https://tephra.tqwewe.com/clients/javascript/): connect, append, read, and subscribe from Node.js with @tephradb/client.
+- [Rust client](https://tephra.tqwewe.com/clients/rust/): the reference client, blocking or async, with tephra-client.
 - [Embedded](https://tephra.tqwewe.com/embedded/): embed the engine directly instead of running the server, and the tradeoffs.
 - [Core concepts](https://tephra.tqwewe.com/core-concepts/): events, types and tags, positions, queries, append conditions.
 - [Decision models](https://tephra.tqwewe.com/guides/decision-models/): read, fold, decide, append guarded by the same query.
 - [The uniqueness guard](https://tephra.tqwewe.com/guides/uniqueness-guard/): omit after to guard that something happens at most once.
 - [Subscriptions](https://tephra.tqwewe.com/guides/subscriptions/): catch-up and live-tail as one loop, and resuming from a cursor.
 - [Handling conflicts](https://tephra.tqwewe.com/guides/conflicts/): SameBatch is advisory and retryable; Durable is terminal until you rebuild.
-- [Operations](https://tephra.tqwewe.com/operations/): configuration, transport security (TLS) and bearer-token authentication, durability, recovery, backpressure, shutdown.
+- [Operations](https://tephra.tqwewe.com/operations/): configuration, transport security (TLS) and bearer-token authentication, durability, recovery, backpressure, connection limits and reaping, monitoring, shutdown.
 - [Architecture](https://tephra.tqwewe.com/architecture/): the layer map and the design rationale, including rejected alternatives.
 - [Comparison](https://tephra.tqwewe.com/comparison/): measured write and read comparisons against UmaDB, Axon Server, KurrentDB, and Postgres, including where Tephra loses (cold reads).
 - [Status](https://tephra.tqwewe.com/status/): what is built and what is deliberately deferred.

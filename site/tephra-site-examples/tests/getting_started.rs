@@ -76,6 +76,17 @@ fn quickstart(addr: &str) -> Result<(), Box<dyn Error>> {
     // ANCHOR_END: read_back
     assert_eq!(newest_positions, vec![3, 2]);
 
+    // ANCHOR: stats
+    // A point-in-time snapshot of the server: the durable event count (also the tip position),
+    // the on-disk size, uptime, and the live connection and subscription counts.
+    let stats = client.stats()?;
+    println!(
+        "{} events across {} segments, {} bytes on disk",
+        stats.event_count, stats.segment_count, stats.disk_bytes
+    );
+    // ANCHOR_END: stats
+    assert_eq!(stats.event_count, 3);
+
     // ANCHOR: subscribe
     // Subscribe from the start: catch up on history, then a CaughtUp marker at the live edge.
     let query = Query::item(QueryItem::with_tags(Tags::new([Tag::new("course:c1")?])?));

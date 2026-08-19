@@ -1,0 +1,153 @@
+---
+title: Rust client
+description: Connect, append, read, and subscribe from Rust with tephra-client, blocking or async.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import gsRaw from '../../../../tephra-site-examples/tests/getting_started.rs?raw';
+
+`tephra-client` is the reference client. It ships a blocking `Client` and, behind the `async`
+feature, a multiplexing `AsyncClient`. The snippets below are compiled and run against a real server
+as part of the site's test suite.
+
+```sh
+cargo add tephra-client
+```
+
+Optional features: `async` (the `AsyncClient`), `tls` (TLS for the blocking client), and `async-tls`
+(TLS for the async client).
+
+```toml
+tephra-client = { version = "0.4", features = ["async", "tls"] }
+```
+
+## Connect
+
+`Client::connect` takes anything that resolves to a socket address and opens one TCP connection. A
+blocking `Client` carries a single request at a time and is not shared between threads: give each
+thread its own, or reach for the `AsyncClient` below.
+
+<Code code={anchor(gsRaw, 'connect')} lang="rust" />
+
+## Append
+
+An event is a type, a set of tags, and an opaque payload. `append` takes an iterator of events and
+an optional condition (`None` here, so the write is unconditional) and returns the position range
+the batch landed at.
+
+<Code code={anchor(gsRaw, 'append')} lang="rust" />
+
+An `AppendCondition` guards the write as a dynamic consistency boundary. [Decision
+models](/guides/decision-models/) builds the read-fold-decide-append cycle, and [Handling
+conflicts](/guides/conflicts/) covers the same-batch versus durable retry contract.
+
+## Read
+
+`read` and `read_all` take a query, an `after` position, and a `limit`. `Position::ZERO` reads from
+the start and a `None` limit reads the whole matching history, ascending.
+
+<Code code={anchor(gsRaw, 'read')} lang="rust" />
+
+## Paginate
+
+Pass `Some(n)` to cap a read, and pair it with `after` to page through a large result: each page
+resumes at the last position seen, with no gap and no duplicate at the seam.
+
+<Code code={anchor(gsRaw, 'paginate')} lang="rust" />
+
+## Read newest-first
+
+`read_back` and `read_all_back` are the newest-first duals. They take `before` (an exclusive upper
+bound), so `Position::MAX` starts at the tip.
+
+<Code code={anchor(gsRaw, 'read_back')} lang="rust" />
+
+## Server stats
+
+`stats` returns a point-in-time snapshot of the server's operational state.
+
+<Code code={anchor(gsRaw, 'stats')} lang="rust" />
+
+## Subscribe
+
+A subscription catches up on history and then tails the live edge as one loop, yielding a `CaughtUp`
+marker each time it reaches the live edge.
+
+<Code code={anchor(gsRaw, 'subscribe')} lang="rust" />
+
+## Async client
+
+With the `async` feature, `AsyncClient` multiplexes many concurrent requests over one control socket
+plus a pool of bulk read sockets. Its methods take `&self`, so a single client drives concurrent
+work. It needs a Tokio runtime.
+
+```rust
+use tephra_client::{AsyncClient, Event, Position, Query};
+
+let client = AsyncClient::connect("127.0.0.1:9000").await?;
+
+// Both futures borrow the same client; the requests are multiplexed on one connection.
+let (a, b) = tokio::join!(
+    client.append([Event::new("A", ["k:1"], b"{}".to_vec())?], None),
+    client.append([Event::new("B", ["k:2"], b"{}".to_vec())?], None),
+);
+a?;
+b?;
+
+let (events, _watermark) = client.read_all(Query::all(), Position::ZERO, None).await?;
+```
+
+## TLS
+
+With the `tls` feature, `Client::connect_tls` verifies the server certificate. Build the client
+config from the system roots, or from a custom CA for a self-signed certificate.
+
+```rust
+use tephra_client::{Client, tls};
+
+// Verify against the system roots (a public CA):
+let config = tls::config_with_native_roots()?;
+let mut client = Client::connect_tls("tephra.example.com:9000", "tephra.example.com", config)?;
+
+// Or trust a private CA for a self-signed certificate:
+let config = tls::config_with_custom_ca("ca.pem".as_ref())?;
+let mut client = Client::connect_tls("tephra.internal:9000", "tephra.internal", config)?;
+```
+
+## Authentication
+
+When the server requires a bearer token, pass it to a `*_with` connect variant, so a rejected token
+fails the connect rather than the first request.
+
+```rust
+// Blocking, over TLS (the token should not cross an unencrypted hop):
+let config = tls::config_with_native_roots()?;
+let mut client = Client::connect_tls_with(
+    "tephra.example.com:9000",
+    "tephra.example.com",
+    config,
+    Some("a-long-random-secret"),
+)?;
+```
+
+The async client carries the token on its config, and every socket in the control-plus-bulk pool
+authenticates independently.
+
+```rust
+use tephra_client::{AsyncClient, AsyncClientConfig};
+
+let config = AsyncClientConfig {
+    auth_token: Some("a-long-random-secret".into()),
+    ..Default::default()
+};
+let client = AsyncClient::connect_tls_with(addr, server_name, tls_config, config).await?;
+```
+
+## Errors
+
+A method returns `ClientError` on failure. The `Server` variant carries the wire `code`, a
+`message`, a `retryable` flag (set for an advisory same-batch append conflict), and a
+`conflict_position` for a durable one; `Protocol`, `UnexpectedEof`, and `Frame` cover transport and
+framing failures. The client does no automatic retries. See [Handling
+conflicts](/guides/conflicts/) for the append retry loop.

@@ -8,7 +8,8 @@ import { anchor } from '../../lib/snippet';
 import gsRaw from '../../../tephra-site-examples/tests/getting_started.rs?raw';
 
 This page runs start to finish against a real server. Everything after "Run the server" uses the
-`tephra-client` crate.
+Rust `tephra-client` crate; the Go and JavaScript clients cover the same operations, so see
+[Clients](../clients/) if you are working in one of those.
 
 ## Run the server
 
@@ -130,6 +131,14 @@ model can report that it is current.
 
 A subscription does not end on its own: drop the stream, or call `cancel` on the paired
 `SubscribeCancel`, to close it.
+
+## Check server stats
+
+`stats` returns a point-in-time snapshot of the server: the durable event count, the on-disk size,
+uptime, and the live connection and subscription counts. It is the same data the `--healthcheck`
+probe reads.
+
+<Code code={anchor(gsRaw, 'stats')} lang="rust" />
 
 ## Next
 

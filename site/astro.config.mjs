@@ -26,6 +26,15 @@ export default defineConfig({
       sidebar: [
         { label: "Introduction", slug: "introduction" },
         { label: "Getting started", slug: "getting-started" },
+        {
+          label: "Clients",
+          items: [
+            { label: "Overview", slug: "clients" },
+            { label: "Go", slug: "clients/go" },
+            { label: "JavaScript", slug: "clients/javascript" },
+            { label: "Rust", slug: "clients/rust" },
+          ],
+        },
         { label: "Embedded", slug: "embedded" },
         { label: "Core concepts", slug: "core-concepts" },
         {
