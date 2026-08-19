@@ -1,4 +1,4 @@
-# <img src="assets/logo.png" alt="" height="30" align="center"> tephra
+# <img src="assets/logo.png" alt="" height="42" align="top"> tephra
 
 An immutable event store with global ordering, built for the Dynamic Consistency Boundary.
 
