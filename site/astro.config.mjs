@@ -18,7 +18,7 @@ export default defineConfig({
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/tqwewe/tephra",
+          href: "https://github.com/tephradb/tephra",
         },
       ],
       customCss: ["./src/styles/custom.css"],

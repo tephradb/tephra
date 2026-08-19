@@ -41,7 +41,7 @@ All crates live under `crates/`:
 Docker (listens on `0.0.0.0:9000`, data in the `/data` volume):
 
 ```sh
-docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
+docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tephradb/tephra:latest
 ```
 
 Each release publishes three image variants: the plain tags (`latest`, `0.1.0`) are a
@@ -49,12 +49,12 @@ distroless glibc image, `*-debug` adds a shell for inspection, and `*-static` is
 scratch` image built around a fully static musl binary (no libc, no loader).
 
 Pre-built binaries (Linux `x86_64` and `aarch64`, glibc or fully static musl) are attached
-to each [release](https://github.com/tqwewe/tephra/releases/latest):
+to each [release](https://github.com/tephradb/tephra/releases/latest):
 
 ```sh
 VERSION=0.3.6
 TARGET=x86_64-unknown-linux-musl   # fully static, runs on any Linux
-BASE="https://github.com/tqwewe/tephra/releases/download/v${VERSION}"
+BASE="https://github.com/tephradb/tephra/releases/download/v${VERSION}"
 curl -fsSLO "${BASE}/tephra-server-v${VERSION}-${TARGET}.tar.gz"
 curl -fsSLO "${BASE}/tephra-server-v${VERSION}-${TARGET}.tar.gz.sha256"
 sha256sum -c "tephra-server-v${VERSION}-${TARGET}.tar.gz.sha256"
@@ -75,7 +75,7 @@ cargo binstall tephra-server
 Nix:
 
 ```sh
-nix run github:tqwewe/tephra
+nix run github:tephradb/tephra
 ```
 
 Cargo:

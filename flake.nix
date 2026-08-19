@@ -74,7 +74,7 @@
 
             meta = {
               description = "Synchronous TCP server exposing a tephra event store over the wire protocol";
-              homepage = "https://github.com/tqwewe/tephra";
+              homepage = "https://github.com/tephradb/tephra";
               license = lib.licenses.asl20;
               mainProgram = "tephra-server";
             };
@@ -110,7 +110,7 @@
 
             meta = {
               description = "Fully static (musl) tephra-server binary, runnable on any Linux and in FROM scratch images";
-              homepage = "https://github.com/tqwewe/tephra";
+              homepage = "https://github.com/tephradb/tephra";
               license = lib.licenses.asl20;
               mainProgram = "tephra-server";
             };

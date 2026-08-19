@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tephra-client.svg)](https://crates.io/crates/tephra-client)
 [![Documentation](https://docs.rs/tephra-client/badge.svg)](https://docs.rs/tephra-client)
-[![License](https://img.shields.io/crates/l/tephra-client.svg)](https://github.com/tqwewe/tephra/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/tephra-client.svg)](https://github.com/tephradb/tephra/blob/main/LICENSE)
 
 A synchronous, blocking TCP client for a [tephra](https://crates.io/crates/tephra) event store,
 speaking the length-prefixed protobuf protocol.
@@ -49,4 +49,4 @@ for the `subscribe` API.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/tephradb/tephra/blob/main/LICENSE).

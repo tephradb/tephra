@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tephra-proto.svg)](https://crates.io/crates/tephra-proto)
 [![Documentation](https://docs.rs/tephra-proto/badge.svg)](https://docs.rs/tephra-proto)
-[![License](https://img.shields.io/crates/l/tephra-proto.svg)](https://github.com/tqwewe/tephra/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/tephra-proto.svg)](https://github.com/tephradb/tephra/blob/main/LICENSE)
 
 Wire protocol shared by the [tephra](https://crates.io/crates/tephra) TCP server and client:
 the protobuf message types, the length-prefixed framing, and the conversions between the wire
@@ -26,4 +26,4 @@ version on the `PATH` (or via the `PROTOC` environment variable).
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/tephradb/tephra/blob/main/LICENSE).

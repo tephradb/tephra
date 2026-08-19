@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tephra-types.svg)](https://crates.io/crates/tephra-types)
 [![Documentation](https://docs.rs/tephra-types/badge.svg)](https://docs.rs/tephra-types)
-[![License](https://img.shields.io/crates/l/tephra-types.svg)](https://github.com/tqwewe/tephra/blob/main/LICENSE)
+[![License](https://img.shields.io/crates/l/tephra-types.svg)](https://github.com/tephradb/tephra/blob/main/LICENSE)
 
 Shared vocabulary types for [tephra](https://crates.io/crates/tephra): the concepts a client
 and the storage engine both speak.
@@ -42,4 +42,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](https://github.com/tqwewe/tephra/blob/main/LICENSE).
+Licensed under the [Apache License, Version 2.0](https://github.com/tephradb/tephra/blob/main/LICENSE).

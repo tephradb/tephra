@@ -18,12 +18,12 @@ none needing a checkout of the workspace. Pick whichever fits how you already ru
 <Tabs>
   <TabItem label="Docker">
     ```sh
-    docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tqwewe/tephra:latest
+    docker run -p 9000:9000 -v tephra-data:/data ghcr.io/tephradb/tephra:latest
     ```
   </TabItem>
   <TabItem label="Nix">
     ```sh
-    nix run github:tqwewe/tephra
+    nix run github:tephradb/tephra
     ```
   </TabItem>
   <TabItem label="Cargo">
@@ -37,7 +37,7 @@ none needing a checkout of the workspace. Pick whichever fits how you already ru
     # Prebuilt Linux binaries (x86_64/aarch64, glibc or static musl) are on each GitHub release.
     VERSION=0.3.6
     TARGET=x86_64-unknown-linux-musl
-    BASE="https://github.com/tqwewe/tephra/releases/download/v${VERSION}"
+    BASE="https://github.com/tephradb/tephra/releases/download/v${VERSION}"
     curl -fsSLO "${BASE}/tephra-server-v${VERSION}-${TARGET}.tar.gz"
     tar -xzf "tephra-server-v${VERSION}-${TARGET}.tar.gz"
     ./tephra-server-v${VERSION}-${TARGET}/tephra-server
