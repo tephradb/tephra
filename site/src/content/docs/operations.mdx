@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Configuration, durability, recovery, startup outcomes, backpressure, and shutdown.
+description: Configuration, transport security and authentication, durability, recovery, startup outcomes, backpressure, and shutdown.
 ---
 
 This page is for running the store: what you can configure, what durability you get, and what
@@ -58,6 +58,51 @@ header size) has no `Default`. `WriterConfig` carries the same writer fields as 
 plus `verify_tips`, a paranoid cross-check that is never operator-settable and stays off.
 `ReadConfig` is the single `scan_bias` dial. The planner only ever changes which correct path
 runs, so `scan_bias` cannot change a result, only its speed.
+
+## Transport security and authentication
+
+Every connection opens with a `Hello`: the client announces its protocol version and, when
+authenticating, a bearer token, and the server replies with an acknowledgement or an error before
+it serves any request. The protocol version is the single compatibility gate; a version the server
+does not support is rejected outright rather than inferred from field presence.
+
+TLS is server-authenticated and off by default. Set a PEM certificate chain and its private key
+together to serve TLS 1.3 (rustls over the `ring` provider, no TLS 1.2, no renegotiation); a
+plaintext client is then rejected at the handshake. Setting only one of the pair is a startup
+error.
+
+```toml
+[tls]
+cert = "server.crt"
+key = "server.key"
+```
+
+Authentication is bearer tokens, also off by default. Each `[[auth.tokens]]` entry is a table (so
+scopes can be added later without a config change), and any configured token authenticates a
+connection. List several to rotate without downtime: add the new token, roll clients over, then
+drop the old.
+
+```toml
+[[auth.tokens]]
+token = "a-long-random-secret"
+[[auth.tokens]]
+token = "the-next-secret-during-rotation"
+```
+
+A token is a secret, so it must not cross an unencrypted hop: the server refuses to start when
+tokens are set without TLS, unless you opt in with `auth.allow_insecure = true` for a deployment
+that terminates TLS at a proxy or mesh in front of Tephra. A missing or wrong token fails the
+`Hello`, so the connection is refused before any request is served.
+
+On the client, `Client::connect_tls(addr, server_name, config)` verifies the server certificate,
+where `config` comes from `tephra_client::tls::config_with_native_roots()` or
+`config_with_custom_ca(path)` for a self-signed certificate. Pass a token with the `*_with`
+variants (`connect_with`, `connect_tls_with`); the async client carries it on
+`AsyncClientConfig::auth_token`, and every socket in its control-plus-bulk pool authenticates
+independently.
+
+Authorization (per-token read-only versus read-write, or tag and type scoping) is not built yet: a
+valid token today grants full access. The token config is a table so that lands additively.
 
 ## Durability
 

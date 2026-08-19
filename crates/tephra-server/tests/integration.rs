@@ -2,7 +2,7 @@
 //! by the blocking `tephra-client`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -17,7 +17,10 @@ use tephra_client::{
     AppendCondition, AsyncClient, AsyncClientConfig, Client, ClientError, ErrorCode, Event,
     Position, Query, QueryItem, SequencedEvent, SubEvent, Tag, Tags,
 };
-use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame, tephra as pb, write_frame};
+use tephra_proto::{
+    DEFAULT_MAX_FRAME_LEN, PROTOCOL_VERSION, read_frame, tephra as pb, write_frame,
+};
+use tephra_server::auth::AuthConfig;
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
 use tokio_stream::StreamExt as _;
 
@@ -50,6 +53,29 @@ impl TestServer {
         let server = Server::bind("127.0.0.1:0", handle, server_config)
             .unwrap()
             .with_data_dir(dir.path());
+        let addr = server.local_addr();
+        let shutdown = server.shutdown_handle();
+        let server_thread = thread::spawn(move || server.run().expect("server run"));
+        TestServer {
+            addr,
+            shutdown,
+            server_thread: Some(server_thread),
+            coordinator: Some(coordinator),
+            _dir: dir,
+        }
+    }
+
+    /// A plaintext server that requires one of `tokens` in each connection's opening Hello. Auth is
+    /// transport-agnostic, so a plaintext server exercises the same handshake enforcement as TLS
+    /// without the certificate setup.
+    fn start_with_auth(tokens: Vec<String>) -> TestServer {
+        let dir = TempDir::new().unwrap();
+        let set = SegmentSet::open(dir.path(), SegmentConfig::new(16 * 1024 * 1024)).unwrap();
+        let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+        let server = Server::bind("127.0.0.1:0", handle, ServerConfig::default())
+            .unwrap()
+            .with_data_dir(dir.path())
+            .with_auth(Arc::new(AuthConfig::new(tokens)));
         let addr = server.local_addr();
         let shutdown = server.shutdown_handle();
         let server_thread = thread::spawn(move || server.run().expect("server run"));
@@ -257,10 +283,10 @@ fn max_connections_refuses_over_the_cap() {
     assert_eq!(stats.connections_refused, 0);
 
     // A second connection completes at the TCP layer but is refused (closed) by the server before
-    // any request is served, so the first operation over it fails.
-    let mut second = Client::connect(ts.addr).unwrap();
+    // its opening Hello can complete, so connecting over the cap fails.
+    let second = Client::connect(ts.addr);
     assert!(
-        second.stats().is_err(),
+        second.is_err(),
         "a connection over the cap must be refused, not served"
     );
 
@@ -1184,11 +1210,30 @@ fn server_shutdown_ends_an_idle_subscription() {
     subscriber.join().unwrap();
 }
 
+/// Completes the mandatory opening Hello on a raw connection and consumes the `HelloAck`, so a
+/// raw-socket test can then send request frames directly. The ack is read unbuffered, leaving the
+/// stream byte-aligned for a subsequent `BufReader`.
+fn raw_hello_stream(stream: &TcpStream) {
+    let mut io = stream;
+    let request = tephra_proto::hello_request(1, None);
+    write_frame(&mut io, &request, DEFAULT_MAX_FRAME_LEN).unwrap();
+    io.flush().unwrap();
+    let ack = read_frame::<pb::Response, _>(&mut io, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("server acknowledges the hello");
+    assert!(
+        matches!(ack.kind(), pb::response::KindOneof::HelloAck(_)),
+        "expected a hello ack, got {:?}",
+        ack.kind()
+    );
+}
+
 /// Sends one hand-built wire request over a fresh connection and returns the first response,
 /// bypassing the clean client so a test can exercise the server's rejection of malformed input.
 fn send_raw_request(addr: SocketAddr, request: &pb::Request) -> pb::Response {
     let stream = TcpStream::connect(addr).unwrap();
     stream.set_nodelay(true).unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     write_frame(&mut writer, request, DEFAULT_MAX_FRAME_LEN).unwrap();
     writer.flush().unwrap();
@@ -1247,6 +1292,7 @@ fn pipelined_appends_all_succeed_with_dense_positions() {
     let ts = TestServer::start();
     let stream = TcpStream::connect(ts.addr).unwrap();
     stream.set_nodelay(true).unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     let mut reader = BufReader::new(stream);
 
@@ -1313,6 +1359,7 @@ fn teardown_with_reads_in_flight_keeps_the_pool_healthy() {
             for _ in 0..10 {
                 let stream = TcpStream::connect(addr).unwrap();
                 stream.set_nodelay(true).unwrap();
+                raw_hello_stream(&stream);
                 let mut writer = BufWriter::new(stream.try_clone().unwrap());
                 write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
                 writer.flush().unwrap();
@@ -1391,6 +1438,7 @@ fn a_subscription_does_not_block_a_concurrent_append() {
     let ts = TestServer::start();
     let stream = TcpStream::connect(ts.addr).unwrap();
     stream.set_nodelay(true).unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     let mut reader = BufReader::new(stream);
 
@@ -1456,6 +1504,7 @@ fn cancel_stops_a_subscription_and_frees_the_connection() {
     let ts = TestServer::start();
     let stream = TcpStream::connect(ts.addr).unwrap();
     stream.set_nodelay(true).unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     let mut reader = BufReader::new(stream);
 
@@ -1696,6 +1745,7 @@ fn subscription_budget_rejects_excess_subscriptions() {
     let ts = TestServer::start_with(config, 16 * 1024 * 1024, WriterConfig::default());
     let stream = TcpStream::connect(ts.addr).unwrap();
     stream.set_nodelay(true).unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     let mut reader = BufReader::new(stream);
 
@@ -1770,6 +1820,7 @@ fn raw_pipelined_append_flood_is_backpressured_not_dropped() {
         conns.push(thread::spawn(move || -> Result<(), String> {
             let stream = TcpStream::connect(addr).map_err(|err| format!("connect: {err}"))?;
             stream.set_nodelay(true).ok();
+            raw_hello_stream(&stream);
             let reader_stream = stream.try_clone().map_err(|err| format!("clone: {err}"))?;
 
             // Drain responses concurrently so the socket never wedges: a well-behaved pipelining
@@ -1847,7 +1898,11 @@ async fn bounded_inflight_flood_backpressures_without_dropping() {
     };
     let mut pool = Vec::with_capacity(CONNS);
     for _ in 0..CONNS {
-        pool.push(AsyncClient::connect_with(ts.addr, config).await.unwrap());
+        pool.push(
+            AsyncClient::connect_with(ts.addr, config.clone())
+                .await
+                .unwrap(),
+        );
     }
     let pool = Arc::new(pool);
 
@@ -2019,6 +2074,7 @@ fn a_small_response_interleaves_with_a_large_read_on_one_socket() {
     socket2::SockRef::from(&stream)
         .set_recv_buffer_size(32 * 1024)
         .unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
     write_frame(
@@ -2083,6 +2139,7 @@ fn a_read_past_the_inflight_and_overflow_budgets_is_rejected() {
     socket2::SockRef::from(&stream)
         .set_recv_buffer_size(32 * 1024)
         .unwrap();
+    raw_hello_stream(&stream);
     let mut writer = BufWriter::new(stream.try_clone().unwrap());
     write_frame(&mut writer, &read_all_frame(1, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
     write_frame(&mut writer, &read_all_frame(2, 0), DEFAULT_MAX_FRAME_LEN).unwrap();
@@ -2109,4 +2166,139 @@ fn a_read_past_the_inflight_and_overflow_budgets_is_rejected() {
             }
         }
     }
+}
+
+// --- bearer-token authentication (Hello handshake) ---
+
+#[test]
+fn a_valid_token_authenticates_and_serves() {
+    // With a token configured, a client presenting it in its Hello connects and serves normally.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let mut client = Client::connect_with(ts.addr, Some("s3cret")).unwrap();
+    client.append([ev("E", &["k:1"], b"p")], None).unwrap();
+    let (events, _) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
+    assert_eq!(positions(&events), vec![1]);
+}
+
+#[test]
+fn a_wrong_token_is_rejected_at_connect() {
+    // A bad token fails the Hello, so `connect_with` returns PermissionDenied before any request.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let err = Client::connect_with(ts.addr, Some("nope")).err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied, "got {err:?}");
+}
+
+#[test]
+fn a_missing_token_is_rejected_at_connect() {
+    // No token against an auth server is also rejected at the Hello.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let err = Client::connect(ts.addr).err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied, "got {err:?}");
+}
+
+#[test]
+fn either_rotation_token_authenticates() {
+    // Multiple accepted tokens (the zero-downtime rotation window): a client using either connects.
+    let ts = TestServer::start_with_auth(vec!["old".to_string(), "new".to_string()]);
+    assert!(Client::connect_with(ts.addr, Some("old")).is_ok());
+    assert!(Client::connect_with(ts.addr, Some("new")).is_ok());
+    assert!(Client::connect_with(ts.addr, Some("other")).is_err());
+}
+
+#[test]
+fn an_open_server_accepts_with_or_without_a_token() {
+    // No tokens configured: the Hello still runs (version negotiation) and any client connects,
+    // whether or not it presents a token.
+    let ts = TestServer::start();
+    assert!(Client::connect(ts.addr).is_ok());
+    assert!(Client::connect_with(ts.addr, Some("ignored")).is_ok());
+}
+
+#[test]
+fn a_wrong_protocol_version_is_rejected() {
+    // A Hello announcing an unsupported protocol version is rejected with a bad-request error,
+    // proving the version is the explicit compatibility gate.
+    let ts = TestServer::start();
+    let stream = TcpStream::connect(ts.addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    let mut reader = BufReader::new(stream);
+
+    let mut hello = pb::Hello::new();
+    hello.set_protocol_version(PROTOCOL_VERSION + 1);
+    let mut request = pb::Request::new();
+    request.set_request_id(1);
+    request.set_hello(hello);
+    write_frame(&mut writer, &request, DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+
+    let response = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("the server answers the hello");
+    match response.kind() {
+        pb::response::KindOneof::Error(error) => {
+            assert_eq!(error.code(), pb::ErrorCode::BadRequest);
+        }
+        other => panic!("expected a version-mismatch error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_non_hello_first_frame_is_rejected() {
+    // The first frame must be a Hello: a client that opens with a request is unauthenticated.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let response = send_raw_first_frame(ts.addr, &append_frame(1, "E", "k:1"));
+    match response.kind() {
+        pb::response::KindOneof::Error(error) => {
+            assert_eq!(error.code(), pb::ErrorCode::Unauthenticated);
+        }
+        other => panic!("expected an unauthenticated error, got {other:?}"),
+    }
+}
+
+/// Sends one frame as the very first frame on a fresh connection (no preceding Hello) and returns
+/// the server's reply, for the "first frame must be a hello" path.
+fn send_raw_first_frame(addr: SocketAddr, request: &pb::Request) -> pb::Response {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut writer = BufWriter::new(stream.try_clone().unwrap());
+    write_frame(&mut writer, request, DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+    let mut reader = BufReader::new(stream);
+    read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("server replies before closing")
+}
+
+#[tokio::test]
+async fn the_async_client_authenticates_control_and_bulk_sockets() {
+    // Every physical socket (control + the bulk pool) authenticates independently, so an append
+    // (control) and a read (a bulk socket) both succeed only if each socket sent a valid Hello.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let config = AsyncClientConfig {
+        auth_token: Some("s3cret".to_string()),
+        bulk_connections: 2,
+        ..AsyncClientConfig::default()
+    };
+    let client = AsyncClient::connect_with(ts.addr, config).await.unwrap();
+    client
+        .append([ev("E", &["k:1"], b"p")], None)
+        .await
+        .unwrap();
+    let (events, _) = client
+        .read_all(Query::all(), Position::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(positions(&events), vec![1]);
+}
+
+#[tokio::test]
+async fn the_async_client_fails_to_connect_without_a_token() {
+    // A missing token fails the control socket's Hello, so `connect_with` fails.
+    let ts = TestServer::start_with_auth(vec!["s3cret".to_string()]);
+    let result = AsyncClient::connect_with(ts.addr, AsyncClientConfig::default()).await;
+    assert!(
+        result.is_err(),
+        "an unauthenticated async connect must fail"
+    );
 }

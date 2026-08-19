@@ -5,6 +5,7 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use tephra::writer::{WriteCoordinator, WriterConfig};
 use tempfile::{NamedTempFile, TempDir};
 use tephra_client::{AsyncClient, Client, Event, Position, Query, SubEvent};
 use tephra_proto::{DEFAULT_MAX_FRAME_LEN, TlsConn, read_frame, tephra as pb, write_frame};
+use tephra_server::auth::AuthConfig;
 use tephra_server::tls::build_server_config;
 use tephra_server::{Server, ServerConfig, ShutdownHandle};
 
@@ -80,6 +82,32 @@ impl TlsTestServer {
         }
     }
 
+    /// A TLS server that also requires one of `tokens` in each connection's opening Hello, proving
+    /// the `with_tls` and `with_auth` builders compose.
+    fn start_with_auth(tokens: Vec<String>) -> TlsTestServer {
+        let certs = TestCerts::generate();
+        let dir = TempDir::new().unwrap();
+        let set = SegmentSet::open(dir.path(), SegmentConfig::new(16 * 1024 * 1024)).unwrap();
+        let (coordinator, handle) = WriteCoordinator::start(set, WriterConfig::default()).unwrap();
+        let tls = build_server_config(certs.cert.path(), certs.key.path()).unwrap();
+        let server = Server::bind("127.0.0.1:0", handle, ServerConfig::default())
+            .unwrap()
+            .with_data_dir(dir.path())
+            .with_tls(tls)
+            .with_auth(Arc::new(AuthConfig::new(tokens)));
+        let addr = server.local_addr();
+        let shutdown = server.shutdown_handle();
+        let server_thread = thread::spawn(move || server.run().expect("server run"));
+        TlsTestServer {
+            addr,
+            shutdown,
+            server_thread: Some(server_thread),
+            coordinator: Some(coordinator),
+            certs,
+            _dir: dir,
+        }
+    }
+
     fn client(&self) -> Client {
         let config = tephra_client::tls::config_with_custom_ca(self.certs.cert.path()).unwrap();
         Client::connect_tls(self.addr, "localhost", config).unwrap()
@@ -96,6 +124,26 @@ impl Drop for TlsTestServer {
             coordinator.shutdown();
         }
     }
+}
+
+#[test]
+fn tls_with_a_token_authenticates_and_rejects_a_bad_one() {
+    // TLS and bearer-token auth compose: a valid token over the encrypted channel serves normally,
+    // and a wrong token is rejected at connect (its Hello rides the established TLS session).
+    let ts = TlsTestServer::start_with_auth(vec!["s3cret".to_string()]);
+
+    let good = tephra_client::tls::config_with_custom_ca(ts.certs.cert.path()).unwrap();
+    let mut client = Client::connect_tls_with(ts.addr, "localhost", good, Some("s3cret")).unwrap();
+    client.append([ev("E", &["k:1"], b"p")], None).unwrap();
+    let (events, _) = client.read_all(Query::all(), Position::ZERO, None).unwrap();
+    assert_eq!(events.len(), 1);
+
+    let bad = tephra_client::tls::config_with_custom_ca(ts.certs.cert.path()).unwrap();
+    let result = Client::connect_tls_with(ts.addr, "localhost", bad, Some("nope"));
+    assert!(
+        result.is_err(),
+        "a wrong token over tls must fail to connect"
+    );
 }
 
 #[test]
@@ -176,14 +224,13 @@ fn tls_subscribe_streams_catch_up_events() {
 #[test]
 fn a_plaintext_client_is_rejected_by_a_tls_server() {
     let ts = TlsTestServer::start();
-    // A plaintext client completes the TCP connect, but its first frame is not a TLS ClientHello,
-    // so the server aborts the handshake and drops the connection. The request must error, never
-    // hang or succeed.
-    let mut client = Client::connect(ts.addr).unwrap();
-    let result = client.append([ev("E", &["t"], b"x")], None);
+    // A plaintext client completes the TCP connect, but its opening Hello frame is not a TLS
+    // ClientHello, so the server aborts the handshake and drops the connection. The Hello
+    // round-trips inside `connect`, so connect itself fails, never hangs or succeeds.
+    let result = Client::connect(ts.addr);
     assert!(
         result.is_err(),
-        "a plaintext request to a TLS server must fail"
+        "a plaintext client against a TLS server must fail to connect"
     );
 }
 
@@ -326,7 +373,17 @@ fn raw_tls_client(
     let write_sock = stream.try_clone().unwrap();
     let session = TlsConn::new(session);
     let (read_half, write_half) = session.split(read_sock, write_sock);
-    (BufReader::new(read_half), BufWriter::new(write_half))
+    let mut reader = BufReader::new(read_half);
+    let mut writer = BufWriter::new(write_half);
+    // The mandatory opening Hello over the encrypted channel, before any request frame.
+    let request = tephra_proto::hello_request(1, None);
+    write_frame(&mut writer, &request, DEFAULT_MAX_FRAME_LEN).unwrap();
+    writer.flush().unwrap();
+    let ack = read_frame::<pb::Response, _>(&mut reader, DEFAULT_MAX_FRAME_LEN)
+        .unwrap()
+        .expect("server acknowledges the hello");
+    assert!(matches!(ack.kind(), pb::response::KindOneof::HelloAck(_)));
+    (reader, writer)
 }
 
 #[test]

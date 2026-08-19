@@ -60,11 +60,12 @@ use tephra_proto::{DEFAULT_MAX_FRAME_LEN, read_frame_async, write_frame_async};
 
 use super::{
     AppendCondition, AppendResult, ClientError, Event, Position, Query, SequencedEvent, Stats,
-    SubEvent, UNATTRIBUTED_REQUEST_ID, event_to_pb, sequenced_from_pb, server_error, stats_from_pb,
+    SubEvent, UNATTRIBUTED_REQUEST_ID, event_to_pb, hello_error, sequenced_from_pb, server_error,
+    stats_from_pb, verify_hello_ack,
 };
 
 /// Tuning for an [`AsyncClient`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct AsyncClientConfig {
     /// Largest single frame accepted or produced (default [`DEFAULT_MAX_FRAME_LEN`]). Must match
     /// or exceed the server's limit, or a large `ReadEvents` batch is rejected as over-limit and
@@ -91,6 +92,10 @@ pub struct AsyncClientConfig {
     /// The outstanding-read budget is per socket, so a larger pool also raises how many of this
     /// client's reads the server admits at once.
     pub bulk_connections: usize,
+    /// The bearer token presented in each socket's opening Hello, for a server that requires
+    /// authentication. `None` (the default) connects unauthenticated. Every socket (control and
+    /// bulk) authenticates with it independently.
+    pub auth_token: Option<String>,
 }
 
 impl Default for AsyncClientConfig {
@@ -100,6 +105,7 @@ impl Default for AsyncClientConfig {
             request_queue_depth: 256,
             max_inflight_requests: 1024,
             bulk_connections: 4,
+            auth_token: None,
         }
     }
 }
@@ -159,16 +165,20 @@ struct Conn {
 }
 
 impl Conn {
-    /// Connects one socket to the first working address, sets `TCP_NODELAY`, and spawns its reader
-    /// and writer tasks.
+    /// Connects one socket to the first working address, sets `TCP_NODELAY`, authenticates with the
+    /// opening Hello, and spawns its reader and writer tasks.
     async fn connect(addrs: &[SocketAddr], config: AsyncClientConfig) -> io::Result<Conn> {
         let stream = connect_any(addrs).await?;
         stream.set_nodelay(true)?;
-        let (read_half, write_half) = stream.into_split();
+        let (mut read_half, mut write_half) = stream.into_split();
+        send_hello(&mut read_half, &mut write_half, &config)
+            .await
+            .map_err(hello_error)?;
         Ok(Conn::spawn(read_half, write_half, config))
     }
 
-    /// Connects one socket and completes a TLS handshake before spawning its tasks.
+    /// Connects one socket, completes a TLS handshake, and authenticates with the opening Hello
+    /// before spawning its tasks.
     #[cfg(feature = "async-tls")]
     async fn connect_tls(
         addrs: &[SocketAddr],
@@ -186,7 +196,10 @@ impl Conn {
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
-        let (read_half, write_half) = tokio::io::split(tls);
+        let (mut read_half, mut write_half) = tokio::io::split(tls);
+        send_hello(&mut read_half, &mut write_half, &config)
+            .await
+            .map_err(hello_error)?;
         Ok(Conn::spawn(read_half, write_half, config))
     }
 
@@ -238,6 +251,33 @@ async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     }))
 }
 
+/// Sends the mandatory opening Hello on a freshly connected socket and awaits its `HelloAck`, so a
+/// version mismatch or a rejected token fails the connect. Runs directly on the split halves before
+/// the reader/writer actor tasks are spawned, so authentication never touches the multiplexing
+/// machinery and every socket is authenticated before it carries a request.
+async fn send_hello<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
+    config: &AsyncClientConfig,
+) -> Result<(), ClientError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // Ids start at 1, so the Hello borrows the first id; its reply is consumed here and never
+    // reaches the actor's registry.
+    let request = tephra_proto::hello_request(1, config.auth_token.as_deref());
+    write_frame_async(write_half, &request, config.max_frame_len).await?;
+    // Flush the first record to the socket, matching every other Hello sender rather than relying on
+    // the transport draining a small first write.
+    write_half.flush().await?;
+
+    let response = read_frame_async::<pb::Response, _>(read_half, config.max_frame_len)
+        .await?
+        .ok_or(ClientError::UnexpectedEof)?;
+    verify_hello_ack(&response)
+}
+
 /// A cheap, cloneable handle to a tephra server over a control socket plus a pool of bulk sockets
 /// (see the module docs and [`AsyncClientConfig::bulk_connections`]). Every clone shares the same
 /// sockets and background tasks; requests issued through any clone run concurrently.
@@ -265,10 +305,11 @@ impl AsyncClient {
         // The control socket must succeed; dial the bulk pool concurrently so a pool over a high-RTT
         // link pays one round-trip, not N. If any bulk socket fails the whole connect fails (the
         // caller asked for this many sockets); the JoinSet aborts the rest on drop.
-        let control = Arc::new(Conn::connect(&addrs, config).await?);
+        let control = Arc::new(Conn::connect(&addrs, config.clone()).await?);
         let mut dialing = JoinSet::new();
         for _ in 0..config.bulk_connections {
             let addrs = addrs.clone();
+            let config = config.clone();
             dialing.spawn(async move { Conn::connect(&addrs, config).await });
         }
         let mut bulk = Vec::with_capacity(config.bulk_connections);
@@ -312,13 +353,15 @@ impl AsyncClient {
             )
         })?;
         let connector = TlsConnector::from(tls_config);
-        let control =
-            Arc::new(Conn::connect_tls(&addrs, name.clone(), connector.clone(), config).await?);
+        let control = Arc::new(
+            Conn::connect_tls(&addrs, name.clone(), connector.clone(), config.clone()).await?,
+        );
         let mut dialing = JoinSet::new();
         for _ in 0..config.bulk_connections {
             let addrs = addrs.clone();
             let name = name.clone();
             let connector = connector.clone();
+            let config = config.clone();
             dialing.spawn(async move { Conn::connect_tls(&addrs, name, connector, config).await });
         }
         let mut bulk = Vec::with_capacity(config.bulk_connections);

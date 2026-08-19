@@ -52,6 +52,7 @@ use tephra_proto::TlsConn;
 use tephra_proto::tephra as pb;
 use tephra_proto::{FrameError, FramePoll, FrameReader, write_frame};
 
+use crate::auth::AuthConfig;
 use crate::convert;
 use crate::stats;
 use crate::{ServerConfig, SharedStats};
@@ -63,6 +64,7 @@ type AppendReply = (u64, Result<PositionRange, AppendError>);
 /// error occurs. Splits the socket into a read and a write half, arms the read-side timeout, and
 /// hands both to [`serve_over`], which owns the reader/writer threads and the request loop. With a
 /// TLS acceptor, the handshake and split happen in [`serve_tls`] first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_connection(
     stream: TcpStream,
     handle: WriteHandle,
@@ -70,6 +72,7 @@ pub(crate) fn serve_connection(
     running: Arc<AtomicBool>,
     read_pool: Sender<ReadJob>,
     stats: &Arc<SharedStats>,
+    auth: Option<Arc<AuthConfig>>,
     #[cfg(feature = "tls")] tls: Option<Arc<rustls::ServerConfig>>,
 ) {
     let peer = stream.peer_addr().ok();
@@ -80,7 +83,7 @@ pub(crate) fn serve_connection(
     #[cfg(feature = "tls")]
     if let Some(tls_config) = tls {
         serve_tls(
-            stream, tls_config, handle, config, running, read_pool, stats,
+            stream, tls_config, handle, config, running, read_pool, stats, auth,
         );
         return;
     }
@@ -124,6 +127,7 @@ pub(crate) fn serve_connection(
         read_pool,
         stats,
         peer,
+        auth,
     );
     let _ = stream.shutdown(Shutdown::Both);
 }
@@ -144,6 +148,7 @@ struct Transport<R, W> {
 /// then reads and dispatches request frames on this thread until the stream ends, and finally tears
 /// everything down and joins. Generic over the read and write halves so the same logic serves a
 /// plaintext `TcpStream` and a TLS-wrapped stream identically.
+#[allow(clippy::too_many_arguments)]
 fn serve_over<R: Read, W: Write + Send + 'static>(
     transport: Transport<R, W>,
     handle: WriteHandle,
@@ -152,6 +157,7 @@ fn serve_over<R: Read, W: Write + Send + 'static>(
     read_pool: Sender<ReadJob>,
     stats: &Arc<SharedStats>,
     peer: Option<SocketAddr>,
+    auth: Option<Arc<AuthConfig>>,
 ) {
     let Transport {
         reader: reader_half,
@@ -227,10 +233,20 @@ fn serve_over<R: Read, W: Write + Send + 'static>(
     loop {
         match frames.poll::<pb::Request, _>(&mut reader, config.max_frame_len) {
             Ok(FramePoll::Frame(request)) => {
-                established = true;
                 last_frame_at = Instant::now();
                 frame_started_at = None;
-                dispatch(&request, &conn, &reply_tx);
+                if established {
+                    dispatch(&request, &conn, &reply_tx);
+                } else {
+                    // The first frame must be a Hello: authenticate and negotiate the protocol
+                    // version before any request is served. A rejected hello closes the connection
+                    // (the error is already queued); the connection counts as established only once
+                    // it succeeds, so the handshake deadline still bounds a client that stalls here.
+                    match handle_hello(&request, &conn, auth.as_deref()) {
+                        HelloOutcome::Ok => established = true,
+                        HelloOutcome::Reject => break,
+                    }
+                }
             }
             Ok(FramePoll::Eof) => {
                 // Clean close at a frame boundary (the peer closed between frames).
@@ -363,6 +379,7 @@ fn serve_over<R: Read, W: Write + Send + 'static>(
 /// the handshake deadline), then splits the session into a read and write half over independent
 /// socket handles and hands them to [`serve_over`], exactly as the plaintext path does.
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
 fn serve_tls(
     mut stream: TcpStream,
     tls_config: Arc<rustls::ServerConfig>,
@@ -371,6 +388,7 @@ fn serve_tls(
     running: Arc<AtomicBool>,
     read_pool: Sender<ReadJob>,
     stats: &Arc<SharedStats>,
+    auth: Option<Arc<AuthConfig>>,
 ) {
     let peer = stream.peer_addr().ok();
     // From here (≈ accept), so the handshake deadline and the first-frame deadline are one budget,
@@ -455,6 +473,7 @@ fn serve_tls(
         read_pool,
         stats,
         peer,
+        auth,
     );
     let _ = stream.shutdown(Shutdown::Both);
 }
@@ -554,6 +573,62 @@ impl ConnCtx {
     fn send_bulk(&self, response: pb::Response) -> bool {
         self.bulk_tx.send(response).is_ok()
     }
+}
+
+/// The result of the mandatory opening Hello.
+enum HelloOutcome {
+    /// Authenticated and version-compatible: the `HelloAck` is queued; serve requests.
+    Ok,
+    /// Rejected: the error is queued; the caller closes the connection.
+    Reject,
+}
+
+/// Handles the connection's first frame, which must be a `Hello`. Checks the protocol version and,
+/// when `auth` is configured, the bearer token, then queues a `HelloAck`. On any failure it queues
+/// the matching error (`UNAUTHENTICATED` for a non-Hello first frame or a bad token, `BAD_REQUEST`
+/// for a version mismatch) and returns [`HelloOutcome::Reject`]. With `auth` `None` the token is
+/// ignored, but the version is still negotiated.
+fn handle_hello(request: &pb::Request, conn: &ConnCtx, auth: Option<&AuthConfig>) -> HelloOutcome {
+    let request_id = request.request_id();
+    let pb::request::KindOneof::Hello(hello) = request.kind() else {
+        conn.send_control(make_response(
+            request_id,
+            ResponseKind::Error(convert::unauthenticated("first frame must be a hello")),
+        ));
+        return HelloOutcome::Reject;
+    };
+
+    let version = hello.protocol_version();
+    if version != tephra_proto::PROTOCOL_VERSION {
+        conn.send_control(make_response(
+            request_id,
+            ResponseKind::Error(convert::bad_request(format!(
+                "unsupported protocol version {version}: this server speaks {}",
+                tephra_proto::PROTOCOL_VERSION
+            ))),
+        ));
+        return HelloOutcome::Reject;
+    }
+
+    if let Some(auth) = auth {
+        let accepted = hello
+            .auth_token_opt()
+            .and_then(|token| token.to_str().ok())
+            .is_some_and(|token| auth.accepts(token));
+        if !accepted {
+            conn.send_control(make_response(
+                request_id,
+                ResponseKind::Error(convert::unauthenticated("invalid or missing auth token")),
+            ));
+            return HelloOutcome::Reject;
+        }
+    }
+
+    let mut ack = pb::HelloAck::new();
+    ack.set_protocol_version(tephra_proto::PROTOCOL_VERSION);
+    ack.set_server_version(env!("CARGO_PKG_VERSION"));
+    conn.send_control(make_response(request_id, ResponseKind::HelloAck(ack)));
+    HelloOutcome::Ok
 }
 
 /// Routes one request. Appends submit and return; reads and subscribes spawn workers; a cancel
@@ -1109,6 +1184,7 @@ enum ResponseKind {
     CaughtUp(pb::SubscribeCaughtUp),
     Stats(pb::StatsResponse),
     Error(pb::ErrorResponse),
+    HelloAck(pb::HelloAck),
 }
 
 /// Builds one `Response` with its `request_id` echoed.
@@ -1122,6 +1198,7 @@ fn make_response(request_id: u64, kind: ResponseKind) -> pb::Response {
         ResponseKind::CaughtUp(caught_up) => response.set_caught_up(caught_up),
         ResponseKind::Stats(stats) => response.set_stats(stats),
         ResponseKind::Error(error) => response.set_error(error),
+        ResponseKind::HelloAck(ack) => response.set_hello_ack(ack),
     }
     response
 }

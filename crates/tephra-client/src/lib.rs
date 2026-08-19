@@ -353,29 +353,53 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connects to a server, setting `TCP_NODELAY` for request/response latency.
+    /// Connects to a server, setting `TCP_NODELAY` for request/response latency. Sends the opening
+    /// Hello (unauthenticated) and awaits the server's acknowledgement before returning.
     pub fn connect(addr: impl ToSocketAddrs) -> io::Result<Client> {
+        Client::connect_with(addr, None)
+    }
+
+    /// [`connect`](Self::connect) with a bearer token presented in the opening Hello, for a server
+    /// that requires authentication. A rejected token fails here (an [`io::ErrorKind::PermissionDenied`])
+    /// rather than on the first request.
+    pub fn connect_with(addr: impl ToSocketAddrs, auth_token: Option<&str>) -> io::Result<Client> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         let reader = BufReader::new(stream.try_clone()?);
         let writer = BufWriter::new(stream);
-        Ok(Client {
+        let mut client = Client {
             reader: Reader::Plain(reader),
             writer: Writer::Plain(writer),
             // Ids start at 1 so 0 stays reserved as the unattributed-error sentinel.
             next_id: 1,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
-        })
+        };
+        client.hello(auth_token).map_err(hello_error)?;
+        Ok(client)
     }
 
     /// Connects to a server over TLS, verifying its certificate against `tls_config` (build one
     /// with [`tls::config_with_native_roots`] or [`tls::config_with_custom_ca`]). `server_name` is
-    /// the name the certificate must match. The handshake runs before this returns.
+    /// the name the certificate must match. The TLS handshake and the opening Hello both run before
+    /// this returns.
     #[cfg(feature = "tls")]
     pub fn connect_tls(
         addr: impl ToSocketAddrs,
         server_name: &str,
         tls_config: Arc<rustls::ClientConfig>,
+    ) -> io::Result<Client> {
+        Client::connect_tls_with(addr, server_name, tls_config, None)
+    }
+
+    /// [`connect_tls`](Self::connect_tls) with a bearer token presented in the opening Hello, for a
+    /// server that requires authentication. A rejected token fails here rather than on the first
+    /// request.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls_with(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+        auth_token: Option<&str>,
     ) -> io::Result<Client> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
@@ -409,12 +433,14 @@ impl Client {
         let write_sock = stream.try_clone()?;
         let session = tephra_proto::TlsConn::new(conn);
         let (read_half, write_half) = session.split(read_sock, write_sock);
-        Ok(Client {
+        let mut client = Client {
             reader: Reader::Tls(BufReader::new(read_half)),
             writer: Writer::Tls(BufWriter::new(write_half)),
             next_id: 1,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
-        })
+        };
+        client.hello(auth_token).map_err(hello_error)?;
+        Ok(client)
     }
 
     /// Overrides the maximum frame length (default [`DEFAULT_MAX_FRAME_LEN`]). Must match or
@@ -433,6 +459,16 @@ impl Client {
         write_frame(&mut self.writer, request, self.max_frame_len)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    /// Sends the mandatory opening Hello and awaits the server's `HelloAck`, so a version mismatch
+    /// or a rejected token fails before any real request. Runs once, at connect.
+    fn hello(&mut self, auth_token: Option<&str>) -> Result<(), ClientError> {
+        let id = self.next_id();
+        self.send(&tephra_proto::hello_request(id, auth_token))?;
+        let response = self.recv()?;
+        check_response_id(&response, id)?;
+        verify_hello_ack(&response)
     }
 
     /// Appends `events` as one atomic batch, optionally guarded by `condition`. Blocks until
@@ -900,6 +936,45 @@ fn check_response_id(response: &pb::Response, expected: u64) -> Result<(), Clien
         )));
     }
     Ok(())
+}
+
+/// Verifies the server's reply to the opening Hello. A `HelloAck` only exists on the server's
+/// success path, where its version always equals ours, so the version comparison here is defensive
+/// against a non-conforming server rather than real negotiation (the version is negotiated by the
+/// server accepting or rejecting the Hello). An error frame or any other kind fails the connect.
+/// Shared by the blocking and async clients so the check lives in one place.
+fn verify_hello_ack(response: &pb::Response) -> Result<(), ClientError> {
+    match response.kind() {
+        pb::response::KindOneof::HelloAck(ack) => {
+            let server = ack.protocol_version();
+            if server != tephra_proto::PROTOCOL_VERSION {
+                return Err(ClientError::Protocol(format!(
+                    "server protocol version {server} does not match client {}",
+                    tephra_proto::PROTOCOL_VERSION
+                )));
+            }
+            Ok(())
+        }
+        pb::response::KindOneof::Error(error) => Err(server_error(error)),
+        other => Err(ClientError::Protocol(format!(
+            "unexpected response to hello: {other:?}"
+        ))),
+    }
+}
+
+/// Maps a failed opening Hello to an [`io::Error`], so the `connect*` constructors keep their
+/// `io::Result` signature. A rejected token is [`io::ErrorKind::PermissionDenied`]; a version or
+/// protocol mismatch is [`io::ErrorKind::InvalidData`]; a transport failure passes through.
+fn hello_error(err: ClientError) -> io::Error {
+    match err {
+        ClientError::Server {
+            code: ErrorCode::Unauthenticated,
+            message,
+            ..
+        } => io::Error::new(io::ErrorKind::PermissionDenied, message),
+        ClientError::Frame(FrameError::Io(err)) => err,
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    }
 }
 
 fn server_error(error: pb::ErrorResponseView<'_>) -> ClientError {

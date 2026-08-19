@@ -70,6 +70,9 @@ A `Client` is not shared between threads: give each thread its own.
 
 <Code code={anchor(gsRaw, 'connect')} lang="rust" />
 
+For an encrypted connection use `Client::connect_tls`, and for a server that requires a bearer
+token use the `*_with` variants; see [transport security and authentication](../operations/#transport-security-and-authentication).
+
 ## Append
 
 An event is a type, a set of tags, and an opaque payload. `append` takes an iterator of events

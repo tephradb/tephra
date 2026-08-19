@@ -16,7 +16,7 @@
 - [The uniqueness guard](https://tephra.tqwewe.com/guides/uniqueness-guard/): omit after to guard that something happens at most once.
 - [Subscriptions](https://tephra.tqwewe.com/guides/subscriptions/): catch-up and live-tail as one loop, and resuming from a cursor.
 - [Handling conflicts](https://tephra.tqwewe.com/guides/conflicts/): SameBatch is advisory and retryable; Durable is terminal until you rebuild.
-- [Operations](https://tephra.tqwewe.com/operations/): configuration, durability, recovery, backpressure, shutdown.
+- [Operations](https://tephra.tqwewe.com/operations/): configuration, transport security (TLS) and bearer-token authentication, durability, recovery, backpressure, shutdown.
 - [Architecture](https://tephra.tqwewe.com/architecture/): the layer map and the design rationale, including rejected alternatives.
 - [Comparison](https://tephra.tqwewe.com/comparison/): measured write and read comparisons against UmaDB, Axon Server, KurrentDB, and Postgres, including where Tephra loses (cold reads).
 - [Status](https://tephra.tqwewe.com/status/): what is built and what is deliberately deferred.

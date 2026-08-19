@@ -66,6 +66,7 @@ pub struct Settings {
     pub server: ServerSettings,
     pub metrics: MetricsSettings,
     pub tls: TlsSettings,
+    pub auth: AuthSettings,
 }
 
 impl Default for Settings {
@@ -80,6 +81,7 @@ impl Default for Settings {
             server: ServerSettings::default(),
             metrics: MetricsSettings::default(),
             tls: TlsSettings::default(),
+            auth: AuthSettings::default(),
         }
     }
 }
@@ -101,6 +103,30 @@ pub struct TlsSettings {
     pub cert: Option<String>,
     /// Path to the PEM private key.
     pub key: Option<String>,
+}
+
+/// Bearer-token authentication. Any configured token in a connection's opening Hello is accepted;
+/// an empty `tokens` list leaves the server open (no authentication). Tokens are secrets, so they
+/// require TLS unless `allow_insecure` is set (see [`Settings::validate`]).
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthSettings {
+    /// The accepted tokens, each a table so scopes can be added later without a config-format
+    /// change. Multiple tokens allow zero-downtime rotation: add the new one, roll clients over,
+    /// then drop the old.
+    pub tokens: Vec<TokenSettings>,
+    /// Permit tokens over a plaintext listener, for a deployment that terminates TLS at a proxy or
+    /// mesh before tephra. Off by default: a bearer secret should not cross an unencrypted hop.
+    pub allow_insecure: bool,
+}
+
+/// One accepted token. A table (rather than a bare string) so an `access` scope, a name, or tag
+/// restrictions can be added additively in a later step.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenSettings {
+    /// The bearer token a client presents in its Hello.
+    pub token: String,
 }
 
 /// Log-segment sizing options.
@@ -323,7 +349,35 @@ impl Settings {
         if self.tls.cert.is_some() != self.tls.key.is_some() {
             return Err("tls.cert and tls.key must be set together".to_string());
         }
+        // An empty token is never a valid secret and would silently accept unauthenticated peers.
+        if self.auth.tokens.iter().any(|t| t.token.is_empty()) {
+            return Err("auth.tokens entries must have a non-empty token".to_string());
+        }
+        // Tokens are bearer secrets: refuse to serve them over plaintext unless the operator has
+        // explicitly opted in (TLS terminated at a proxy/mesh in front of tephra).
+        let tls_enabled = self.tls.cert.is_some() && self.tls.key.is_some();
+        if !self.auth.tokens.is_empty() && !tls_enabled && !self.auth.allow_insecure {
+            return Err(
+                "auth.tokens require tls; set tls.cert and tls.key, or auth.allow_insecure = true"
+                    .to_string(),
+            );
+        }
         Ok(())
+    }
+
+    /// The configured bearer tokens, if any. `None` leaves the server open (no authentication).
+    /// Owned because the sole consumer, `AuthConfig::new`, hashes and keeps them.
+    pub fn auth_tokens(&self) -> Option<Vec<String>> {
+        if self.auth.tokens.is_empty() {
+            return None;
+        }
+        Some(self.auth.tokens.iter().map(|t| t.token.clone()).collect())
+    }
+
+    /// The first configured token, borrowed, for the healthcheck probe (which needs one token, not
+    /// the whole set). `None` when no tokens are configured.
+    pub fn first_auth_token(&self) -> Option<&str> {
+        self.auth.tokens.first().map(|t| t.token.as_str())
     }
 }
 
@@ -499,6 +553,62 @@ mod tests {
         let mut settings = Settings::default();
         settings.server.frame_queue_depth = 0;
         assert!(settings.validate().is_err());
+    }
+
+    fn with_tls(mut settings: Settings) -> Settings {
+        settings.tls.cert = Some("server.crt".to_string());
+        settings.tls.key = Some("server.key".to_string());
+        settings
+    }
+
+    fn token(value: &str) -> TokenSettings {
+        TokenSettings {
+            token: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn auth_tokens_require_tls_unless_allow_insecure() {
+        // Tokens over plaintext are rejected by default...
+        let mut settings = Settings::default();
+        settings.auth.tokens = vec![token("secret")];
+        assert!(settings.validate().is_err());
+
+        // ...accepted with TLS...
+        let mut settings = with_tls(Settings::default());
+        settings.auth.tokens = vec![token("secret")];
+        assert!(settings.validate().is_ok());
+
+        // ...and accepted over plaintext only with the explicit opt-out.
+        let mut settings = Settings::default();
+        settings.auth.tokens = vec![token("secret")];
+        settings.auth.allow_insecure = true;
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_auth_token_is_rejected() {
+        let mut settings = with_tls(Settings::default());
+        settings.auth.tokens = vec![token("")];
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn no_auth_tokens_is_open_and_valid() {
+        // The default (empty token list) is valid over plaintext and yields no auth config.
+        let settings = Settings::default();
+        assert!(settings.validate().is_ok());
+        assert!(settings.auth_tokens().is_none());
+    }
+
+    #[test]
+    fn auth_tokens_collects_configured_tokens() {
+        let mut settings = with_tls(Settings::default());
+        settings.auth.tokens = vec![token("alpha"), token("beta")];
+        assert_eq!(
+            settings.auth_tokens(),
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
     }
 
     #[test]
