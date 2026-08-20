@@ -53,7 +53,7 @@
         commonArgs = {
           inherit src;
           pname = "tephra";
-          version = "0.1.0";
+          version = (builtins.fromTOML (builtins.readFile ./crates/tephra-server/Cargo.toml)).package.version;
           strictDeps = true;
 
           # tephra-proto's build.rs drives protoc, located via PROTOC or PATH.
