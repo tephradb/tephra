@@ -86,6 +86,12 @@ decision, which may be higher than the last matching event.
 Omit `after` (leave it at `Position::ZERO`) and the condition becomes "fail if any event matches
 at all". That is the uniqueness guard, covered in its own [guide](../guides/uniqueness-guard/).
 
+A condition can also carry an optional existence clause, `fail_if_exists`: a second query checked
+against the whole log (an implicit `after = 0`), OR'd with the boundary check. It exists because a
+single `after` cannot be both a moving boundary and a whole-log uniqueness assertion at once, which
+is what idempotent appends need. Its conflict is reported distinctly (`AlreadyExists`, not
+`Conflict`); see [Idempotency and deduplication](../guides/idempotency/).
+
 ## Decision models
 
 A decision model is small projections composed over one read: each projection has its own

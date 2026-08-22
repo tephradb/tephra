@@ -74,6 +74,17 @@ impl Default for WriterConfig {
     }
 }
 
+/// Which clause of the append condition a conflict came from, reported so a caller can tell
+/// "boundary moved, rebuild and retry" (the `fail_if_events_match` boundary check) from
+/// "already applied" (the `fail_if_exists` existence check).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictClause {
+    /// The boundary check: `fail_if_events_match` matched after `after`.
+    Boundary,
+    /// The whole-log existence check: `fail_if_exists` matched (implicit `after = 0`).
+    Existence,
+}
+
 /// Where a conflict was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictSite {
@@ -91,9 +102,13 @@ pub enum ConflictSite {
 /// Why an append did not succeed.
 #[derive(Clone, Debug, Error)]
 pub enum AppendError {
-    /// The condition matched at least one event after `after`.
-    #[error("append condition conflict ({at:?})")]
-    Conflict { at: ConflictSite },
+    /// A condition clause matched. `clause` says which (boundary vs existence), `at` says
+    /// where (a durable position vs a conservative same-batch rejection).
+    #[error("append condition conflict ({clause:?}, {at:?})")]
+    Conflict {
+        clause: ConflictClause,
+        at: ConflictSite,
+    },
     /// `after` referenced a position beyond the durable tip: a misbehaving client or a
     /// bug, since a client cannot have observed a position that is not yet durable.
     #[error("after {after} is beyond the durable tip {tip}")]

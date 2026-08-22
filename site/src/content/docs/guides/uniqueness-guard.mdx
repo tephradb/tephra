@@ -40,3 +40,8 @@ A conflict here means the course already exists. That is a durable conflict, not
 retrying will hit the same existing event and fail again. The caller treats it as a definite "no",
 which is why the example returns `false` rather than looping. The difference between an advisory
 and a terminal conflict is the subject of [Handling conflicts](../conflicts/).
+
+If you need this at-most-once check *alongside* a moving decision boundary, or you want the
+"already exists" case reported as a distinct `AlreadyExists` code you can treat as an idempotent
+no-op, reach for the `fail_if_exists` clause instead. See [Idempotency and
+deduplication](../idempotency/).

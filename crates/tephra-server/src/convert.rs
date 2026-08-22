@@ -9,7 +9,7 @@ use std::{error, fmt};
 use tephra::Position;
 use tephra::event::{EncodeError, Event, EventRef, EventType};
 use tephra::query::{AppendCondition, Query};
-use tephra::writer::{AppendError, ConflictSite};
+use tephra::writer::{AppendError, ConflictClause, ConflictSite};
 
 use tephra_proto::convert as wire;
 use tephra_proto::tephra as pb;
@@ -90,8 +90,11 @@ pub fn append_error_to_proto(err: &AppendError) -> pb::ErrorResponse {
     let mut resp = pb::ErrorResponse::new();
     resp.set_message(err.to_string());
     match err {
-        AppendError::Conflict { at } => {
-            resp.set_code(pb::ErrorCode::Conflict);
+        AppendError::Conflict { clause, at } => {
+            resp.set_code(match clause {
+                ConflictClause::Boundary => pb::ErrorCode::Conflict,
+                ConflictClause::Existence => pb::ErrorCode::AlreadyExists,
+            });
             match at {
                 ConflictSite::Durable(position) => {
                     resp.set_conflict_position(position.get());

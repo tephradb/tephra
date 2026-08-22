@@ -1,0 +1,65 @@
+---
+title: Idempotency and deduplication
+description: Use fail_if_exists to make an append safe to retry.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { anchor } from '../../../lib/snippet';
+import idemRaw from '../../../../tephra-site-examples/tests/idempotency.rs?raw';
+
+A command handler often has to apply a command exactly once even when the caller retries: a network
+timeout, a redelivered message, or a double click must not place two orders. The `fail_if_exists`
+clause on an append condition makes that a single atomic guarantee.
+
+## The gap a single `after` leaves
+
+An append condition's boundary check ignores everything at or before `after` and fails if anything
+matching the query landed since. That is exactly right for a decision boundary ("nothing new since
+I read"). An idempotency check is different: it must assert the command's key exists *nowhere* in
+the log, from the very beginning, regardless of how far the boundary has advanced.
+
+One `after` cannot be both. Set it to your boundary position `N` and the dedupe check misses a
+duplicate that landed before `N`. Set it to `0` and the boundary check fails on every event your
+decision legitimately read. The two assertions need two different `after` values at once.
+
+## The existence clause
+
+`fail_if_exists` is that second assertion: a query evaluated against the whole log (an implicit
+`after = 0`), OR'd with the boundary check. The append fails if either fires.
+
+<Code code={anchor(idemRaw, 'idempotent')} lang="rust" />
+
+Tag each command with a unique key (`cmd:order-1`) and guard the append on it. The first apply
+commits; any retry finds the key already present and is rejected, even after the log has moved on.
+
+## `AlreadyExists`, not `Conflict`
+
+A `fail_if_exists` rejection is reported as `AlreadyExists`, distinct from the `Conflict` a
+boundary check raises. The distinction matters because the two call for opposite responses:
+
+- `Conflict` (boundary): your decision read stale data. Re-read, rebuild, and retry.
+- `AlreadyExists` (existence): the command was already applied. Treat it as a successful no-op;
+  retrying will only be rejected again.
+
+The error `code` is what tells the two apart; `retryable` is the orthogonal axis it always is. A
+durable conflict is terminal (`retryable: false`); a same-batch race is `retryable: true`. The
+example above keys on `code` alone, which is correct for a single dedupe tag: a same-batch race
+there is a real duplicate the winner already committed, so treating it as already-applied is right.
+If your existence query carries several tags, also honor `retryable`, since a same-batch match can
+be conservative (see [Handling conflicts](../conflicts/)).
+
+## Combining with a boundary
+
+Because it is a separate clause, `fail_if_exists` composes with an ordinary boundary in one atomic
+condition:
+
+```rust
+let condition = AppendCondition::new(boundary_query)
+    .after(watermark)
+    .fail_if_exists(dedupe_query);
+```
+
+That is the case a single `after` cannot express, and the reason the clause exists: a decision
+whose boundary has legitimately advanced can still assert its command has never been applied. The
+boundary is checked first, so a genuine boundary conflict is reported as `Conflict`; only when the
+boundary passes does a duplicate surface as `AlreadyExists`.

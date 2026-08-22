@@ -1,5 +1,5 @@
-//! Minimal end-to-end client example: connect, append two events (one guarded), then read
-//! everything back.
+//! Minimal end-to-end client example: connect, append events (a uniqueness guard and an
+//! idempotency `fail_if_exists` guard), then read everything back.
 //!
 //! Run against a `tephra-server`:
 //!
@@ -11,7 +11,9 @@
 use std::env;
 use std::error::Error;
 
-use tephra_client::{AppendCondition, Client, Event, Position, Query, QueryItem};
+use tephra_client::{
+    AppendCondition, Client, ClientError, ErrorCode, Event, Position, Query, QueryItem,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let addr = env::args()
@@ -46,6 +48,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     ) {
         Ok(_) => println!("second reservation unexpectedly succeeded"),
         Err(err) => println!("second reservation rejected: {err}"),
+    }
+
+    // An idempotency guard: `fail_if_exists` reports a duplicate as a distinct `AlreadyExists`
+    // error (not a boundary `Conflict`), so a client can treat it as "already applied".
+    let idem =
+        AppendCondition::exists_only(Query::item(QueryItem::with_tags(tags(&["cmd:order-42"])?)));
+    let range = client.append(
+        [Event::new("OrderPlaced", ["cmd:order-42"], b"{}")?],
+        Some(idem),
+    )?;
+    println!("placed order at position {}", range.first);
+
+    let idem =
+        AppendCondition::exists_only(Query::item(QueryItem::with_tags(tags(&["cmd:order-42"])?)));
+    match client.append(
+        [Event::new("OrderPlaced", ["cmd:order-42"], b"{}")?],
+        Some(idem),
+    ) {
+        Ok(_) => println!("duplicate order unexpectedly succeeded"),
+        Err(ClientError::Server {
+            code: ErrorCode::AlreadyExists,
+            conflict_position,
+            ..
+        }) => println!("duplicate order already applied at {conflict_position:?}"),
+        Err(err) => println!("duplicate order rejected: {err}"),
     }
 
     let (events, watermark) = client.read_all(Query::all(), Position::ZERO, None)?;

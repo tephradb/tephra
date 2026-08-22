@@ -96,6 +96,11 @@ differentially tested against, and the fallback when a segment is unindexable. T
 separate types on purpose, because they disagree on what an absent tag means, and one type carrying
 both meanings is exactly the subtlety that reads as correct and is not.
 
+A condition can carry two clauses, OR'd: the boundary check above and an optional existence check
+(`fail_if_exists`) evaluated against the whole log. The boundary is checked first, and each clause
+runs through the same two arms; a conflict is tagged with which clause it came from, so a boundary
+violation surfaces as `Conflict` and an existence violation as `AlreadyExists`.
+
 ## The append-only active tail and the watermark
 
 Reads run on the caller's own thread, never on the writer's, over an immutable snapshot the writer

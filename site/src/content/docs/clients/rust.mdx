@@ -39,8 +39,10 @@ the batch landed at.
 <Code code={anchor(gsRaw, 'append')} lang="rust" />
 
 An `AppendCondition` guards the write as a dynamic consistency boundary. [Decision
-models](/guides/decision-models/) builds the read-fold-decide-append cycle, and [Handling
-conflicts](/guides/conflicts/) covers the same-batch versus durable retry contract.
+models](/guides/decision-models/) builds the read-fold-decide-append cycle, [Handling
+conflicts](/guides/conflicts/) covers the same-batch versus durable retry contract, and its
+optional `fail_if_exists` clause makes an append idempotent, returning `ErrorCode::AlreadyExists`
+on a duplicate ([Idempotency](/guides/idempotency/)).
 
 ## Read
 

@@ -241,10 +241,10 @@ impl Worker {
                     verify,
                     self.cfg.condition_force_scan,
                 ) {
-                    Ok(Some(at)) => {
+                    Ok(Some((clause, at))) => {
                         let _ = req
                             .reply
-                            .send((req.token, Err(AppendError::Conflict { at })));
+                            .send((req.token, Err(AppendError::Conflict { clause, at })));
                         continue;
                     }
                     Ok(None) => {}
@@ -329,7 +329,7 @@ mod tests {
     use crate::event::{Event, EventType, Tag, Tags};
     use crate::log::set::{PositionRange, SegmentConfig};
     use crate::query::{AppendCondition, Query, QueryItem};
-    use crate::writer::ConflictSite;
+    use crate::writer::{ConflictClause, ConflictSite};
 
     use super::*;
 
@@ -405,6 +405,12 @@ mod tests {
         AppendCondition::new(Query::item(QueryItem::with_tags(tags(tag_strs)))).after(after)
     }
 
+    /// A condition whose boundary matches nothing (empty items), so only the `fail_if_exists`
+    /// existence clause is active. Isolates the existence path.
+    fn exists_only(exists_tags: &[&str]) -> AppendCondition {
+        AppendCondition::exists_only(Query::item(QueryItem::with_tags(tags(exists_tags))))
+    }
+
     fn assert_ok(rx: &ReplyRx) -> PositionRange {
         match rx.try_recv() {
             Ok((_token, Ok(range))) => range,
@@ -448,6 +454,7 @@ mod tests {
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::SameBatch
             }
         ));
@@ -492,6 +499,7 @@ mod tests {
         assert!(matches!(
             got[&222].as_ref().unwrap_err(),
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::SameBatch
             }
         ));
@@ -536,6 +544,7 @@ mod tests {
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::Durable(p)
             } if p == Position::new(1)
         ));
@@ -556,6 +565,118 @@ mod tests {
         );
         w.process(&[r2]);
         assert_ok(&rx2);
+    }
+
+    // --- existence clause (fail_if_exists) ---
+
+    #[test]
+    fn durable_existence_conflict() {
+        // A committed event carrying the dedupe tag makes a later `fail_if_exists` guard on it
+        // lose with an Existence conflict, independent of any boundary cursor.
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+        let (r1, rx1) = request(&[("Op", &["idem:x"])], None);
+        w.process(&[r1]);
+        assert_ok(&rx1);
+
+        let (r2, rx2) = request(&[("Op", &["idem:x"])], Some(exists_only(&["idem:x"])));
+        w.process(&[r2]);
+        assert!(matches!(
+            assert_err(&rx2),
+            AppendError::Conflict {
+                clause: ConflictClause::Existence,
+                at: ConflictSite::Durable(p)
+            } if p == Position::new(1)
+        ));
+    }
+
+    #[test]
+    fn same_batch_existence_conflict() {
+        // Two same-drain appends carrying the same dedupe tag, both guarded by fail_if_exists:
+        // one wins, the other loses as a retryable same-batch Existence conflict.
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+        let (r1, rx1) = request(&[("Op", &["idem:x"])], Some(exists_only(&["idem:x"])));
+        let (r2, rx2) = request(&[("Op", &["idem:x"])], Some(exists_only(&["idem:x"])));
+        w.process(&[r1, r2]);
+        assert_ok(&rx1);
+        assert!(matches!(
+            assert_err(&rx2),
+            AppendError::Conflict {
+                clause: ConflictClause::Existence,
+                at: ConflictSite::SameBatch
+            }
+        ));
+        assert_eq!(w.set.last_position(), Position::new(1));
+    }
+
+    #[test]
+    fn existence_catches_a_duplicate_before_the_boundary_cursor() {
+        // The hole this feature closes: a boundary guard with `after = tip` legitimately
+        // ignores an earlier duplicate, but the existence clause (after = 0) still catches it.
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+        let (seed, rxs) = request(
+            &[
+                ("Op", &["idem:x"]),
+                ("Other", &["k:1"]),
+                ("Other", &["k:2"]),
+            ],
+            None,
+        );
+        w.process(&[seed]);
+        assert_ok(&rxs);
+        let tip = w.set.last_position();
+        assert_eq!(tip, Position::new(3));
+
+        // Boundary on idem:x with after = tip alone would succeed (the duplicate at 1 is at or
+        // before `after`); the existence clause rejects it.
+        let cond = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["idem:x"]))))
+            .after(tip)
+            .fail_if_exists(Query::item(QueryItem::with_tags(tags(&["idem:x"]))));
+        let (r, rx) = request(&[("Op", &["idem:x"])], Some(cond));
+        w.process(&[r]);
+        assert!(matches!(
+            assert_err(&rx),
+            AppendError::Conflict {
+                clause: ConflictClause::Existence,
+                at: ConflictSite::Durable(p)
+            } if p == Position::new(1)
+        ));
+    }
+
+    #[test]
+    fn existence_clause_succeeds_when_the_key_is_absent() {
+        // No false positive: a fail_if_exists guard on an absent key does not block the append.
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+        let (r1, rx1) = request(&[("Op", &["idem:x"])], None);
+        w.process(&[r1]);
+        assert_ok(&rx1);
+        let (r2, rx2) = request(&[("Op", &["idem:y"])], Some(exists_only(&["idem:y"])));
+        w.process(&[r2]);
+        assert_ok(&rx2);
+    }
+
+    #[test]
+    fn boundary_takes_precedence_when_both_clauses_match() {
+        // Both clauses would fire; the boundary conflict is reported (it is checked first).
+        let dir = TempDir::new().unwrap();
+        let (mut w, _tx) = worker(&dir, cfg());
+        let (r1, rx1) = request(&[("Op", &["idem:x"])], None);
+        w.process(&[r1]);
+        assert_ok(&rx1);
+        let cond = AppendCondition::new(Query::item(QueryItem::with_tags(tags(&["idem:x"]))))
+            .fail_if_exists(Query::item(QueryItem::with_tags(tags(&["idem:x"]))));
+        let (r2, rx2) = request(&[("Op", &["idem:x"])], Some(cond));
+        w.process(&[r2]);
+        assert!(matches!(
+            assert_err(&rx2),
+            AppendError::Conflict {
+                clause: ConflictClause::Boundary,
+                ..
+            }
+        ));
     }
 
     // --- after == tip boundary with a staged record at tip + 1 ---
@@ -587,6 +708,7 @@ mod tests {
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::SameBatch
             }
         ));
@@ -706,7 +828,18 @@ mod tests {
                     .collect();
                 let tip = expected_last;
                 let after = if tip == 0 { 0 } else { rng.below(tip + 1) };
-                Some(guard(&gtags, Position::new(after)))
+                let mut cond = guard(&gtags, Position::new(after));
+                // Sometimes also attach an existence clause (whole-log, after = 0) on a random
+                // tag subset, so the second clause's verify cross-check is exercised too.
+                if rng.below(2) == 0 {
+                    let estart = rng.below(universe.len() as u64) as usize;
+                    let en = 1 + rng.below(2) as usize;
+                    let etags: Vec<&str> = (0..en)
+                        .map(|i| universe[(estart + i) % universe.len()])
+                        .collect();
+                    cond = cond.fail_if_exists(Query::item(QueryItem::with_tags(tags(&etags))));
+                }
+                Some(cond)
             } else {
                 None
             };
@@ -785,9 +918,11 @@ mod tests {
         match (assert_err(&rga), assert_err(&rgb)) {
             (
                 AppendError::Conflict {
+                    clause: ConflictClause::Boundary,
                     at: ConflictSite::Durable(pa),
                 },
                 AppendError::Conflict {
+                    clause: ConflictClause::Boundary,
                     at: ConflictSite::Durable(pb),
                 },
             ) => assert_eq!(pa, pb, "index and scan-fallback name the same conflict"),
@@ -831,6 +966,7 @@ mod tests {
         assert!(matches!(
             assert_err(&rx2),
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::Durable(p)
             } if p == Position::new(1)
         ));

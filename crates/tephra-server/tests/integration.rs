@@ -768,6 +768,37 @@ fn durable_append_conflict_is_reported_and_not_retryable() {
 }
 
 #[test]
+fn existence_clause_conflict_is_reported_as_already_exists() {
+    let ts = TestServer::start();
+    let mut client = ts.client();
+
+    // Commit a command carrying its dedupe key.
+    client
+        .append([ev("OrderPlaced", &["cmd:abc"], b"{}")], None)
+        .unwrap();
+
+    // A re-application guarded by `fail_if_exists` on the dedupe key is rejected with
+    // AlreadyExists (distinct from a boundary Conflict), terminal, at the original position.
+    let condition = AppendCondition::exists_only(tag_query(&["cmd:abc"]));
+    let err = client
+        .append([ev("OrderPlaced", &["cmd:abc"], b"{}")], Some(condition))
+        .unwrap_err();
+    match err {
+        ClientError::Server {
+            code,
+            retryable,
+            conflict_position,
+            ..
+        } => {
+            assert_eq!(code, ErrorCode::AlreadyExists);
+            assert!(!retryable, "a durable duplicate is terminal");
+            assert_eq!(conflict_position, Some(Position::new(1)));
+        }
+        other => panic!("expected an AlreadyExists conflict, got {other:?}"),
+    }
+}
+
+#[test]
 fn malformed_wire_event_maps_to_bad_request() {
     // The clean client validates before sending, so a malformed event cannot go through
     // `append`. A hand-built wire frame with an empty event type exercises the server's

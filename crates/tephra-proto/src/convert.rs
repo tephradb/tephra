@@ -104,7 +104,11 @@ pub fn condition_from_pb(
     condition: pb::AppendConditionView<'_>,
 ) -> Result<AppendCondition, ConvertError> {
     let query = query_from_pb(condition.fail_if_events_match())?;
-    Ok(AppendCondition::new(query).after(Position::new(condition.after())))
+    let mut cond = AppendCondition::new(query).after(Position::new(condition.after()));
+    if let Some(exists) = condition.fail_if_exists_opt() {
+        cond = cond.fail_if_exists(query_from_pb(exists)?);
+    }
+    Ok(cond)
 }
 
 /// Builds a wire [`AppendCondition`](pb::AppendCondition) from a vocabulary condition.
@@ -112,6 +116,9 @@ pub fn condition_to_pb(condition: &AppendCondition) -> pb::AppendCondition {
     let mut out = pb::AppendCondition::new();
     out.set_fail_if_events_match(query_to_pb(&condition.fail_if_events_match));
     out.set_after(condition.after.get());
+    if let Some(exists) = &condition.fail_if_exists {
+        out.set_fail_if_exists(query_to_pb(exists));
+    }
     out
 }
 
@@ -121,6 +128,7 @@ pub fn condition_to_pb(condition: &AppendCondition) -> pb::AppendCondition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     Conflict,
+    AlreadyExists,
     AfterBeyondTip,
     Empty,
     TooLarge,
@@ -135,6 +143,7 @@ impl From<pb::ErrorCode> for ErrorCode {
     fn from(code: pb::ErrorCode) -> Self {
         match code {
             pb::ErrorCode::Conflict => ErrorCode::Conflict,
+            pb::ErrorCode::AlreadyExists => ErrorCode::AlreadyExists,
             pb::ErrorCode::AfterBeyondTip => ErrorCode::AfterBeyondTip,
             pb::ErrorCode::Empty => ErrorCode::Empty,
             pb::ErrorCode::TooLarge => ErrorCode::TooLarge,
@@ -154,6 +163,7 @@ impl ErrorCode {
     pub fn to_pb(self) -> pb::ErrorCode {
         match self {
             ErrorCode::Conflict => pb::ErrorCode::Conflict,
+            ErrorCode::AlreadyExists => pb::ErrorCode::AlreadyExists,
             ErrorCode::AfterBeyondTip => pb::ErrorCode::AfterBeyondTip,
             ErrorCode::Empty => pb::ErrorCode::Empty,
             ErrorCode::TooLarge => pb::ErrorCode::TooLarge,
@@ -216,6 +226,32 @@ mod tests {
     }
 
     #[test]
+    fn condition_with_existence_clause_round_trips() {
+        let cond = AppendCondition::new(Query::item(QueryItem::with_tags(
+            Tags::new(vec![Tag::new("course:c1").unwrap()]).unwrap(),
+        )))
+        .after(Position::new(42))
+        .fail_if_exists(Query::item(QueryItem::with_tags(
+            Tags::new(vec![Tag::new("idempotency:abc").unwrap()]).unwrap(),
+        )));
+        let pb = condition_to_pb(&cond);
+        let back = condition_from_pb(pb.as_view()).unwrap();
+        assert_eq!(back, cond);
+        assert!(back.fail_if_exists.is_some());
+    }
+
+    #[test]
+    fn condition_without_existence_clause_decodes_to_none() {
+        // An absent field must decode to `None`, not an empty (match-nothing) clause.
+        let cond = AppendCondition::new(Query::all());
+        let pb = condition_to_pb(&cond);
+        assert_eq!(
+            condition_from_pb(pb.as_view()).unwrap().fail_if_exists,
+            None
+        );
+    }
+
+    #[test]
     fn empty_tag_is_rejected_through_core_validation() {
         // An empty tag is invalid, and the rejection comes from the core constructor, so
         // there is one definition of the rule.
@@ -233,6 +269,7 @@ mod tests {
     fn error_code_round_trips() {
         for code in [
             ErrorCode::Conflict,
+            ErrorCode::AlreadyExists,
             ErrorCode::AfterBeyondTip,
             ErrorCode::Empty,
             ErrorCode::TooLarge,

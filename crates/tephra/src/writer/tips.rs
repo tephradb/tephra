@@ -340,6 +340,20 @@ mod tests {
         assert_eq!(tips.may_match(&Query::all(), pos(5)), Verdict::Unknown);
     }
 
+    #[test]
+    fn existence_check_after_zero_always_falls_through() {
+        // An existence clause (`fail_if_exists`) queries at `after = 0`. A recorded tag's max
+        // is > 0, and an absent tag's max is the floor (>= 1), also > 0, so the tips can never
+        // prove `DefinitelyNoMatch`: a whole-log existence check always falls through to the
+        // index existence check.
+        let mut tips = TagTips::new(pos(1), 1_000);
+        tips.record("idem:x", pos(10));
+        let present = Query::item(QueryItem::with_tags(tags(&["idem:x"])));
+        let absent = Query::item(QueryItem::with_tags(tags(&["idem:absent"])));
+        assert_eq!(tips.may_match(&present, pos(0)), Verdict::Unknown);
+        assert_eq!(tips.may_match(&absent, pos(0)), Verdict::Unknown);
+    }
+
     // --- eviction / floor monotonicity ---
 
     #[test]
