@@ -52,9 +52,10 @@ client; [Core concepts](/core-concepts/) is the precise definition.
 
 ## Append with a condition
 
-An `AppendCondition` is a dynamic consistency boundary: the append is rejected if any event matching
-the query already exists after its `After` position. Omit `After` (leave it at `Zero`) for the
-uniqueness-guard pattern, "fail if this has ever happened".
+An `AppendCondition` guards the append with two checks, OR'd. The boundary check is a dynamic
+consistency boundary: it rejects the append if any event matching `FailIfEventsMatch` already exists
+after its `After` position. Leave `After` at `Zero` for the uniqueness-guard pattern, "fail if this
+has ever happened".
 
 ```go
 item, err := tephra.WithTags("email:a@example.com")
@@ -75,9 +76,45 @@ if errors.As(err, &serverErr) && serverErr.Code == tephra.ErrCodeConflict {
 }
 ```
 
-Use `NewAppendConditionAfter(query, after)` when you have already read up to a position and only
-need to guard against events since. See [Handling conflicts](/guides/conflicts/) for the retry
-contract on a same-batch versus a durable conflict.
+Set the `After` field when you have already read up to a position and only need to guard against
+events since. See [Handling conflicts](/guides/conflicts/) for the retry contract on a same-batch
+versus a durable conflict.
+
+## Idempotent appends
+
+The optional existence check, `FailIfExists`, rejects the append if any event matches its query
+*anywhere* in the log, independent of the boundary's `After`. It is the idempotency/dedupe guard: a
+single `After` cannot be both a moving decision boundary and a whole-log uniqueness assertion, so
+this is the second, separate check. Its conflict comes back as `ErrCodeAlreadyExists`, distinct from
+a boundary `ErrCodeConflict`, so a retried command can be treated as "already applied" (a no-op)
+rather than "rebuild and retry". Use `ExistsOnly` for the pure-dedupe case, or set `FailIfExists`
+alongside a boundary query to assert both in one append.
+
+```go
+key, err := tephra.WithTags("cmd:order-42")
+if err != nil {
+	log.Fatal(err)
+}
+event, err := tephra.NewEvent("OrderPlaced", []string{"cmd:order-42"}, []byte(`{}`))
+if err != nil {
+	log.Fatal(err)
+}
+
+cond := tephra.ExistsOnly(tephra.QueryItems(key))
+_, err = client.Append(ctx, []tephra.Event{event}, &cond)
+
+var serverErr *tephra.ServerError
+switch {
+case err == nil:
+	fmt.Println("order placed")
+case errors.As(err, &serverErr) && serverErr.Code == tephra.ErrCodeAlreadyExists:
+	fmt.Println("order already placed, treating as a no-op")
+default:
+	log.Fatal(err)
+}
+```
+
+See [Idempotency and deduplication](/guides/idempotency/) for the full pattern.
 
 ## Reads and pagination
 
@@ -208,7 +245,8 @@ client, err := tephra.Dial(ctx, "tephra.internal:9000",
 The client does no automatic retries or reconnection: it surfaces a typed error and leaves the
 policy to you. Match with `errors.As`.
 
-- `*ServerError`: the server returned an error. `Code` is an `ErrorCode`, `Retryable` marks an
+- `*ServerError`: the server returned an error. `Code` is an `ErrorCode` (`ErrCodeConflict` for a
+  boundary conflict, `ErrCodeAlreadyExists` for an existence-clause match), `Retryable` marks an
   advisory same-batch append conflict, and `ConflictPosition` is set for a durable one.
 - `*ProtocolError`: the peer sent something outside the protocol.
 - `*ConnError`: the connection failed with requests in flight; every one is failed with it rather

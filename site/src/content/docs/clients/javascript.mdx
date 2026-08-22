@@ -43,9 +43,10 @@ concepts](/core-concepts/) is the precise definition.
 
 ## Append with a condition
 
-An `AppendCondition` is a dynamic consistency boundary: the append is rejected if any event matching
-the query already exists after its `after` position. `after` defaults to `ZERO`, which considers the
-whole log, the uniqueness-guard pattern.
+An `AppendCondition` guards the append with two checks, OR'd. The boundary check is a dynamic
+consistency boundary: it rejects the append if any event matching `failIfEventsMatch` already exists
+after its `after` position. `after` defaults to `ZERO`, which considers the whole log, the
+uniqueness-guard pattern.
 
 ```ts
 import { AppendCondition, ErrorCode, Event, Query, QueryItem, ServerError } from "@tephradb/client";
@@ -66,6 +67,35 @@ try {
 
 See [Handling conflicts](/guides/conflicts/) for the retry contract on a same-batch versus a durable
 conflict.
+
+## Idempotent appends
+
+The optional existence check, `failIfExists`, rejects the append if any event matches its query
+*anywhere* in the log, independent of the boundary `after`. It is the idempotency/dedupe guard: a
+single `after` cannot be both a moving decision boundary and a whole-log uniqueness assertion, so
+this is the second, separate check. Its conflict surfaces as `ErrorCode.AlreadyExists`, distinct
+from a boundary `ErrorCode.Conflict`, so a retried command can be treated as "already applied" (a
+no-op) rather than "rebuild and retry". Use `AppendCondition.existsOnly` for the pure-dedupe case,
+or pass a third argument to `AppendCondition.create` to assert a boundary and a dedupe key in one
+append.
+
+```ts
+import { AppendCondition, ErrorCode, Event, Query, QueryItem, ServerError } from "@tephradb/client";
+
+const dedupe = AppendCondition.existsOnly(Query.items(QueryItem.withTags("cmd:order-42")));
+
+try {
+  await client.append([Event.create("OrderPlaced", ["cmd:order-42"])], dedupe);
+} catch (err) {
+  if (err instanceof ServerError && err.code === ErrorCode.AlreadyExists) {
+    // The command was already applied; treat this retry as a no-op.
+  } else {
+    throw err;
+  }
+}
+```
+
+See [Idempotency and deduplication](/guides/idempotency/) for the full pattern.
 
 ## Reads and pagination
 
@@ -184,8 +214,9 @@ const client = await Client.connect("tephra.example.com:9000", {
 The client throws typed errors, all extending `TephraError`. It performs no automatic retries or
 reconnection.
 
-- `ServerError`: the server returned an error. `code` is an `ErrorCode`, `retryable` marks an
-  advisory same-batch append conflict, and `conflictPosition` is set for a durable one.
+- `ServerError`: the server returned an error. `code` is an `ErrorCode` (`Conflict` for a boundary
+  conflict, `AlreadyExists` for a `failIfExists` duplicate), `retryable` marks an advisory same-batch
+  append conflict, and `conflictPosition` is set for a durable one.
 - `ProtocolError`: the peer sent something outside the protocol.
 - `ConnError`: the connection failed with requests in flight; every one is failed with it rather
   than left hanging. The cause is on `cause`.

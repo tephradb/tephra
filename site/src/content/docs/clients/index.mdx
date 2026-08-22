@@ -62,6 +62,7 @@ casing convention.
 | Subscribe | `Subscribe` | `subscribe` | `subscribe` |
 | Server stats | `Stats` | `stats` | `stats` |
 
-Append conditions (the dynamic consistency boundary guard), forward and backward pagination via
-`after`/`before` and a `limit`, TLS, and bearer tokens work the same way in each. The pages below
-show the idiomatic form for each language.
+Append conditions (the dynamic consistency boundary guard, plus the optional existence clause for
+[idempotent appends](/guides/idempotency/)), forward and backward pagination via `after`/`before`
+and a `limit`, TLS, and bearer tokens work the same way in each. The pages below show the idiomatic
+form for each language.
