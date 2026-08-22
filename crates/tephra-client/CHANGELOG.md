@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/tephradb/tephra/compare/tephra-client-v0.5.0...tephra-client-v0.5.1) - 2026-08-22
+
+### Added
+
+- add fail_if_exists existence clause to the append condition ([#31](https://github.com/tephradb/tephra/pull/31))
+
 ## [0.5.0](https://github.com/tephradb/tephra/compare/tephra-client-v0.4.1...tephra-client-v0.5.0) - 2026-08-19
 
 ### Added
