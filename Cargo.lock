@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "tephra"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "futures-core",
  "rustls",
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "protobuf",
  "protobuf-codegen",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "argh",
  "config",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "tephra-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "smallvec",
  "thiserror",
