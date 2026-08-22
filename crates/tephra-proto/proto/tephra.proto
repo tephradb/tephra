@@ -22,11 +22,16 @@ message Query {
   repeated QueryItem items = 2;
 }
 
-// The guard on an append: reject if any event after `after` matches the query.
-// `after` = 0 means "consider the whole log" (positions are 1-based).
+// The guard on an append: two checks, OR'd, so the append is rejected if either fires.
+// The boundary check rejects if any event after `after` matches `fail_if_events_match`
+// (`after` = 0 means "the whole log"; positions are 1-based). The optional existence check
+// rejects if any event anywhere (implicit `after` = 0) matches `fail_if_exists`, the
+// idempotency/dedupe guard; a conflict from it is reported as ERROR_CODE_ALREADY_EXISTS,
+// distinct from a boundary ERROR_CODE_CONFLICT.
 message AppendCondition {
   Query fail_if_events_match = 1;
   uint64 after = 2;
+  optional Query fail_if_exists = 3;
 }
 
 message AppendRequest {
@@ -150,6 +155,11 @@ enum ErrorCode {
   ERROR_CODE_SHUTDOWN = 7;
   // The connection failed authentication: a missing or invalid token, or a non-Hello first frame.
   ERROR_CODE_UNAUTHENTICATED = 8;
+  // An append's `fail_if_exists` existence clause matched: the guarded event already exists.
+  // Distinct from ERROR_CODE_CONFLICT (a boundary conflict) so a client can treat it as
+  // "already applied" rather than "rebuild and retry". Terminal when durable; a same-batch
+  // race is retryable like any conflict (see the `retryable` field).
+  ERROR_CODE_ALREADY_EXISTS = 9;
 }
 
 message ErrorResponse {

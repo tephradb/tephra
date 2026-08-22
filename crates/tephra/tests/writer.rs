@@ -12,7 +12,9 @@ use tephra::Position;
 use tephra::event::{Event, EventType, Tag, Tags};
 use tephra::log::set::{SegmentConfig, SegmentSet};
 use tephra::query::{AppendCondition, Query, QueryItem};
-use tephra::writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};
+use tephra::writer::{
+    AppendError, ConflictClause, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig,
+};
 
 const SEG_SIZE: usize = 1 << 20;
 
@@ -300,6 +302,7 @@ fn durable_conflict_detected_through_the_index_across_sealed_segments() {
         matches!(
             err,
             AppendError::Conflict {
+                clause: ConflictClause::Boundary,
                 at: ConflictSite::Durable(_)
             }
         ),
@@ -332,6 +335,73 @@ fn append_with_no_events_is_rejected() {
     ));
     drop(handle);
     coord.shutdown();
+}
+
+#[test]
+fn existence_clause_provides_idempotent_appends() {
+    // The idempotency use case end to end: an existence guard on a dedupe key rejects a
+    // duplicate command with an Existence conflict even after the boundary has moved well past
+    // the original event, which a boundary-only guard could not do.
+    let dir = TempDir::new().unwrap();
+    // Tiny segments force seals, so the original event ends up in a sealed segment and the
+    // existence check must find it there. Verify on cross-checks it against the scan oracle.
+    let set = SegmentSet::open(dir.path(), SegmentConfig::new(512)).unwrap();
+    let cfg = WriterConfig {
+        queue_capacity: 64,
+        max_batch_records: 64,
+        max_batch_bytes: 256,
+        verify_tips: true,
+        ..WriterConfig::default()
+    };
+    let (coord, handle) = WriteCoordinator::start(set, cfg).unwrap();
+
+    let dedupe =
+        |key: &str| AppendCondition::exists_only(Query::item(QueryItem::with_tags(tags(&[key]))));
+
+    // First application of the command commits at position 1.
+    handle
+        .append(
+            vec![event("OrderPlaced", &["cmd:abc"])],
+            Some(dedupe("cmd:abc")),
+        )
+        .unwrap();
+
+    // Enough unrelated events to seal several segments, so the tip is far past the original.
+    for i in 0..80u64 {
+        handle
+            .append(vec![event("Filler", &[&format!("f:{i}")])], None)
+            .unwrap();
+    }
+
+    // Re-applying the same command is rejected as a duplicate, regardless of the tip.
+    let err = handle
+        .append(
+            vec![event("OrderPlaced", &["cmd:abc"])],
+            Some(dedupe("cmd:abc")),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppendError::Conflict {
+                clause: ConflictClause::Existence,
+                at: ConflictSite::Durable(p),
+            } if p == Position::new(1)
+        ),
+        "expected an Existence conflict at the original position, got {err:?}"
+    );
+
+    // A different command key is not blocked.
+    handle
+        .append(
+            vec![event("OrderPlaced", &["cmd:xyz"])],
+            Some(dedupe("cmd:xyz")),
+        )
+        .unwrap();
+
+    drop(handle);
+    let set = coord.shutdown();
+    assert!(set.sealed_len() >= 1, "tiny segments should have sealed");
 }
 
 #[cfg(feature = "async")]

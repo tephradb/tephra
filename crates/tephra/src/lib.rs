@@ -75,7 +75,9 @@ pub use tephra_types::{
     AppendCondition, EventType, MAX_NAME_LEN, NameError, Position, Query, QueryItem, Tag, Tags,
     TagsError,
 };
-pub use writer::{AppendError, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig};
+pub use writer::{
+    AppendError, ConflictClause, ConflictSite, WriteCoordinator, WriteHandle, WriterConfig,
+};
 
 /// The crate README and the workspace README, compiled as doctests so their code samples
 /// cannot drift from the API. These items exist only during doctest builds (`cfg(doctest)`),

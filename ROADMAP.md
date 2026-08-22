@@ -168,6 +168,14 @@ Pure logic, no I/O.
 - [x] Concurrency tests: N threads appending, positions dense, unique, no gaps
 - [x] Conflict tests: overlapping uniqueness guard, exactly one wins (same-batch and
       durable paths), plus oversize routing/isolation and no-events rejection
+- [x] Existence clause (`AppendCondition::fail_if_exists`): a second, whole-log (`after = 0`)
+      condition query OR'd with the boundary check, for idempotent/dedupe appends where one
+      `after` cannot be both a moving boundary and a global uniqueness assertion. Evaluated by
+      the same two arms per clause (`evaluate_clause`), boundary checked first; conflicts are
+      tagged `ConflictClause::{Boundary, Existence}` and surface as distinct wire codes
+      (`Conflict` vs `AlreadyExists`), keeping `retryable` orthogonal. Covered by unit,
+      coordinator, integration, wire round-trip, the extended `verify_tips` property test, and
+      the crashtest DCB invariant
 
 **Milestone: after phase 4, this is a correct, durable, DCB-compliant store.** It just
 restarts slowly and answers selective queries by scanning. Everything below is

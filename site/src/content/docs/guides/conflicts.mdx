@@ -28,6 +28,20 @@ now-durable state and gets the precise answer, which is often "no real conflict,
 Collapsing the two into a bare "it conflicted" loses this. Retrying a durable conflict spins; not
 retrying a same-batch conflict fails a write that should have succeeded.
 
+## Boundary vs existence conflicts
+
+`retryable` is one axis; the error `code` is a second: which clause of the condition was violated.
+
+A `Conflict` is a boundary conflict: an event matched `fail_if_events_match` after your `after`
+cursor. Handle it as above (rebuild, and if durable, surface).
+
+An `AlreadyExists` is an existence conflict: an event matched a `fail_if_exists` clause, so the
+guarded key already exists in the log. It follows the same `retryable` rule as any conflict: a
+durable duplicate is terminal (`retryable: false`) and means "already applied", so the right
+response is to treat it as a successful no-op rather than to rebuild and retry; a same-batch race
+is `retryable: true` and resolves to the durable verdict on retry, exactly like a boundary
+same-batch conflict. See [Idempotency and deduplication](../idempotency/).
+
 ## The retry loop
 
 Rebuild the model from the current tail each attempt. Retry a same-batch conflict. On a durable

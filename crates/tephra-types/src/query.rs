@@ -92,26 +92,38 @@ impl Query {
     }
 }
 
-/// The guard on an `append` call.
+/// The guard on an `append` call: two independent checks, OR'd, so the append is rejected
+/// if either fires.
 ///
-/// The store ignores everything at or before [`after`](Self::after) and rejects the
-/// append if anything matching [`fail_if_events_match`](Self::fail_if_events_match)
-/// landed since. `after` is the highest position the client observed while building
-/// its decision model, which may be higher than the last matching event's position.
+/// The **boundary check** ignores everything at or before [`after`](Self::after) and rejects
+/// the append if anything matching [`fail_if_events_match`](Self::fail_if_events_match) landed
+/// since. `after` is the highest position the client observed while building its decision
+/// model, which may be higher than the last matching event's position. Positions are 1-based,
+/// so [`after`](Self::after) `= Position::ZERO` (the default) means "consider the whole log":
+/// the spec's "omit `after`" case, i.e. fail if *any* event matches (the uniqueness-guard
+/// pattern).
 ///
-/// Positions are 1-based, so [`after`](Self::after) `= Position::ZERO` (the default)
-/// means "consider the whole log": the spec's "omit `after`" case, i.e. fail if *any*
-/// event matches (the uniqueness-guard pattern).
+/// The optional **existence check** ([`fail_if_exists`](Self::fail_if_exists)) rejects the
+/// append if any event *anywhere* matches its query, independent of `after` (an implicit
+/// `after = 0`). It is the idempotency/dedupe primitive: assert a key is globally absent even
+/// when the boundary legitimately advanced past events the decision read, which a single
+/// `after` cannot express. A conflict from this clause is reported distinctly from a boundary
+/// conflict (the engine's `ConflictClause`), so a client can treat "already applied"
+/// differently from "boundary moved, rebuild and retry".
 ///
-/// This type only *holds* the condition. Evaluating it (position filtering plus the
-/// match predicate over the durable suffix) is the engine's job.
+/// This type only *holds* the condition. Evaluating it (position filtering plus the match
+/// predicate over the durable suffix) is the engine's job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendCondition {
-    /// Reject the append if any event after [`after`](Self::after) matches this query.
+    /// Boundary check: reject the append if any event after [`after`](Self::after) matches
+    /// this query.
     pub fail_if_events_match: Query,
-    /// Ignore everything at or before this position. `Position::ZERO` means the whole
-    /// log.
+    /// Ignore everything at or before this position for the boundary check. `Position::ZERO`
+    /// means the whole log.
     pub after: Position,
+    /// Optional existence check: reject the append if any event anywhere (implicit
+    /// `after = 0`) matches this query. `None` disables it.
+    pub fail_if_exists: Option<Query>,
 }
 
 impl AppendCondition {
@@ -121,12 +133,33 @@ impl AppendCondition {
         AppendCondition {
             fail_if_events_match,
             after: Position::ZERO,
+            fail_if_exists: None,
         }
     }
 
-    /// Sets the exclusive lower bound: only events strictly after `after` are checked.
+    /// A condition with no boundary check, only the existence clause: fail the append if any
+    /// event anywhere matches `query`. The pure idempotency/dedupe guard, without a decision
+    /// boundary. Equivalent to `AppendCondition::new(Query::items([])).fail_if_exists(query)`
+    /// (an empty boundary matches nothing), without the empty-boundary boilerplate.
+    pub fn exists_only(query: Query) -> Self {
+        AppendCondition {
+            fail_if_events_match: Query::items(Vec::new()),
+            after: Position::ZERO,
+            fail_if_exists: Some(query),
+        }
+    }
+
+    /// Sets the exclusive lower bound for the boundary check: only events strictly after
+    /// `after` are checked.
     pub fn after(mut self, after: Position) -> Self {
         self.after = after;
+        self
+    }
+
+    /// Adds the existence check: fail the append if any event anywhere (implicit `after = 0`)
+    /// matches `query`, independent of the boundary. The idempotency/dedupe guard.
+    pub fn fail_if_exists(mut self, query: Query) -> Self {
+        self.fail_if_exists = Some(query);
         self
     }
 }
@@ -162,11 +195,31 @@ mod tests {
         let cond = AppendCondition::new(Query::all());
         assert_eq!(cond.after, Position::ZERO);
         assert_eq!(cond.fail_if_events_match, Query::All);
+        assert_eq!(cond.fail_if_exists, None);
     }
 
     #[test]
     fn condition_after_sets_bound() {
         let cond = AppendCondition::new(Query::all()).after(Position::new(42));
         assert_eq!(cond.after, Position::new(42));
+    }
+
+    #[test]
+    fn condition_fail_if_exists_sets_the_clause() {
+        let dedupe = Query::item(QueryItem::with_tags(Tags::empty()));
+        let cond = AppendCondition::new(Query::all()).fail_if_exists(dedupe.clone());
+        assert_eq!(cond.fail_if_exists, Some(dedupe));
+        // Independent of the boundary bound.
+        assert_eq!(cond.after, Position::ZERO);
+    }
+
+    #[test]
+    fn exists_only_has_an_empty_boundary_and_the_existence_clause() {
+        let dedupe = Query::item(QueryItem::with_tags(Tags::empty()));
+        let cond = AppendCondition::exists_only(dedupe.clone());
+        // Empty boundary matches nothing, so only the existence clause can fire.
+        assert_eq!(cond.fail_if_events_match, Query::items(Vec::new()));
+        assert_eq!(cond.after, Position::ZERO);
+        assert_eq!(cond.fail_if_exists, Some(dedupe));
     }
 }

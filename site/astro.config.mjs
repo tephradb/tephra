@@ -66,6 +66,7 @@ export default defineConfig({
             { label: "The uniqueness guard", slug: "guides/uniqueness-guard" },
             { label: "Subscriptions", slug: "guides/subscriptions" },
             { label: "Handling conflicts", slug: "guides/conflicts" },
+            { label: "Idempotency", slug: "guides/idempotency" },
           ],
         },
         { label: "Operations", slug: "operations" },

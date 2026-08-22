@@ -46,12 +46,21 @@ variant.
 
 ### Append condition
 
-`failIfEventsMatch: Query` plus optional `after: Position`.
+`failIfEventsMatch: Query` plus optional `after: Position`, and an optional existence clause
+`failIfExists: Query`.
 
-The store ignores everything at or before `after` and rejects if anything matching the
-query landed since. `after` is the highest position the client observed while building
-its decision model, which may be higher than the position of the last matching event.
-Omitting `after` means "fail if *any* event matches" (the uniqueness-guard pattern).
+The **boundary check** ignores everything at or before `after` and rejects if anything
+matching `failIfEventsMatch` landed since. `after` is the highest position the client
+observed while building its decision model, which may be higher than the position of the last
+matching event. Omitting `after` means "fail if *any* event matches" (the uniqueness-guard
+pattern).
+
+The optional **existence check** `failIfExists` rejects if any event *anywhere* matches its
+query, independent of `after` (an implicit `after = 0`), OR'd with the boundary check. One
+`after` cannot be both a moving boundary (nothing new since N) and a whole-log uniqueness
+assertion (a key exists nowhere) at once; the existence clause is the second, for
+idempotent/dedupe appends. Its conflict is reported distinctly (`AlreadyExists` vs a boundary
+`Conflict`), so a client can treat "already applied" differently from "rebuild and retry".
 
 ### Decision model
 
@@ -496,6 +505,22 @@ event exist after `after`" that the index (layer 3) will be differential-tested 
 It has two arms, and **neither may ever produce a false negative** (silently accepting a
 conflicting write). `may_match` returns an enum (`DefinitelyNoMatch` / `Unknown`), never a
 bool, so every call site handles the `Unknown` fallthrough explicitly.
+
+A condition is up to two clauses, OR'd: the **boundary clause** (`failIfEventsMatch` with its
+`after`) and an optional **existence clause** (`failIfExists`, whole-log with `after = 0`).
+`condition::evaluate` runs the boundary clause first (range-pruned, so rejecting there skips
+the whole-log existence scan) and only then the existence clause, both through the same two
+arms (`evaluate_clause`), tagging the conflict with its `ConflictClause` (`Boundary` vs
+`Existence`). The server maps that to the wire code (`Conflict` vs `AlreadyExists`) while
+`retryable` still carries the durable-vs-same-batch distinction. The existence clause closes
+the gap a single `after` cannot: a boundary at `after = N` legitimately ignores a duplicate
+that predates N, and the existence clause catches it.
+
+Because `after = 0` prunes nothing, the existence clause always falls through the tips to
+`find_match`, which probes every touched segment: O(sealed segments) FST lookups per idempotent
+append (cheap per lookup, growing with the log). A global tag-presence filter that fast-rejects
+an absent key in O(1) is deferred, not built: it reintroduces the unbounded memory the windowed
+tips deliberately avoid, and idempotency keys are singletons the index already answers cheaply.
 
 **Durable arm: `TagTips` fast-reject, then the index existence check.** `HashMap<tag,
 max_position>` of the highest position per tag, **bounded to a recent position window**. For

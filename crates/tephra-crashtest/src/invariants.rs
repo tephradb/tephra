@@ -343,6 +343,33 @@ fn check_dcb_integrity(addr: SocketAddr, existing_tag: Option<&str>, v: &mut Vec
             "dcb integrity: append guarded on absent tag {absent_tag} was wrongly rejected: {err}"
         ));
     }
+
+    // Existence clause, conflicting: a `fail_if_exists` guard on the present tag must be rejected
+    // as a duplicate with the distinct AlreadyExists code after recovery.
+    let exists_cond = AppendCondition::exists_only(tag_query(&[existing_tag]));
+    let ev = tephra_client::Event::new(PROBE_TYPE, ["probe:dcb-exists"], b"z".to_vec()).unwrap();
+    match client.append([ev], Some(exists_cond)) {
+        Err(ClientError::Server {
+            code: ErrorCode::AlreadyExists,
+            ..
+        }) => {}
+        Ok(_) => v.push(format!(
+            "dcb integrity: existence guard on present tag {existing_tag} was NOT rejected after recovery"
+        )),
+        Err(err) => v.push(format!(
+            "dcb integrity: existence-guarded append failed with an unexpected error: {err}"
+        )),
+    }
+
+    // Existence clause, non-conflicting: a `fail_if_exists` guard on a key that never existed must
+    // succeed after recovery (catches a regression that made the existence path always reject).
+    let ok_exists = AppendCondition::exists_only(tag_query(&[absent_tag]));
+    let ev = tephra_client::Event::new(PROBE_TYPE, ["probe:dcb-exists-ok"], b"w".to_vec()).unwrap();
+    if let Err(err) = client.append([ev], Some(ok_exists)) {
+        v.push(format!(
+            "dcb integrity: existence guard on absent tag {absent_tag} was wrongly rejected: {err}"
+        ));
+    }
 }
 
 /// Invariant 7 (rebuild half): query answers are identical after deleting and rebuilding the
